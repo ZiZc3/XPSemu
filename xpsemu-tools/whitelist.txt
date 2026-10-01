@@ -1,0 +1,4 @@
+# Whitelist for XPSemu Tools (/data/whitelist.txt on the PS5).
+# One title ID per line. Only listed titles get jailbroken.
+# Lines starting with '#' are comments.
+PPSA97358
