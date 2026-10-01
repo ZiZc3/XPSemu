@@ -17,6 +17,10 @@
 
 ---
 
+<p align="center">
+  <img src="ps5/screenshots/dashboard.jpg" alt="XPSemu dashboard on PS5" width="100%">
+</p>
+
 > **Alpha 1** is the first public build. It boots and plays real games, but expect bugs, slow scenes in
 > CPU-heavy games, and missing features. Please report problems with your `xemu-game.log` attached (see [Logs](#logs-and-reporting-problems)).
 
