@@ -105,7 +105,6 @@ fail here too.
   to `/download0/etahen_jailbreak` (the [etaHEN](https://github.com/LightningMods/etaHEN) protocol);
   XPSemu Tools picks it up, verifies the title ID against `/data/whitelist.txt`, and jailbreaks it
   (root, sandbox escape, JIT). Multi-firmware: offsets resolve at runtime via the ps5-payload-sdk.
-  Replaces the PS5SX2 Helper — no third-party helper payload needed any more.
 - A way to install/mount the app folder, for example **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
 - **Your own** original Xbox files, dumped from your own console (not included, never will be):
   - MCPX boot ROM: `mcpx_1.0.bin`
@@ -286,7 +285,7 @@ A full diff of the modified upstream files is in [`ps5/XPSEMU-CHANGES.diff`](ps5
   and a startup scan that reports any unresolved system import.
 - **Memory** (`ps5/compat/mmap.c`, `tcg/region.c`, `util/oslib-posix.c`): `mmap` mapped onto the PS5's
   flexible/direct memory, allocations kept out of the GPU's address window, the TCG JIT buffer in
-  executable shared memory (as PS5SX2 does), coroutine stacks from the heap, file-mapping fallback to
+  executable shared memory, coroutine stacks from the heap, file-mapping fallback to
   read-into-memory.
 - **Sandbox**: requests the app jailbreak from XPSemu Tools at startup; all data under `/data/xemu`.
 - **DualSense input** (`ui/xemu-input-ps5.c`) through libScePad, mapped to an Xbox controller.
@@ -343,7 +342,7 @@ the SSE math fast path only runs where the host's result is bit-identical by con
 | `hw/xbox/xemu-timing.h` | Stopwatches used by the game log. |
 | `ui/xemu-os-utils-ps5.c` | PS5 startup, jailbreak request, crash handler, pinning, profiler. |
 | `config_spec.yml` | New settings: performance overlay, menu sounds, CPU pinning, profiler, shader cache. |
-| `xpsemu-tools/` | Standalone app-jailbreak daemon (`xpsemu_tools.elf`): replaces the PS5SX2 Helper. |
+| `xpsemu-tools/` | Standalone app-jailbreak daemon (`xpsemu_tools.elf`) |
 
 ## Building from source
 
