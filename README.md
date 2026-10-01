@@ -413,7 +413,3 @@ Third-party components keep their own licenses.
 
 XPSemu **does not include** any Microsoft BIOS, MCPX ROM, dashboard, game or other copyrighted Xbox
 content, and never will. Use your own legally dumped files and games.
-
-XPSemu is an independent fan project. It is **not affiliated with, endorsed by or sponsored by Microsoft,
-Sony Interactive Entertainment or the xemu project**. "Xbox" is a trademark of Microsoft; "PlayStation"
-and "PS5" are trademarks of Sony Interactive Entertainment.
