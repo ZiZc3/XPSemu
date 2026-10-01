@@ -18,7 +18,7 @@ the JIT), gated by a whitelist.
 - Multi-firmware: offsets resolve at runtime via the SDK, so every firmware
   the SDK + kstuff covers works (up to 13.60 with a current SDK).
 - Quiet: one `XPSemu Tools active` toast at boot, one `XPSemu Started...`
-  toast per successful unlock. No debug `Jailbreak!` spam.
+  toast per successful unlock.
 
 ## Requirements
 
