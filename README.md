@@ -96,15 +96,15 @@ fail here too.
 ## Requirements
 
 - A **jailbroken PS5** that can run homebrew apps (fake-signed titles).
-- A HEN that **jailbreaks apps on request**: XPSemu asks for it the same way PS5SX2 does (it writes its PID
-  to `/download0/etahen_jailbreak`). Tested with the **PS5SX2 Helper** payload (with kstuff), which only
+- A HEN that **jailbreaks apps on request**: XPSemu asks for it the same way [PS5SX2](https://github.com/Swordpdf/PS5SX2) does (it writes its PID
+  to `/download0/etahen_jailbreak`, the [etaHEN](https://github.com/LightningMods/etaHEN) protocol). Tested with the **PS5SX2 Helper** payload (with [kstuff](https://github.com/EchoStretch/kstuff)), which only
   jailbreaks title IDs listed in `/data/whitelist.txt`.
-- A way to install/mount the app folder, for example **ShadowMountPlus**.
+- A way to install/mount the app folder, for example **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
 - **Your own** original Xbox files, dumped from your own console (not included, never will be):
   - MCPX boot ROM: `mcpx_1.0.bin`
   - Xbox BIOS / flash ROM, for example `Complex_4627.bin`
   - An Xbox hard-disk image, for example xemu's blank `xbox_hdd.qcow2` (see [xemu's setup guide](https://xemu.app/docs/required-files/))
-- **Your own games** as **XISO** images (`.iso` / `.xiso`). Full "redump" disc images must be converted to XISO first (for example with extract-xiso).
+- **Your own games** as **XISO** images (`.iso` / `.xiso`). Full "redump" disc images must be converted to XISO first (for example with [extract-xiso](https://github.com/XboxDev/extract-xiso)).
 
 ## Installation
 
@@ -191,7 +191,7 @@ GPU). Change it in the dashboard before launching; per-game resolutions apply wh
 
 ## Game patches
 
-XPSemu reads patches in **Jay's Magic Patch** format (`.jmp`, as published on JayXbox PatchHub) from
+XPSemu reads patches in **Jay's Magic Patch** format (`.jmp`, as published on [JayXbox PatchHub](https://www.jayxbox.com/Retail-Game-Modification/PatchHub.php)) from
 `/data/xemu/patches/`. Open a game's settings (△) → **Game patches** to turn groups on or off.
 
 - Patches are applied **in memory while the game reads its executable**. Your ISO is never changed.
@@ -338,7 +338,7 @@ the SSE math fast path only runs where the host's result is bit-identical by con
 ## Building from source
 
 The build runs on Linux (tested on WSL2 Ubuntu). You need the PS5 toolchain and RADV from
-**PS5_Vulkan** (by Mihawk-99) first.
+**PS5_Vulkan** (by [Mihawk-99](https://github.com/mihawk-99)) first.
 
 1. **PS5_Vulkan**: clone it to `~/ps5/PS5_Vulkan` and build its toolchain, RADV release archive and host
    tools following its documentation. XPSemu uses:
@@ -386,14 +386,14 @@ Menu sounds: `ps5/sounds/embed-sounds.py` turns `ps5/sounds/*.wav` into `ui/xui/
 
 ## Credits
 
-- **[xemu](https://github.com/xemu-project/xemu)** and its contributors: the emulator this is built on.
-- **[QEMU](https://www.qemu.org/)**: the machine emulation and the TCG JIT under xemu.
-- **Mihawk-99's PS5_Vulkan / PS5_Mesa**: RADV (Mesa's open-source AMD Vulkan driver) running on the PS5, the toolchain integration and title packaging XPSemu links against.
-- **[ps5-payload-dev SDK](https://github.com/ps5-payload-dev)**: the open PS5 payload SDK.
-- **PS5SX2**: reference for the app jailbreak request, CPU core layout, JIT memory and DualSense reading on the PS5.
-- **etaHEN, kstuff, ShadowMountPlus** and the PS5 scene for making homebrew apps possible.
-- **Jay's Magic Patch / JayXbox PatchHub**: the patch format and the community's patches.
-- **Dear ImGui**, **SDL3**, **GLib**, **glslang**, **Vulkan Memory Allocator** and the other libraries xemu uses.
+- **[xemu](https://github.com/xemu-project/xemu)** ([xemu.app](https://xemu.app)) and its contributors: the emulator this is built on.
+- **[QEMU](https://www.qemu.org/)** ([source](https://gitlab.com/qemu-project/qemu)): the machine emulation and the TCG JIT under xemu.
+- **[Mihawk-99](https://github.com/mihawk-99)'s PS5_Vulkan / PS5_Mesa**: RADV ([Mesa](https://gitlab.freedesktop.org/mesa/mesa)'s open-source AMD Vulkan driver) running on the PS5, the toolchain integration and title packaging XPSemu links against. (The repositories are not public at the time of writing.)
+- **[ps5-payload-dev SDK](https://github.com/ps5-payload-dev/sdk)** (as pinned by Mihawk-99's PS5_PayloadSDK): the open PS5 payload SDK.
+- **[PS5SX2](https://github.com/Swordpdf/PS5SX2)** by Swordpdf: reference for the app jailbreak request, CPU core layout, JIT memory and DualSense reading on the PS5.
+- **[etaHEN](https://github.com/LightningMods/etaHEN)** (LightningMods), **[kstuff](https://github.com/EchoStretch/kstuff)** (EchoStretch, from [ps5-payload-dev/kstuff](https://github.com/ps5-payload-dev/kstuff)), **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)** (drakmor) and the PS5 scene for making homebrew apps possible.
+- **Jay's Magic Patch / [JayXbox PatchHub](https://www.jayxbox.com/Retail-Game-Modification/PatchHub.php)**: the patch format and the community's patches.
+- **[Dear ImGui](https://github.com/ocornut/imgui)**, **[SDL3](https://github.com/libsdl-org/SDL)**, **[GLib](https://gitlab.gnome.org/GNOME/glib)**, **[glslang](https://github.com/KhronosGroup/glslang)**, **[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)** and the other libraries xemu uses.
 
 XPSemu's icon, background and banner are original artwork (a green "X" emblem); they are not the Xbox logo.
 
