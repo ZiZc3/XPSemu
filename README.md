@@ -4,7 +4,7 @@
 
 <p align="center">
   <b>The original Xbox, running natively on a PlayStation 5.</b><br>
-  A port of <a href="https://xemu.app">xemu</a> to the jailbroken PS5 as a native app, with its own Xbox-style dashboard.
+  A port of <a href="https://xemu.app">xemu</a> to the PS5 as a native app, with its own Xbox-style dashboard.
 </p>
 
 <p align="center">
