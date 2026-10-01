@@ -148,7 +148,7 @@ Everything XPSemu writes lives under `/data/xemu/` (an app's own folder is read-
 |---|---|
 | `/data/xemu/xemu.toml` | Main settings (xemu's format; the dashboard edits it for you). |
 | `/data/xemu/games/` | Your XISO games. |
-| `/data/xemu/games/covers/` or `/data/xemu/covers/` | Cover art: `<game name>.jpg` or `.png`. Matching ignores case, spaces and `(...)`/`[...]`; the title ID (e.g. `4D530064.jpg`) works too. |
+| `/data/xemu/games/covers/` or `/data/xemu/covers/` | Cover art: `<game name>.jpg` same as the iso name or the title ID (e.g. `4D530064.jpg`) works too, png also supported. |
 | `/data/xemu/patches/` | `.jmp` game patches (subfolders are fine). |
 | `/data/xemu/sounds/` | Optional: your own menu sounds (`move`, `change`, `select`, `back`, `open`, `launch`, `error` `.wav`) replace the built-in ones. |
 | `/data/xemu/game-settings/` | Per-game settings and patch choices (written by the dashboard). |
