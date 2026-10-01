@@ -387,8 +387,6 @@ Menu sounds: `ps5/sounds/embed-sounds.py` turns `ps5/sounds/*.wav` into `ui/xui/
 - **Smooth mode**: optional frame generation (FSR 3 frame interpolation through an open-source Vulkan port) to show 30 FPS games at 60.
 - More CPU fast paths guided by the profiler.
 - Save manager and save states.
-- `APPEND` patches (code caves) for patches like Halo 2 HD.
-- More of the PS5 polish: favourites, sorting.
 
 ## Credits
 
