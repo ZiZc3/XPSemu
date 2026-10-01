@@ -87,8 +87,8 @@ Tested by the developer on a PS5 with Alpha 1. "FPS" is what the game itself dra
 
 | Game | Status | Notes |
 |---|---|---|
-| Halo 2 | ✅ Good | 30 FPS stock. With the Halo 2 60 FPS patch: 51-60 FPS in the opening, 36-50 in gameplay. Set **DSP Off**. |
-| Forza Motorsport | ⚠️ In-game | 30 FPS (its cap) in menus and intro, 15-21 FPS while racing. Set **DSP Off**. |
+| Halo 2 | ✅ Good | 30 FPS stock. With the Halo 2 60 FPS patch: 51-60 FPS in the opening, 36-50 in gameplay.. |
+| Forza Motorsport | ⚠️ In-game | 30 FPS (its cap) in menus and intro, 15-21 FPS while racing. |
 | Fable: The Lost Chapters | ⚠️ In-game | 22-30 FPS in many areas (30 is its cap), 10-20 FPS in heavy areas. |
 | Crash Bandicoot: The Wrath of Cortex | ✅ Great | Runs smoothly. |
 
