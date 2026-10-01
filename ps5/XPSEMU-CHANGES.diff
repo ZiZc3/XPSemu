@@ -1,0 +1,3413 @@
+# XPSemu changes to upstream xemu files (base: xemu 478b4f4961).
+# New files added by XPSemu are not in this diff; see README.md.
+#
+#  .gitignore                                 |   5 +
+#  README.md                                  | 411 ++++++++++++++++++++++++++++-
+#  accel/tcg/tb-jmp-cache.h                   |   6 +
+#  accel/tcg/tb-maint.c                       |   2 +
+#  accel/tcg/tcg-accel-ops-mttcg.c            |   9 +
+#  accel/tcg/tcg-accel-ops-rr.c               |   9 +
+#  accel/tcg/translate-all.c                  |   2 +
+#  block/raw-format.c                         |  15 +-
+#  config_spec.yml                            |  13 +
+#  fpu/softfloat.c                            |  51 ++++
+#  hw/xbox/mcpx/apu/dsp/dsp.c                 |  10 +
+#  hw/xbox/mcpx/apu/dsp/meson.build           |  15 +-
+#  hw/xbox/mcpx/apu/monitor.c                 | 102 +++++++
+#  hw/xbox/nv2a/debug.h                       |  22 +-
+#  hw/xbox/nv2a/nv2a.c                        |   9 +-
+#  hw/xbox/nv2a/pfifo.c                       |   7 +
+#  hw/xbox/nv2a/pgraph/meson.build            |   4 +-
+#  hw/xbox/nv2a/pgraph/profile.c              |   5 +
+#  hw/xbox/nv2a/pgraph/thirdparty/meson.build |  12 +-
+#  hw/xbox/nv2a/pgraph/vk/command.c           |   5 +
+#  hw/xbox/nv2a/pgraph/vk/display.c           |   9 +-
+#  hw/xbox/nv2a/pgraph/vk/draw.c              |  78 +++++-
+#  hw/xbox/nv2a/pgraph/vk/glsl.c              |  67 ++++-
+#  hw/xbox/nv2a/pgraph/vk/gpuprops.c          |   2 +
+#  hw/xbox/nv2a/pgraph/vk/instance.c          |  29 ++
+#  hw/xbox/nv2a/pgraph/vk/renderer.c          |  85 +++++-
+#  hw/xbox/nv2a/pgraph/vk/renderer.h          |  15 ++
+#  hw/xbox/nv2a/pgraph/vk/surface.c           |   3 +
+#  hw/xbox/smbus_storage.c                    |  63 +++++
+#  meson.build                                |  13 +-
+#  system/physmem.c                           |   7 +
+#  system/vl.c                                |   5 +
+#  target/i386/ops_sse.h                      | 143 ++++++++++
+#  target/i386/tcg/emit.c.inc                 |  74 +++++-
+#  target/i386/tcg/ops_sse_header.h.inc       |  99 +++----
+#  tcg/region.c                               |  13 +
+#  ui/meson.build                             |   2 +
+#  ui/qemu-pixman.c                           |   9 +
+#  ui/xemu-input.c                            |  14 +
+#  ui/xemu-input.h                            |   6 +
+#  ui/xemu-os-utils.h                         |  30 +++
+#  ui/xemu-settings.cc                        |  20 ++
+#  ui/xemu-settings.h                         |   7 +
+#  ui/xemu-snapshots.c                        |  13 +-
+#  ui/xemu-snapshots.h                        |  10 +-
+#  ui/xemu-thumbnail.cc                       |  31 ++-
+#  ui/xemu.c                                  | 218 ++++++++++++++-
+#  ui/xui/common.hh                           |   8 +-
+#  ui/xui/compat.cc                           |   7 +
+#  ui/xui/font-manager.cc                     |   7 +
+#  ui/xui/gl-helpers.hh                       |  27 +-
+#  ui/xui/input-manager.cc                    |   3 +-
+#  ui/xui/main-menu.cc                        |  46 +++-
+#  ui/xui/main-menu.hh                        |   2 +
+#  ui/xui/main.cc                             |  77 +++++-
+#  ui/xui/meson.build                         |  15 +-
+#  ui/xui/popup-menu.cc                       |  15 ++
+#  ui/xui/scene-components.cc                 |   8 +-
+#  ui/xui/xemu-hud.h                          |  15 +-
+#  util/oslib-posix.c                         |  18 ++
+#  60 files changed, 1899 insertions(+), 128 deletions(-)
+
+diff --git a/accel/tcg/tb-jmp-cache.h b/accel/tcg/tb-jmp-cache.h
+index c3a505e394..f1ee4f95b3 100644
+--- a/accel/tcg/tb-jmp-cache.h
++++ b/accel/tcg/tb-jmp-cache.h
+@@ -12,7 +12,13 @@
+ #include "qemu/rcu.h"
+ #include "exec/cpu-common.h"
+ 
++#ifdef __PROSPERO__
++/* XPSemu: big games' indirect jumps missed the 4096 entries often (the
++ * hash table lookups behind it were the CPU thread's top cost). */
++#define TB_JMP_CACHE_BITS 14
++#else
+ #define TB_JMP_CACHE_BITS 12
++#endif
+ #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
+ 
+ /*
+diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
+index d21a8bd42f..907ede0503 100644
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "hw/xbox/xemu-timing.h"
+ #include "qemu/interval-tree.h"
+ #include "qemu/qtree.h"
+ #include "exec/cputlb.h"
+@@ -968,6 +969,7 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
+ 
+     qatomic_set(&tb_ctx.tb_phys_invalidate_count,
+                 tb_ctx.tb_phys_invalidate_count + 1);
++    __atomic_fetch_add(&xemu_timing_count[XT_TB_INVAL], 1, __ATOMIC_RELAXED);
+ }
+ 
+ static void tb_phys_invalidate__locked(TranslationBlock *tb)
+diff --git a/accel/tcg/tcg-accel-ops-mttcg.c b/accel/tcg/tcg-accel-ops-mttcg.c
+index cf1ee7ac25..885737c806 100644
+--- a/accel/tcg/tcg-accel-ops-mttcg.c
++++ b/accel/tcg/tcg-accel-ops-mttcg.c
+@@ -33,6 +33,8 @@
+ #include "hw/boards.h"
+ #include "tcg/startup.h"
+ #include "tcg-accel-ops.h"
++#include "ui/xemu-os-utils.h"
++#include "hw/xbox/xemu-timing.h"
+ #include "tcg-accel-ops-mttcg.h"
+ 
+ typedef struct MttcgForceRcuNotifier {
+@@ -70,6 +72,9 @@ static void *mttcg_cpu_thread_fn(void *arg)
+     g_assert(!icount_enabled());
+ 
+     rcu_register_thread();
++#ifdef __PROSPERO__
++    xemu_ps5_register_thread(XEMU_PS5_THREAD_CPU); /* A core of its own */
++#endif
+     force_rcu.notifier.notify = mttcg_force_rcu;
+     force_rcu.cpu = cpu;
+     rcu_add_force_rcu_notifier(&force_rcu.notifier);
+@@ -85,12 +90,16 @@ static void *mttcg_cpu_thread_fn(void *arg)
+     qemu_guest_random_seed_thread_part2(cpu->random_seed);
+ 
+     do {
++        uint64_t xt_idle = xemu_timing_now();
+         qemu_process_cpu_events(cpu);
++        xemu_timing_add(XT_CPU_IDLE, xt_idle);
+ 
+         if (cpu_can_run(cpu)) {
+             int r;
+             bql_unlock();
++            uint64_t xt_exec = xemu_timing_now();
+             r = tcg_cpu_exec(cpu);
++            xemu_timing_add(XT_CPU_EXEC, xt_exec);
+             bql_lock();
+             switch (r) {
+             case EXCP_DEBUG:
+diff --git a/accel/tcg/tcg-accel-ops-rr.c b/accel/tcg/tcg-accel-ops-rr.c
+index f84342e044..0aa36815be 100644
+--- a/accel/tcg/tcg-accel-ops-rr.c
++++ b/accel/tcg/tcg-accel-ops-rr.c
+@@ -34,6 +34,8 @@
+ #include "exec/cpu-common.h"
+ #include "tcg/startup.h"
+ #include "tcg-accel-ops.h"
++#include "ui/xemu-os-utils.h"
++#include "hw/xbox/xemu-timing.h"
+ #include "tcg-accel-ops-rr.h"
+ #include "tcg-accel-ops-icount.h"
+ 
+@@ -184,6 +186,9 @@ static void *rr_cpu_thread_fn(void *arg)
+ 
+     assert(tcg_enabled());
+     rcu_register_thread();
++#ifdef __PROSPERO__
++    xemu_ps5_register_thread(XEMU_PS5_THREAD_CPU); /* A core of its own */
++#endif
+     force_rcu.notify = rr_force_rcu;
+     rcu_add_force_rcu_notifier(&force_rcu);
+     tcg_register_thread();
+@@ -232,7 +237,9 @@ static void *rr_cpu_thread_fn(void *arg)
+             qemu_notify_event();
+         }
+ 
++        uint64_t xt_idle = xemu_timing_now();
+         rr_wait_io_event();
++        xemu_timing_add(XT_CPU_IDLE, xt_idle);
+         rr_deal_with_unplugged_cpus();
+ 
+         bql_unlock();
+@@ -282,7 +289,9 @@ static void *rr_cpu_thread_fn(void *arg)
+                 if (icount_enabled()) {
+                     icount_prepare_for_run(cpu, cpu_budget);
+                 }
++                uint64_t xt_exec = xemu_timing_now();
+                 r = tcg_cpu_exec(cpu);
++                xemu_timing_add(XT_CPU_EXEC, xt_exec);
+                 if (icount_enabled()) {
+                     icount_process_data(cpu);
+                 }
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 0871388c6c..8a1df23e8b 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -19,6 +19,7 @@
+ 
+ #include "qemu/osdep.h"
+ 
++#include "hw/xbox/xemu-timing.h"
+ #include "trace.h"
+ #include "disas/disas.h"
+ #include "tcg/tcg.h"
+@@ -681,4 +682,5 @@ void tcg_flush_jmp_cache(CPUState *cpu)
+     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+         qatomic_set(&jc->array[i].tb, NULL);
+     }
++    __atomic_fetch_add(&xemu_timing_count[XT_JC_FLUSH], 1, __ATOMIC_RELAXED);
+ }
+diff --git a/block/raw-format.c b/block/raw-format.c
+index a57c2922d5..0433d79982 100644
+--- a/block/raw-format.c
++++ b/block/raw-format.c
+@@ -206,6 +206,14 @@ static inline int raw_adjust_offset(BlockDriverState *bs, int64_t *offset,
+     return 0;
+ }
+ 
++/*
++ * xemu: sees every read of a raw image (the game disc), after it's read, to
++ * change what the game gets (game patches, ui/xui/game-patches.cc). NULL
++ * when unused. offset is into the image file.
++ */
++void (*xemu_raw_read_hook)(const char *filename, int64_t offset,
++                           int64_t bytes, struct iovec *iov, int niov);
++
+ static int coroutine_fn GRAPH_RDLOCK
+ raw_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
+               QEMUIOVector *qiov, BdrvRequestFlags flags)
+@@ -218,7 +226,12 @@ raw_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
+     }
+ 
+     BLKDBG_CO_EVENT(bs->file, BLKDBG_READ_AIO);
+-    return bdrv_co_preadv(bs->file, offset, bytes, qiov, flags);
++    ret = bdrv_co_preadv(bs->file, offset, bytes, qiov, flags);
++    if (ret >= 0 && xemu_raw_read_hook && qiov->size == (size_t)bytes) {
++        xemu_raw_read_hook(bs->filename, offset, bytes, qiov->iov,
++                           qiov->niov);
++    }
++    return ret;
+ }
+ 
+ static int coroutine_fn GRAPH_RDLOCK
+diff --git a/config_spec.yml b/config_spec.yml
+index c933b54daf..1798b5e335 100644
+--- a/config_spec.yml
++++ b/config_spec.yml
+@@ -264,6 +264,13 @@ display:
+     show_notifications:
+       type: bool
+       default: true
++    menu_sounds:
++      type: bool
++      default: true
++    perf_overlay:
++      type: enum
++      values: ['off', fps, full]
++      default: 'off'
+     hide_cursor:
+       type: bool
+       default: true
+@@ -367,6 +374,12 @@ sys:
+     dvd_path: string
+ 
+ perf:
++  profiler:
++    type: bool
++    default: true
++  cpu_pinning:
++    type: bool
++    default: true
+   hard_fpu:
+     type: bool
+     default: true
+diff --git a/fpu/softfloat.c b/fpu/softfloat.c
+index 8094358c2e..efccf9f509 100644
+--- a/fpu/softfloat.c
++++ b/fpu/softfloat.c
+@@ -3365,8 +3365,46 @@ int16_t float32_to_int16(float32 a, float_status *s)
+     return float32_to_int16_scalbn(a, s->float_rounding_mode, 0, s);
+ }
+ 
++#ifdef __PROSPERO__
++#include <xmmintrin.h>
++/*
++ * XPSemu: float -> int32 with the host's instruction when the input is
++ * zero or normal and fits (|a| < 2^31): no flag but inexact can arise.
++ */
++static inline bool xps_f32_to_i32(float32 a, bool trunc, int32_t *out,
++                                  float_status *s)
++{
++    uint32_t bits = float32_val(a);
++    uint32_t e = (bits >> 23) & 0xff;
++    union { uint32_t u; float f; } x = { .u = bits };
++    int32_t i;
++
++    if (e >= 158 || (e == 0 && (bits << 1))) {
++        return false;
++    }
++    if (trunc) {
++        i = _mm_cvttss_si32(_mm_set_ss(x.f));
++    } else if (s->float_rounding_mode == float_round_nearest_even) {
++        i = _mm_cvtss_si32(_mm_set_ss(x.f)); /* host MXCSR: nearest */
++    } else {
++        return false;
++    }
++    if ((float)i != x.f) {
++        float_raise(float_flag_inexact, s);
++    }
++    *out = i;
++    return true;
++}
++#endif
++
+ int32_t float32_to_int32(float32 a, float_status *s)
+ {
++#ifdef __PROSPERO__
++    int32_t r;
++    if (xps_f32_to_i32(a, false, &r, s)) {
++        return r;
++    }
++#endif
+     return float32_to_int32_scalbn(a, s->float_rounding_mode, 0, s);
+ }
+ 
+@@ -3437,6 +3475,12 @@ int16_t float32_to_int16_round_to_zero(float32 a, float_status *s)
+ 
+ int32_t float32_to_int32_round_to_zero(float32 a, float_status *s)
+ {
++#ifdef __PROSPERO__
++    int32_t r;
++    if (xps_f32_to_i32(a, true, &r, s)) {
++        return r;
++    }
++#endif
+     return float32_to_int32_scalbn(a, float_round_to_zero, 0, s);
+ }
+ 
+@@ -3986,6 +4030,13 @@ float32 int64_to_float32(int64_t a, float_status *status)
+ 
+ float32 int32_to_float32(int32_t a, float_status *status)
+ {
++#ifdef __PROSPERO__
++    /* XPSemu: exact (no flags) for |a| <= 2^24: the host's conversion. */
++    if (a >= -(1 << 24) && a <= (1 << 24)) {
++        union { float f; uint32_t u; } x = { .f = (float)a };
++        return make_float32(x.u);
++    }
++#endif
+     return int64_to_float32_scalbn(a, 0, status);
+ }
+ 
+diff --git a/hw/xbox/mcpx/apu/dsp/dsp.c b/hw/xbox/mcpx/apu/dsp/dsp.c
+index 0d844af07d..3311f9ea35 100644
+--- a/hw/xbox/mcpx/apu/dsp/dsp.c
++++ b/hw/xbox/mcpx/apu/dsp/dsp.c
+@@ -119,11 +119,15 @@ DSPState *dsp_init(void *rw_opaque, dsp_scratch_rw_func scratch_rw,
+     dsp->dma.scratch_rw = scratch_rw;
+     dsp->dma.fifo_rw = fifo_rw;
+ 
++#ifdef CONFIG_DSP56300_JIT
+     if (g_config.audio.use_dsp_jit) {
+         dsp_jit_init(dsp);
+     } else {
+         dsp_c_init(dsp);
+     }
++#else
++    dsp_c_init(dsp);
++#endif
+ 
+     dsp_reset(dsp);
+ 
+@@ -212,6 +216,7 @@ void dsp_sync_from_vm(DSPState *dsp)
+ 
+ void dsp_set_engine(DSPState *dsp, bool use_jit)
+ {
++#ifdef CONFIG_DSP56300_JIT
+     bool currently_jit = (dsp->ops == &jit_dsp_ops);
+     if (use_jit == currently_jit) {
+         return;
+@@ -227,4 +232,9 @@ void dsp_set_engine(DSPState *dsp, bool use_jit)
+     }
+ 
+     dsp_sync_from_vm(dsp);
++#else
++    /* Built without the JIT: the interpreter is the only engine. */
++    (void)dsp;
++    (void)use_jit;
++#endif
+ }
+diff --git a/hw/xbox/mcpx/apu/dsp/meson.build b/hw/xbox/mcpx/apu/dsp/meson.build
+index 3429547e24..139d21bae5 100644
+--- a/hw/xbox/mcpx/apu/dsp/meson.build
++++ b/hw/xbox/mcpx/apu/dsp/meson.build
+@@ -1,10 +1,21 @@
+-dsp56300_emu_ffi = dependency('dsp56300-emu-ffi', fallback: ['dsp56300', 'dsp56300_dep'])
++# dsp56300 ships prebuilt for Linux, Windows and macOS only. Elsewhere (the PS5)
++# the JIT is left out and the C interpreter always runs.
++dsp56300_emu_ffi = dependency('dsp56300-emu-ffi', fallback: ['dsp56300', 'dsp56300_dep'],
++                              required: host_os in ['linux', 'windows', 'darwin'])
+ 
+ subdir('interp')
+ 
++libdsp_sources = files(['dsp.c', 'dsp_c.c', 'dsp_dma.c'])
++libdsp_c_args = []
++if dsp56300_emu_ffi.found()
++  libdsp_sources += files('dsp_jit.c')
++  libdsp_c_args += '-DCONFIG_DSP56300_JIT'
++endif
++
+ libdsp = static_library(
+   'dsp',
+-  files(['dsp.c', 'dsp_c.c', 'dsp_jit.c', 'dsp_dma.c']) + genh,
++  libdsp_sources + genh,
++  c_args: libdsp_c_args,
+   dependencies: [dsp56300_emu_ffi],
+ )
+ 
+diff --git a/hw/xbox/mcpx/apu/monitor.c b/hw/xbox/mcpx/apu/monitor.c
+index 730fcc9d73..c7850c755d 100644
+--- a/hw/xbox/mcpx/apu/monitor.c
++++ b/hw/xbox/mcpx/apu/monitor.c
+@@ -19,6 +19,107 @@
+ 
+ #include "apu_int.h"
+ 
++#ifdef __PROSPERO__
++/*
++ * PS5: SDL has no audio driver for it, so the stream isn't bound to a device:
++ * it stays the queue apu.c paces the APU by, and a thread feeds the console's
++ * audio out from it, 256 frames at a time. sceAudioOutOutput blocks until the
++ * previous grain has played, which paces the thread. The calls are PS5SX2's
++ * (ps5/coreorbis/orbis-shims/ProsperoAudio.cpp).
++ */
++int sceAudioOutInit(void);
++int sceAudioOutOpen(int user_id, int type, int index, unsigned int len,
++                    unsigned int freq, unsigned int param);
++int sceAudioOutOutput(int handle, const void *buf);
++int sceAudioOutClose(int handle);
++
++#define PS5_AUDIO_USER_SYSTEM 255
++#define PS5_AUDIO_PORT_MAIN 0
++#define PS5_AUDIO_S16_STEREO 1
++#define PS5_AUDIO_GRAIN 256 /* frames */
++
++/* The dashboard's sounds, mixed in (ui/xui/ui-sounds.cc). */
++void xemu_ps5_ui_sound_mix(int16_t *buf, int frames);
++
++static QemuThread ps5_audio_thread;
++static int ps5_audio_handle = -1;
++static bool ps5_audio_running;
++
++static void *ps5_audio_out(void *opaque)
++{
++    MCPXAPUState *d = opaque;
++    int16_t buf[PS5_AUDIO_GRAIN * 2];
++
++    while (qatomic_read(&ps5_audio_running)) {
++        int got = SDL_GetAudioStreamData(d->monitor.stream, buf, sizeof(buf));
++        if (got < (int)sizeof(buf)) {
++            /* Not enough queued: play the rest as silence */
++            got = MAX(got, 0);
++            memset((uint8_t *)buf + got, 0, sizeof(buf) - got);
++        }
++        xemu_ps5_ui_sound_mix(buf, PS5_AUDIO_GRAIN);
++        sceAudioOutOutput(ps5_audio_handle, buf);
++    }
++    return NULL;
++}
++
++void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
++{
++    SDL_AudioSpec spec = {
++        .freq = 48000,
++        .format = SDL_AUDIO_S16LE,
++        .channels = 2,
++    };
++
++    /* The dummy driver (see main): the stream only needs SDL's audio core */
++    if (!SDL_Init(SDL_INIT_AUDIO)) {
++        error_setg(errp, "SDL_Init failed: %s", SDL_GetError());
++        return;
++    }
++
++    d->monitor.stream = SDL_CreateAudioStream(&spec, &spec);
++    if (d->monitor.stream == NULL) {
++        error_setg(errp, "SDL_CreateAudioStream failed: %s", SDL_GetError());
++        return;
++    }
++
++    int rc = sceAudioOutInit();
++    ps5_audio_handle =
++        sceAudioOutOpen(PS5_AUDIO_USER_SYSTEM, PS5_AUDIO_PORT_MAIN, 0,
++                        PS5_AUDIO_GRAIN, spec.freq, PS5_AUDIO_S16_STEREO);
++    fprintf(stderr, "xemu PS5 audio: init %#x, open %#x\n", rc,
++            ps5_audio_handle);
++    if (ps5_audio_handle < 0) {
++        error_setg(errp, "sceAudioOutOpen failed: %#x", ps5_audio_handle);
++        SDL_DestroyAudioStream(d->monitor.stream);
++        d->monitor.stream = NULL;
++        return;
++    }
++
++    int grain_bytes = PS5_AUDIO_GRAIN * spec.channels *
++                      SDL_AUDIO_BYTESIZE(spec.format);
++    int drain = MAX(grain_bytes, (int)sizeof(d->monitor.frame_buf));
++    d->monitor.queued_bytes_low = drain;
++    d->monitor.queued_bytes_high = 3 * drain;
++
++    qatomic_set(&ps5_audio_running, true);
++    qemu_thread_create(&ps5_audio_thread, "ps5-audio-out", ps5_audio_out, d,
++                       QEMU_THREAD_JOINABLE);
++}
++
++void mcpx_apu_monitor_finalize(MCPXAPUState *d)
++{
++    if (ps5_audio_handle >= 0) {
++        qatomic_set(&ps5_audio_running, false);
++        qemu_thread_join(&ps5_audio_thread);
++        sceAudioOutClose(ps5_audio_handle);
++        ps5_audio_handle = -1;
++    }
++    if (d->monitor.stream) {
++        SDL_DestroyAudioStream(d->monitor.stream);
++    }
++}
++#else
+ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
+ {
+     SDL_AudioSpec spec = {
+@@ -66,6 +167,7 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
+         SDL_DestroyAudioStream(d->monitor.stream);
+     }
+ }
++#endif
+ 
+ void mcpx_apu_monitor_frame(MCPXAPUState *d)
+ {
+diff --git a/hw/xbox/nv2a/debug.h b/hw/xbox/nv2a/debug.h
+index 2dc4bece96..3ef45fd628 100644
+--- a/hw/xbox/nv2a/debug.h
++++ b/hw/xbox/nv2a/debug.h
+@@ -46,19 +46,31 @@
+  * macro for debugging.
+  */
+ #ifndef DEBUG_NV2A_FEATURES
+-# define DEBUG_NV2A_FEATURES 0
++# ifdef __PROSPERO__ /* For the game logs (XPSemu), reported once each */
++#  define DEBUG_NV2A_FEATURES 1
++# else
++#  define DEBUG_NV2A_FEATURES 0
++# endif
+ #endif
+ 
+ #if DEBUG_NV2A_FEATURES
+ 
+-/* Feature which has not yet been confirmed */
++/* Feature which has not yet been confirmed (reported once per place) */
+ #define NV2A_UNCONFIRMED(format, ...) do { \
+-    fprintf(stderr, "nv2a: Warning unconfirmed feature: " format "\n", ## __VA_ARGS__); \
++    static bool reported_; \
++    if (!reported_) { \
++        reported_ = true; \
++        fprintf(stderr, "nv2a: Warning unconfirmed feature: " format "\n", ## __VA_ARGS__); \
++    } \
+ } while (0)
+ 
+-/* Feature which is not implemented */
++/* Feature which is not implemented (reported once per place) */
+ #define NV2A_UNIMPLEMENTED(format, ...) do { \
+-    fprintf(stderr, "nv2a: Warning unimplemented feature: " format "\n", ## __VA_ARGS__); \
++    static bool reported_; \
++    if (!reported_) { \
++        reported_ = true; \
++        fprintf(stderr, "nv2a: Warning unimplemented feature: " format "\n", ## __VA_ARGS__); \
++    } \
+ } while (0)
+ 
+ #else
+diff --git a/hw/xbox/nv2a/nv2a.c b/hw/xbox/nv2a/nv2a.c
+index 1565c05211..e5230ddacd 100644
+--- a/hw/xbox/nv2a/nv2a.c
++++ b/hw/xbox/nv2a/nv2a.c
+@@ -249,7 +249,12 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
+ static void nv2a_init_vga(NV2AState *d)
+ {
+     VGACommonState *vga = &d->vga;
+-    vga->vram_size_mb = memory_region_size(d->vram) / MiB;
++    /* vga_common_init allocates VRAM of this size, only for it to be
++     * swapped for an alias of the Xbox's RAM below: keep it small (on the
++     * PS5, RAM-sized allocations at once were more than the memory there
++     * is), and set the real size after the swap. */
++    vga->vram_size_mb = 1;
++    vga->vbe_size = memory_region_size(d->vram);
+ 
+     vga_common_init(vga, OBJECT(d), &error_fatal);
+     vga->get_bpp = nv2a_get_bpp;
+@@ -266,6 +271,8 @@ static void nv2a_init_vga(NV2AState *d)
+     memory_region_init_alias(&vga->vram, OBJECT(d), "vga.vram",
+                              d->vram, 0, memory_region_size(d->vram));
+     vga->vram_ptr = memory_region_get_ram_ptr(&vga->vram);
++    vga->vram_size = memory_region_size(d->vram);
++    vga->vram_size_mb = vga->vram_size / MiB;
+     vga_dirty_log_start(vga);
+ }
+ 
+diff --git a/hw/xbox/nv2a/pfifo.c b/hw/xbox/nv2a/pfifo.c
+index ff4625c258..3c6cdccf35 100644
+--- a/hw/xbox/nv2a/pfifo.c
++++ b/hw/xbox/nv2a/pfifo.c
+@@ -20,6 +20,8 @@
+  */
+ 
+ #include "nv2a_int.h"
++#include "ui/xemu-os-utils.h"
++#include "hw/xbox/xemu-timing.h"
+ 
+ typedef struct RAMHTEntry {
+     uint32_t handle;
+@@ -451,6 +453,9 @@ static void pfifo_run_pusher(NV2AState *d)
+ 
+ void *pfifo_thread(void *arg)
+ {
++#ifdef __PROSPERO__
++    xemu_ps5_register_thread(XEMU_PS5_THREAD_GPU); /* A core of its own */
++#endif
+     NV2AState *d = (NV2AState *)arg;
+ 
+     pgraph_init_thread(d);
+@@ -473,7 +478,9 @@ void *pfifo_thread(void *arg)
+             qemu_cond_broadcast(&d->pfifo.fifo_idle_cond);
+ 
+             // Both the pusher and puller are waiting for some action
++            uint64_t xt_idle = xemu_timing_now();
+             qemu_cond_wait(&d->pfifo.fifo_cond, &d->pfifo.lock);
++            xemu_timing_add(XT_GPU_IDLE, xt_idle);
+         }
+ 
+         if (d->exiting) {
+diff --git a/hw/xbox/nv2a/pgraph/meson.build b/hw/xbox/nv2a/pgraph/meson.build
+index fc52f609eb..c7f79d5b06 100644
+--- a/hw/xbox/nv2a/pgraph/meson.build
++++ b/hw/xbox/nv2a/pgraph/meson.build
+@@ -12,7 +12,9 @@ if have_renderdoc
+ endif
+ subdir('thirdparty')
+ subdir('null')
+-subdir('gl')
++if opengl.found()
++	subdir('gl')
++endif
+ subdir('glsl')
+ subdir('vk')
+ specific_ss.add(nv2a_vsh_cpu)
+diff --git a/hw/xbox/nv2a/pgraph/profile.c b/hw/xbox/nv2a/pgraph/profile.c
+index 295042010d..1832bbb93f 100644
+--- a/hw/xbox/nv2a/pgraph/profile.c
++++ b/hw/xbox/nv2a/pgraph/profile.c
+@@ -18,9 +18,14 @@
+  */
+ 
+ #include "hw/xbox/nv2a/nv2a_int.h"
++#include "hw/xbox/xemu-timing.h"
+ 
+ NV2AStats g_nv2a_stats;
+ 
++/* XPSemu's stopwatches (hw/xbox/xemu-timing.h). */
++uint64_t xemu_timing_ns[XT__COUNT];
++uint32_t xemu_timing_count[XT__COUNT];
++
+ void nv2a_profile_increment(void)
+ {
+     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+diff --git a/hw/xbox/nv2a/pgraph/thirdparty/meson.build b/hw/xbox/nv2a/pgraph/thirdparty/meson.build
+index fbc3751ea7..0eb1af7ce2 100644
+--- a/hw/xbox/nv2a/pgraph/thirdparty/meson.build
++++ b/hw/xbox/nv2a/pgraph/thirdparty/meson.build
+@@ -11,8 +11,10 @@ nv2a_vsh_cpu = declare_dependency(include_directories: nv2a_vsh_cpu_subproj.incl
+                                     nv2a_vsh_cpu_subproj.target('nv2a_vsh_disassembler'),
+                                     ])
+ 
+-libgloffscreen = static_library('libgloffscreen',
+-                          sources: files('gloffscreen/common.c', 'gloffscreen/sdl.c'),
+-                          dependencies: sdl)
+-gloffscreen = declare_dependency(link_with: libgloffscreen,
+-                           include_directories: ['gloffscreen'])
++if opengl.found()
++  libgloffscreen = static_library('libgloffscreen',
++                            sources: files('gloffscreen/common.c', 'gloffscreen/sdl.c'),
++                            dependencies: sdl)
++  gloffscreen = declare_dependency(link_with: libgloffscreen,
++                             include_directories: ['gloffscreen'])
++endif
+diff --git a/hw/xbox/nv2a/pgraph/vk/command.c b/hw/xbox/nv2a/pgraph/vk/command.c
+index 0e9fc9a2ee..e5dffd6406 100644
+--- a/hw/xbox/nv2a/pgraph/vk/command.c
++++ b/hw/xbox/nv2a/pgraph/vk/command.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "renderer.h"
++#include "hw/xbox/xemu-timing.h"
+ 
+ static void create_command_pool(PGRAPHState *pg)
+ {
+@@ -99,9 +100,13 @@ void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd)
+         .commandBufferCount = 1,
+         .pCommandBuffers = &cmd,
+     };
++    uint64_t xt_aux = xemu_timing_now();
++    qemu_mutex_lock(&r->queue_lock);
+     VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, VK_NULL_HANDLE));
+     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_AUX);
+     VK_CHECK(vkQueueWaitIdle(r->queue));
++    qemu_mutex_unlock(&r->queue_lock);
++    xemu_timing_add(XT_AUX_WAIT, xt_aux);
+ 
+     r->in_aux_command_buffer = false;
+ }
+diff --git a/hw/xbox/nv2a/pgraph/vk/display.c b/hw/xbox/nv2a/pgraph/vk/display.c
+index 6b9e5851c4..d0c7213156 100644
+--- a/hw/xbox/nv2a/pgraph/vk/display.c
++++ b/hw/xbox/nv2a/pgraph/vk/display.c
+@@ -234,6 +234,9 @@ static const char *display_frag_glsl =
+     "            out_Color.rgba = texture(pvideo_tex, in_st);\n"
+     "        }\n"
+     "    }\n"
++    /* The TV shows no alpha: games may leave it 0 (X8R8G8B8), and the
++     * Vulkan UI draws this image blended, unlike the GL UI (XPSemu). */
++    "    out_Color.a = 1.0;\n"
+     "}\n";
+ 
+ static void create_descriptor_pool(PGRAPHState *pg)
+@@ -578,10 +581,10 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+         destroy_current_display_image(pg);
+     }
+ 
+-    const GLint gl_internal_format = GL_RGBA8;
+     bool use_optimal_tiling = true;
+ 
+ #if HAVE_EXTERNAL_MEMORY
++    const GLint gl_internal_format = GL_RGBA8;
+     GLint num_tiling_types;
+     glGetInternalformativ(GL_TEXTURE_2D, gl_internal_format,
+                           GL_NUM_TILING_TYPES_EXT, 1, &num_tiling_types);
+@@ -617,6 +620,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+     };
+ 
++#if HAVE_EXTERNAL_MEMORY
+     VkExternalMemoryImageCreateInfo external_memory_image_create_info = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+ #ifdef WIN32
+@@ -626,6 +630,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+ #endif
+     };
+     image_create_info.pNext = &external_memory_image_create_info;
++#endif
+ 
+     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
+ 
+@@ -641,6 +646,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+     };
+ 
++#if HAVE_EXTERNAL_MEMORY
+     VkExportMemoryAllocateInfo export_memory_alloc_info = {
+         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+         .handleTypes =
+@@ -652,6 +658,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+             ,
+     };
+     alloc_info.pNext = &export_memory_alloc_info;
++#endif
+ 
+     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
+     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
+diff --git a/hw/xbox/nv2a/pgraph/vk/draw.c b/hw/xbox/nv2a/pgraph/vk/draw.c
+index d78087e56b..787c5dbadf 100644
+--- a/hw/xbox/nv2a/pgraph/vk/draw.c
++++ b/hw/xbox/nv2a/pgraph/vk/draw.c
+@@ -20,6 +20,8 @@
+ #include "qemu/osdep.h"
+ #include "qemu/fast-hash.h"
+ #include "renderer.h"
++#include "ui/xemu-settings.h"
++#include "hw/xbox/xemu-timing.h"
+ #include <math.h>
+ 
+ void pgraph_vk_draw_begin(NV2AState *d)
+@@ -121,19 +123,77 @@ static bool pipeline_cache_entry_compare(Lru *lru, LruNode *node,
+     return memcmp(&snode->key, key, sizeof(PipelineKey));
+ }
+ 
++/*
++ * XPSemu: the pipeline cache is kept on disk, so pipelines built in one
++ * session are ready in the next. The driver checks the data is its own
++ * (same GPU and driver build) and starts empty otherwise.
++ */
++static char *pipeline_cache_path(void)
++{
++    return g_strdup_printf("%scache/vk-pipelines.bin",
++                           xemu_settings_get_base_path());
++}
++
++void pgraph_vk_save_pipeline_cache(PGRAPHState *pg)
++{
++    PGRAPHVkState *r = pg->vk_renderer_state;
++    size_t size = 0;
++    if (!r || r->vk_pipeline_cache == VK_NULL_HANDLE ||
++        vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size,
++                               NULL) != VK_SUCCESS ||
++        !size) {
++        return;
++    }
++    void *data = g_malloc(size);
++    if (vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size,
++                               data) == VK_SUCCESS) {
++        char *path = pipeline_cache_path();
++        char *tmp = g_strdup_printf("%s.tmp", path);
++        char *dir = g_path_get_dirname(path);
++        g_mkdir_with_parents(dir, 0777);
++        if (g_file_set_contents(tmp, data, size, NULL)) {
++            rename(tmp, path);
++            fprintf(stderr, "XPSemu: pipeline cache saved (%zu KiB)\n",
++                    size >> 10);
++        }
++        g_free(dir);
++        g_free(tmp);
++        g_free(path);
++    }
++    g_free(data);
++}
++
+ static void init_pipeline_cache(PGRAPHState *pg)
+ {
+     PGRAPHVkState *r = pg->vk_renderer_state;
+ 
++    char *path = pipeline_cache_path();
++    gchar *saved = NULL;
++    gsize saved_size = 0;
++    if (!g_config.perf.cache_shaders ||
++        !g_file_get_contents(path, &saved, &saved_size, NULL)) {
++        saved = NULL;
++        saved_size = 0;
++    }
++    g_free(path);
++
+     VkPipelineCacheCreateInfo cache_info = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+         .flags = 0,
+-        .initialDataSize = 0,
+-        .pInitialData = NULL,
++        .initialDataSize = saved_size,
++        .pInitialData = saved,
+         .pNext = NULL,
+     };
+-    VK_CHECK(vkCreatePipelineCache(r->device, &cache_info, NULL,
+-                                   &r->vk_pipeline_cache));
++    if (vkCreatePipelineCache(r->device, &cache_info, NULL,
++                              &r->vk_pipeline_cache) != VK_SUCCESS) {
++        cache_info.initialDataSize = 0; /* Not usable: start empty */
++        cache_info.pInitialData = NULL;
++        VK_CHECK(vkCreatePipelineCache(r->device, &cache_info, NULL,
++                                       &r->vk_pipeline_cache));
++    }
++    fprintf(stderr, "XPSemu: pipeline cache loaded (%zu KiB)\n",
++            (size_t)(saved_size >> 10));
++    g_free(saved);
+ 
+     const size_t pipeline_cache_size = 2048;
+     lru_init(&r->pipeline_cache);
+@@ -153,6 +213,10 @@ static void finalize_pipeline_cache(PGRAPHState *pg)
+ {
+     PGRAPHVkState *r = pg->vk_renderer_state;
+ 
++    if (g_config.perf.cache_shaders) {
++        pgraph_vk_save_pipeline_cache(pg);
++    }
++
+     lru_flush(&r->pipeline_cache);
+     g_free(r->pipeline_cache_entries);
+     r->pipeline_cache_entries = NULL;
+@@ -1259,8 +1323,12 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
+         };
+         nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT);
+         vkResetFences(r->device, 1, &r->command_buffer_fence);
++        uint64_t xt_submit = xemu_timing_now();
++        qemu_mutex_lock(&r->queue_lock);
+         VK_CHECK(vkQueueSubmit(r->queue, ARRAY_SIZE(submit_infos), submit_infos,
+                                r->command_buffer_fence));
++        qemu_mutex_unlock(&r->queue_lock);
++        xemu_timing_add(XT_FINISH_SUBMIT, xt_submit);
+         r->submit_count += 1;
+ 
+         bool check_budget = false;
+@@ -1277,8 +1345,10 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
+             check_budget = true;
+         }
+ 
++        uint64_t xt_wait = xemu_timing_now();
+         VK_CHECK(vkWaitForFences(r->device, 1, &r->command_buffer_fence,
+                                  VK_TRUE, UINT64_MAX));
++        xemu_timing_add(XT_FINISH_WAIT, xt_wait);
+ 
+         r->descriptor_set_index = 0;
+         r->in_command_buffer = false;
+diff --git a/hw/xbox/nv2a/pgraph/vk/glsl.c b/hw/xbox/nv2a/pgraph/vk/glsl.c
+index d7aef1b590..ae231f7850 100644
+--- a/hw/xbox/nv2a/pgraph/vk/glsl.c
++++ b/hw/xbox/nv2a/pgraph/vk/glsl.c
+@@ -17,6 +17,7 @@
+  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "qemu/osdep.h"
+ #include "ui/xemu-settings.h"
+ #include "renderer.h"
+ 
+@@ -140,8 +141,8 @@ void pgraph_vk_finalize_glsl_compiler(void)
+     glslang_finalize_process();
+ }
+ 
+-GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
+-                                          const char *glsl_source)
++static GByteArray *compile_glsl_to_spv(glslang_stage_t stage,
++                                       const char *glsl_source)
+ {
+     const glslang_input_t input = {
+         .language = GLSLANG_SOURCE_GLSL,
+@@ -206,7 +207,14 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
+     }
+ 
+     glslang_spv_options_t spv_options = {
++#ifdef __PROSPERO__
++        /* XPSemu: validating every shader made first-time compiles (the
++         * stutter when a game shows something new) slower; only when
++         * debugging shaders. */
++        .validate = g_config.display.vulkan.debug_shaders,
++#else
+         .validate = true,
++#endif
+     };
+ 
+     if (g_config.display.vulkan.debug_shaders) {
+@@ -242,6 +250,61 @@ GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
+     return g_byte_array_new_take(data, num_program_bytes);
+ }
+ 
++/*
++ * XPSemu: compiled shaders are kept on disk (perf.cache_shaders), named by
++ * a hash of their stage and GLSL, so a game's shaders compile once, not
++ * every time XPSemu starts: glslang is most of a new shader's stutter.
++ */
++unsigned int pgraph_vk_spirv_cache_hits, pgraph_vk_spirv_cache_misses;
++
++static char *spirv_cache_path(glslang_stage_t stage, const char *glsl_source)
++{
++    static char *dir;
++    if (!dir) {
++        dir = g_strdup_printf("%scache/spirv", xemu_settings_get_base_path());
++        g_mkdir_with_parents(dir, 0777);
++    }
++    GChecksum *sum = g_checksum_new(G_CHECKSUM_SHA256);
++    uint32_t tag = stage;
++    g_checksum_update(sum, (const guchar *)&tag, sizeof(tag));
++    g_checksum_update(sum, (const guchar *)glsl_source, strlen(glsl_source));
++    char *path = g_strdup_printf("%s/%.40s.spv", dir,
++                                 g_checksum_get_string(sum));
++    g_checksum_free(sum);
++    return path;
++}
++
++GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
++                                          const char *glsl_source)
++{
++    bool use_cache = g_config.perf.cache_shaders &&
++                     !g_config.display.vulkan.debug_shaders;
++    char *path = use_cache ? spirv_cache_path(stage, glsl_source) : NULL;
++    gchar *cached = NULL;
++    gsize len = 0;
++    if (path && g_file_get_contents(path, &cached, &len, NULL) && len &&
++        len % 4 == 0) {
++        qatomic_inc(&pgraph_vk_spirv_cache_hits);
++        g_free(path);
++        return g_byte_array_new_take((guint8 *)cached, len);
++    }
++    g_free(cached);
++
++    GByteArray *spv = compile_glsl_to_spv(stage, glsl_source);
++    qatomic_inc(&pgraph_vk_spirv_cache_misses);
++    if (path && spv) {
++        /* Whole or not at all: a file cut short is never read back. */
++        char *tmp = g_strdup_printf("%s.tmp", path);
++        if (g_file_set_contents(tmp, (const gchar *)spv->data, spv->len,
++                                NULL)) {
++            rename(tmp, path);
++        }
++        g_free(tmp);
++    }
++    g_free(path);
++    return spv;
++}
++
+ VkShaderModule pgraph_vk_create_shader_module_from_spv(PGRAPHVkState *r, GByteArray *spv)
+ {
+     VkShaderModuleCreateInfo create_info = {
+diff --git a/hw/xbox/nv2a/pgraph/vk/gpuprops.c b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
+index ecc8bb3852..4b1ed1102f 100644
+--- a/hw/xbox/nv2a/pgraph/vk/gpuprops.c
++++ b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
+@@ -451,8 +451,10 @@ static uint8_t *render_geom_shader_triangles(NV2AState *d, int width,
+         .pCommandBuffers = &r->command_buffer,
+     };
+ 
++    qemu_mutex_lock(&r->queue_lock);
+     VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, VK_NULL_HANDLE));
+     VK_CHECK(vkQueueWaitIdle(r->queue));
++    qemu_mutex_unlock(&r->queue_lock);
+ 
+     void *data;
+     VK_CHECK(
+diff --git a/hw/xbox/nv2a/pgraph/vk/instance.c b/hw/xbox/nv2a/pgraph/vk/instance.c
+index edead06c0f..1e3e090860 100644
+--- a/hw/xbox/nv2a/pgraph/vk/instance.c
++++ b/hw/xbox/nv2a/pgraph/vk/instance.c
+@@ -32,6 +32,7 @@ static char const *const validation_layers[] = {
+ };
+ 
+ static char const *const required_device_extensions[] = {
++#if HAVE_EXTERNAL_MEMORY
+ #ifdef WIN32
+     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+@@ -39,8 +40,21 @@ static char const *const required_device_extensions[] = {
+     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+ #endif
++#else
++    /* No OpenGL UI to hand frames to: the Vulkan UI presents them itself. */
++    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
++#endif
+ };
+ 
++#ifdef __PROSPERO__
++/*
++ * PS5: RADV is linked in statically, so there is no loader library for
++ * volkInitialize() to open. Its ICD entry point serves as the loader's.
++ */
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName);
++#endif
++
+ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
+     VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+     VkDebugUtilsMessageTypeFlagsEXT messageType,
+@@ -142,6 +156,15 @@ add_optional_instance_extension_names(PGRAPHState *pg,
+         g_config.display.vulkan.validation_layers &&
+         add_extension_if_available(available_extensions, enabled_extension_names,
+                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
++
++#ifdef __PROSPERO__
++    /* The PS5 has no window system: the Vulkan UI presents to VideoOut. */
++    r->display_extension_enabled =
++        add_extension_if_available(available_extensions, enabled_extension_names,
++                                   VK_KHR_SURFACE_EXTENSION_NAME) &&
++        add_extension_if_available(available_extensions, enabled_extension_names,
++                                   VK_KHR_DISPLAY_EXTENSION_NAME);
++#endif
+ }
+ 
+ static bool create_instance(PGRAPHState *pg, Error **errp)
+@@ -149,11 +172,15 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
+     PGRAPHVkState *r = pg->vk_renderer_state;
+     VkResult result;
+ 
++#ifdef __PROSPERO__
++    volkInitializeCustom(vk_icdGetInstanceProcAddr);
++#else
+     result = volkInitialize();
+     if (result != VK_SUCCESS) {
+         error_setg(errp, "volkInitialize failed");
+         return false;
+     }
++#endif
+ 
+     uint32_t instance_version = VK_API_VERSION_1_0;
+     if (vkEnumerateInstanceVersion) {
+@@ -553,6 +580,7 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
+     }
+ 
+     vkGetDeviceQueue(r->device, indices.queue_family, 0, &r->queue);
++    qemu_mutex_init(&r->queue_lock);
+     return true;
+ }
+ 
+@@ -635,6 +663,7 @@ void pgraph_vk_finalize_instance(PGRAPHState *pg)
+     if (r->device != VK_NULL_HANDLE) {
+         vkDestroyDevice(r->device, NULL);
+         r->device = VK_NULL_HANDLE;
++        qemu_mutex_destroy(&r->queue_lock);
+     }
+ 
+     if (r->debug_messenger != VK_NULL_HANDLE) {
+diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.c b/hw/xbox/nv2a/pgraph/vk/renderer.c
+index 4272bbceb6..6636faeb8e 100644
+--- a/hw/xbox/nv2a/pgraph/vk/renderer.c
++++ b/hw/xbox/nv2a/pgraph/vk/renderer.c
+@@ -18,11 +18,13 @@
+  */
+ 
+ #include "hw/xbox/nv2a/nv2a_int.h"
++#include "ui/xemu-settings.h"
+ #include "renderer.h"
++#include "vk-ui.h"
+ 
++#if HAVE_EXTERNAL_MEMORY
+ #include "gloffscreen.h"
+ 
+-#if HAVE_EXTERNAL_MEMORY
+ static GloContext *g_gl_context;
+ #endif
+ 
+@@ -120,7 +122,8 @@ static void pgraph_vk_process_pending(NV2AState *d)
+     if (qatomic_read(&r->downloads_pending) ||
+         qatomic_read(&r->download_dirty_surfaces_pending) ||
+         qatomic_read(&d->pgraph.sync_pending) ||
+-        qatomic_read(&d->pgraph.flush_pending)
++        qatomic_read(&d->pgraph.flush_pending) ||
++        qatomic_read(&r->cache_save_pending)
+     ) {
+         qemu_mutex_unlock(&d->pfifo.lock);
+         qemu_mutex_lock(&d->pgraph.lock);
+@@ -136,6 +139,9 @@ static void pgraph_vk_process_pending(NV2AState *d)
+         if (qatomic_read(&d->pgraph.flush_pending)) {
+             pgraph_vk_flush(d);
+         }
++        if (qatomic_xchg(&r->cache_save_pending, false)) {
++            pgraph_vk_save_pipeline_cache(&d->pgraph);
++        }
+         qemu_mutex_unlock(&d->pgraph.lock);
+         qemu_mutex_lock(&d->pfifo.lock);
+     }
+@@ -190,17 +196,16 @@ static int pgraph_vk_get_framebuffer_surface(NV2AState *d)
+ 
+     surface->frame_time = pg->frame_time;
+ 
+-#if HAVE_EXTERNAL_MEMORY
+     qemu_event_reset(&d->pgraph.sync_complete);
+     qatomic_set(&pg->sync_pending, true);
+     pfifo_kick(d);
+     qemu_mutex_unlock(&d->pfifo.lock);
+     qemu_event_wait(&d->pgraph.sync_complete);
++#if HAVE_EXTERNAL_MEMORY
+     return r->display.gl_texture_id;
+ #else
+-    qemu_mutex_unlock(&d->pfifo.lock);
+-    pgraph_vk_wait_for_surface_download(surface);
+-    return 0;
++    /* The Vulkan UI samples the display image itself (pgraph_vk_get_display). */
++    return r->display.image != VK_NULL_HANDLE;
+ #endif
+ }
+ 
+@@ -238,6 +243,74 @@ static void __attribute__((constructor)) register_renderer(void)
+     pgraph_renderer_register(&pgraph_vk_renderer);
+ }
+ 
++static PGRAPHVkState *get_active_state(void)
++{
++    if (!g_nv2a || g_nv2a->pgraph.renderer != &pgraph_vk_renderer) {
++        return NULL;
++    }
++    PGRAPHVkState *r = g_nv2a->pgraph.vk_renderer_state;
++    return (r && r->device != VK_NULL_HANDLE) ? r : NULL;
++}
++
++bool pgraph_vk_get_ui_context(PGRAPHVkUIContext *ctx)
++{
++    PGRAPHVkState *r = get_active_state();
++    if (!r) {
++        return false;
++    }
++
++    *ctx = (PGRAPHVkUIContext){
++        .api_version = r->vk_api_version,
++        .instance = r->instance,
++        .physical_device = r->physical_device,
++        .device = r->device,
++        .queue_family =
++            pgraph_vk_find_queue_families(r->physical_device).queue_family,
++        .queue = r->queue,
++        .display_extension_enabled = r->display_extension_enabled,
++    };
++    return true;
++}
++
++void pgraph_vk_request_cache_save(void)
++{
++    PGRAPHVkState *r = get_active_state();
++    if (r && g_config.perf.cache_shaders) {
++        qatomic_set(&r->cache_save_pending, true);
++    }
++}
++
++void pgraph_vk_lock_queue(void)
++{
++    qemu_mutex_lock(&get_active_state()->queue_lock);
++}
++
++void pgraph_vk_unlock_queue(void)
++{
++    qemu_mutex_unlock(&get_active_state()->queue_lock);
++}
++
++bool pgraph_vk_get_display(VkImage *image, VkImageView *view, int *width,
++                           int *height)
++{
++    PGRAPHVkState *r = get_active_state();
++    if (!r || r->display.image_view == VK_NULL_HANDLE) {
++        return false;
++    }
++
++    *image = r->display.image;
++    *view = r->display.image_view;
++    *width = r->display.width;
++    *height = r->display.height;
++    return true;
++}
++
++const char *pgraph_vk_get_device_name(void)
++{
++    PGRAPHVkState *r = get_active_state();
++    return r ? r->device_props.deviceName : "Vulkan";
++}
++
+ void pgraph_vk_check_memory_budget(PGRAPHState *pg)
+ {
+ #if 0 // FIXME
+diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.h b/hw/xbox/nv2a/pgraph/vk/renderer.h
+index deb8762225..156e15155f 100644
+--- a/hw/xbox/nv2a/pgraph/vk/renderer.h
++++ b/hw/xbox/nv2a/pgraph/vk/renderer.h
+@@ -41,7 +41,16 @@
+ #include "constants.h"
+ #include "glsl.h"
+ 
++/*
++ * Share the display image with the OpenGL UI through external memory. Builds
++ * without OpenGL (the PS5) present the display image with Vulkan directly.
++ */
++#ifdef CONFIG_OPENGL
+ #define HAVE_EXTERNAL_MEMORY 1
++#include <epoxy/gl.h>
++#else
++#define HAVE_EXTERNAL_MEMORY 0
++#endif
+ 
+ typedef struct QueueFamilyIndices {
+     int queue_family;
+@@ -286,6 +295,7 @@ typedef struct PGRAPHVkDisplayState {
+     int width, height;
+     int draw_time;
+ 
++#if HAVE_EXTERNAL_MEMORY
+     // OpenGL Interop
+ #ifdef WIN32
+     HANDLE handle;
+@@ -294,6 +304,7 @@ typedef struct PGRAPHVkDisplayState {
+ #endif
+     GLuint gl_memory_obj;
+     GLuint gl_texture_id;
++#endif
+ } PGRAPHVkDisplayState;
+ 
+ typedef struct ComputePipelineKey {
+@@ -327,6 +338,7 @@ typedef struct PGRAPHVkState {
+     bool debug_utils_extension_enabled;
+     bool custom_border_color_extension_enabled;
+     bool memory_budget_extension_enabled;
++    bool display_extension_enabled; /* VK_KHR_surface + VK_KHR_display */
+ 
+     VkPhysicalDevice physical_device;
+     VkPhysicalDeviceFeatures enabled_physical_device_features;
+@@ -336,6 +348,7 @@ typedef struct PGRAPHVkState {
+     uint32_t allocator_last_submit_index;
+ 
+     VkQueue queue;
++    QemuMutex queue_lock; /* Also taken by the Vulkan UI to submit and present */
+     VkCommandPool command_pool;
+     VkCommandBuffer command_buffers[2];
+ 
+@@ -390,6 +403,7 @@ typedef struct PGRAPHVkState {
+     bool downloads_pending;
+     QemuEvent downloads_complete;
+     bool download_dirty_surfaces_pending;
++    bool cache_save_pending; /* XPSemu: save the pipeline cache (draw.c) */
+     QemuEvent dirty_surfaces_download_complete; // common
+ 
+     Lru texture_cache;
+@@ -522,6 +536,7 @@ void pgraph_vk_surface_update(NV2AState *d, bool upload, bool color_write,
+ SurfaceBinding *pgraph_vk_surface_get(NV2AState *d, hwaddr addr);
+ void pgraph_vk_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta);
+ void pgraph_vk_set_surface_scale_factor(NV2AState *d, unsigned int scale);
++void pgraph_vk_save_pipeline_cache(PGRAPHState *pg);
+ unsigned int pgraph_vk_get_surface_scale_factor(NV2AState *d);
+ void pgraph_vk_reload_surface_scale_factor(PGRAPHState *pg);
+ 
+diff --git a/hw/xbox/nv2a/pgraph/vk/surface.c b/hw/xbox/nv2a/pgraph/vk/surface.c
+index 9d438f2d7b..794be26c86 100644
+--- a/hw/xbox/nv2a/pgraph/vk/surface.c
++++ b/hw/xbox/nv2a/pgraph/vk/surface.c
+@@ -28,6 +28,7 @@
+ #include "qemu/compiler.h"
+ #include "ui/xemu-settings.h"
+ #include "renderer.h"
++#include "hw/xbox/xemu-timing.h"
+ 
+ const int num_invalid_surfaces_to_keep = 10;  // FIXME: Make automatic
+ const int max_surface_frame_time_delta = 5;
+@@ -480,7 +481,9 @@ static void download_surface(NV2AState *d, SurfaceBinding *surface, bool force)
+ 
+     // FIXME: Respect write enable at last TOU?
+ 
++    uint64_t xt_download = xemu_timing_now();
+     download_surface_to_buffer(d, surface, d->vram_ptr + surface->vram_addr);
++    xemu_timing_add(XT_DOWNLOAD, xt_download);
+ 
+     memory_region_set_client_dirty(d->vram, surface->vram_addr,
+                                    surface->pitch * surface->height,
+diff --git a/hw/xbox/smbus_storage.c b/hw/xbox/smbus_storage.c
+index e2e0497b26..778f4aaf05 100644
+--- a/hw/xbox/smbus_storage.c
++++ b/hw/xbox/smbus_storage.c
+@@ -31,6 +31,8 @@
+ #include "qapi/error.h"
+ #include "hw/loader.h"
+ #include "migration/vmstate.h"
++#include "qom/object.h"
++#include "xemu-eeprom.h"
+ 
+ #define TYPE_SMBUS_STORAGE "smbus-storage"
+ #define SMBUS_STORAGE(obj) OBJECT_CHECK(SMBusStorageDevice, (obj), \
+@@ -171,6 +173,67 @@ static void smbus_storage_class_init(ObjectClass *klass, const void *data)
+     device_class_set_props(dc, smbus_storage_props);
+ }
+ 
++/*
++ * XPSemu: the EEPROM's video settings. The user section (time zone,
++ * language, video, audio...) starts at 0x64, its checksum at 0x60 covers
++ * 0x5C bytes of it (eeprom_generation.c), and the video flags are at 0x94.
++ */
++#define EEPROM_USER_CHECKSUM 0x60
++#define EEPROM_USER_SECTION 0x64
++#define EEPROM_USER_CHECKED 0x5C
++#define EEPROM_VIDEO_FLAGS 0x94
++
++static SMBusStorageDevice *xemu_eeprom(void)
++{
++    Object *o = object_resolve_path_type("", TYPE_SMBUS_STORAGE, NULL);
++    SMBusStorageDevice *s = o ? SMBUS_STORAGE(o) : NULL;
++    return s && s->data && s->size >= 256 ? s : NULL;
++}
++
++static uint32_t xemu_eeprom_crc(const uint8_t *data, size_t len)
++{
++    uint32_t high = 0, low = 0;
++    for (size_t i = 0; i < len / 4; i++) {
++        uint32_t val = ldl_le_p(data + i * 4);
++        uint64_t sum = ((uint64_t)high << 32) | low;
++        high = (sum + val) >> 32;
++        low += val;
++    }
++    return ~(high + low);
++}
++
++bool xemu_eeprom_get_video_flags(uint32_t *flags)
++{
++    SMBusStorageDevice *s = xemu_eeprom();
++    if (!s) {
++        return false;
++    }
++    *flags = ldl_le_p(s->data + EEPROM_VIDEO_FLAGS);
++    return true;
++}
++
++bool xemu_eeprom_set_video_flags(uint32_t flags)
++{
++    SMBusStorageDevice *s = xemu_eeprom();
++    if (!s) {
++        return false;
++    }
++    stl_le_p(s->data + EEPROM_VIDEO_FLAGS, flags);
++    stl_le_p(s->data + EEPROM_USER_CHECKSUM,
++             xemu_eeprom_crc(s->data + EEPROM_USER_SECTION,
++                             EEPROM_USER_CHECKED));
++    if (s->file && s->persist) {
++        int fd = qemu_open(s->file, O_WRONLY | O_BINARY, NULL);
++        if (fd < 0) {
++            return false;
++        }
++        bool ok = write(fd, s->data, s->size) == (ssize_t)s->size;
++        close(fd);
++        return ok;
++    }
++    return true;
++}
++
+ static TypeInfo smbus_storage_info = {
+     .name = TYPE_SMBUS_STORAGE,
+     .parent = TYPE_SMBUS_DEVICE,
+diff --git a/meson.build b/meson.build
+index 82e5f5af65..999657d851 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1882,10 +1882,10 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
+                          required: get_option('coreaudio'))
+ endif
+ 
+-epoxy = dependency('epoxy', required: true)
++epoxy = dependency('epoxy', required: get_option('opengl'))
+ 
+ opengl = not_found
+-if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
++if epoxy.found() and (not get_option('opengl').auto() or have_system or have_vhost_user_gpu)
+   # FIXME: Use meson's 'gl' dep
+   if host_os == 'darwin'
+     opengl_libs=['-framework', 'OpenGL']
+@@ -2389,7 +2389,7 @@ libglslang = not_found
+ 
+ if host_os == 'windows'
+   vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
+-elif host_os == 'linux'
++elif host_os in ['linux', 'freebsd']
+   vulkan = dependency('vulkan')
+ endif
+ 
+@@ -2413,6 +2413,9 @@ if vulkan.found()
+   volk_opts.add_cmake_defines({'VOLK_STATIC_DEFINES': 'VK_NO_PROTOTYPES'})
+   if host_os == 'windows'
+     volk_opts.append_compile_args('c', '-DVK_USE_PLATFORM_WIN32_KHR=1')
++  elif host_os == 'freebsd'
++    # Keep CMake's FindVulkan off the build machine's headers when cross-compiling.
++    volk_opts.add_cmake_defines({'Vulkan_INCLUDE_DIR': vulkan.get_variable(pkgconfig: 'includedir')})
+   endif
+   volk_subproj = cmake.subproject('volk', options: volk_opts)
+   volk = declare_dependency(compile_args: ['-DVK_NO_PROTOTYPES'],
+@@ -2445,10 +2448,10 @@ imgui_proj = subproject('imgui', required: true,
+                            'dx11=disabled',
+                            'dx12=disabled',
+                            'metal=disabled',
+-                           'opengl=enabled',
++                           opengl.found() ? 'opengl=enabled' : 'opengl=disabled',
+                            'sdl2_renderer=disabled',
+                            'sdl3_renderer=disabled',
+-                           'vulkan=disabled',
++                           opengl.found() ? 'vulkan=disabled' : 'vulkan=enabled',
+                            'webgpu=disabled',
+                            'glfw=disabled',
+                            'sdl2=disabled',
+diff --git a/system/physmem.c b/system/physmem.c
+index 009c7931fc..fb9c5b5c39 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -2611,6 +2611,13 @@ RAMBlock *qemu_ram_alloc_internal(ram_addr_t size, ram_addr_t max_size,
+     Error *local_err = NULL;
+     int align, share_flags;
+ 
++#ifdef __PROSPERO__
++    if (size >= (1 << 20)) { /* The big allocations in the log */
++        fprintf(stderr, "xemu PS5: RAM block '%s' %" PRIu64 " KiB\n",
++                mr ? memory_region_name(mr) : "?", (uint64_t)(size >> 10));
++    }
++#endif
++
+     share_flags = ram_flags & (RAM_PRIVATE | RAM_SHARED);
+     assert(share_flags != (RAM_SHARED | RAM_PRIVATE));
+     ram_flags &= ~RAM_PRIVATE;
+diff --git a/system/vl.c b/system/vl.c
+index f45bdc3458..db7706e1a0 100644
+--- a/system/vl.c
++++ b/system/vl.c
+@@ -3096,6 +3096,11 @@ void qemu_init(int argc, char **argv)
+ 
+     fake_argv[fake_argc++] = strdup("-display");
+     fake_argv[fake_argc++] = strdup("xemu");
++#ifdef __PROSPERO__
++    /* XPSemu: the Xbox stays off until its dashboard starts a game or the
++     * Xbox's own dashboard (so neither shows before it). */
++    fake_argv[fake_argc++] = strdup("-S");
++#endif
+ 
+     // Create USB Daughterboard for 1.0 Xbox. This is connected to Port 1 of the Root hub.
+     fake_argv[fake_argc++] = strdup("-device");
+diff --git a/target/i386/ops_sse.h b/target/i386/ops_sse.h
+index a2e4d48039..22206bc2c2 100644
+--- a/target/i386/ops_sse.h
++++ b/target/i386/ops_sse.h
+@@ -22,6 +22,142 @@
+ #include "crypto/aes-round.h"
+ #include "crypto/clmul.h"
+ 
++#if defined(__PROSPERO__) && !defined(XPS_SIMD_HELPERS)
++#define XPS_SIMD_HELPERS
++/*
++ * XPSemu: the PS5's CPU is x86 too, so some of the Xbox's MMX/SSE
++ * instructions are one host instruction instead of a loop of emulated
++ * steps (Fable spent ~10% of its CPU thread in the MMX unpack/pack loops
++ * and ~20% in emulated float math).
++ */
++#include <immintrin.h>
++
++/* MMX punpck{l,h}{bw,wd,dq}: interleave the low (or high) halves. */
++static inline void xps_mmx_unpck(void *d, const void *v, const void *s,
++                                 int high, int size)
++{
++    __m128i a = _mm_loadl_epi64((const __m128i *)v);
++    __m128i b = _mm_loadl_epi64((const __m128i *)s);
++    __m128i r = size == 8  ? _mm_unpacklo_epi8(a, b) :
++                size == 16 ? _mm_unpacklo_epi16(a, b) :
++                             _mm_unpacklo_epi32(a, b);
++    if (high) {
++        r = _mm_srli_si128(r, 8);
++    }
++    _mm_storel_epi64((__m128i *)d, r);
++}
++
++enum { XPS_PACK_sswb, XPS_PACK_uswb, XPS_PACK_ssdw };
++
++/* MMX packsswb/packuswb/packssdw: v's then s's elements, saturated. */
++static inline void xps_mmx_pack(void *d, const void *v, const void *s,
++                                int kind)
++{
++    __m128i x = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)v),
++                                   _mm_loadl_epi64((const __m128i *)s));
++    __m128i r = kind == XPS_PACK_sswb ? _mm_packs_epi16(x, x) :
++                kind == XPS_PACK_uswb ? _mm_packus_epi16(x, x) :
++                                        _mm_packs_epi32(x, x);
++    _mm_storel_epi64((__m128i *)d, r);
++}
++
++enum { XPS_OP_add, XPS_OP_sub, XPS_OP_mul, XPS_OP_div, XPS_OP_min,
++       XPS_OP_max };
++
++/*
++ * SSE add/sub/mul/div ps (4 lanes) and ss (lane 0) with the host's SSE,
++ * under the same conditions as softfloat's own hardfloat path (round to
++ * nearest, inexact already raised): every input zero or normal, every
++ * result normal (or an exact zero from zero inputs). Then the host's
++ * result is bit-exact and no new flag can arise; anything else (NaN, inf,
++ * denormals, possible underflow) goes the emulated way.
++ */
++static inline bool xps_lane_ok(uint32_t x)
++{
++    uint32_t e = x & 0x7f800000;
++    return e != 0x7f800000 && (e != 0 || !(x & 0x7fffffff));
++}
++
++static inline bool xps_sse_fast(CPUX86State *env, int op, void *d,
++                                const void *v, const void *s, int lanes)
++{
++    float_status *st = &env->sse_status;
++    uint32_t a[4], b[4], r[4];
++    __m128 va, vb, vr;
++    int i;
++
++    if (op > XPS_OP_div ||
++        !(st->float_exception_flags & float_flag_inexact) ||
++        st->float_rounding_mode != float_round_nearest_even) {
++        return false;
++    }
++    va = _mm_loadu_ps((const float *)v);
++    vb = _mm_loadu_ps((const float *)s);
++    _mm_storeu_si128((__m128i *)a, _mm_castps_si128(va));
++    _mm_storeu_si128((__m128i *)b, _mm_castps_si128(vb));
++    for (i = 0; i < lanes; i++) {
++        if (!xps_lane_ok(a[i]) || !xps_lane_ok(b[i]) ||
++            (op == XPS_OP_div && !(b[i] & 0x7f800000))) {
++            return false;
++        }
++    }
++    switch (op) {
++    case XPS_OP_add: vr = _mm_add_ps(va, vb); break;
++    case XPS_OP_sub: vr = _mm_sub_ps(va, vb); break;
++    case XPS_OP_mul: vr = _mm_mul_ps(va, vb); break;
++    default:         vr = _mm_div_ps(va, vb); break;
++    }
++    _mm_storeu_si128((__m128i *)r, _mm_castps_si128(vr));
++    for (i = 0; i < lanes; i++) {
++        uint32_t m = r[i] & 0x7fffffff;
++        if ((r[i] & 0x7f800000) == 0x7f800000) {
++            return false; /* overflow */
++        }
++        if (m <= 0x00800000) { /* zero, denormal or FLT_MIN */
++            bool az = !(a[i] & 0x7fffffff), bz = !(b[i] & 0x7fffffff);
++            bool exact = m == 0 &&
++                         (op == XPS_OP_mul ? (az || bz) :
++                          op == XPS_OP_div ? az : (az && bz));
++            if (!exact) {
++                return false;
++            }
++        }
++    }
++    if (lanes == 4) {
++        _mm_storeu_ps((float *)d, vr);
++    } else {
++        uint32_t *o = d;
++        o[0] = r[0];
++        o[1] = a[1];
++        o[2] = a[2];
++        o[3] = a[3];
++    }
++    return true;
++}
++#endif
++
++#undef XPS_MMX_UNPCK
++#undef XPS_MMX_PACK
++#undef XPS_SSE_PS
++#undef XPS_SSE_SS
++#ifdef __PROSPERO__
++#define XPS_MMX_UNPCK(high, size) \
++    if (SHIFT == 0) { xps_mmx_unpck(d, v, s, high, size); return; }
++#define XPS_MMX_PACK(kind) \
++    if (SHIFT == 0) { xps_mmx_pack(d, v, s, kind); return; }
++#define XPS_SSE_PS(name) \
++    if (SHIFT == 1 && xps_sse_fast(env, XPS_OP_ ## name, d, v, s, 4)) { \
++        return; \
++    }
++#define XPS_SSE_SS(name) \
++    if (xps_sse_fast(env, XPS_OP_ ## name, d, v, s, 1)) { return; }
++#else
++#define XPS_MMX_UNPCK(high, size)
++#define XPS_MMX_PACK(kind)
++#define XPS_SSE_PS(name)
++#define XPS_SSE_SS(name)
++#endif
++
+ #if SHIFT == 0
+ #define Reg MMXReg
+ #define XMM_ONLY(...)
+@@ -467,6 +603,7 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
+     void glue(helper_ ## name ## ps, SUFFIX)(CPUX86State *env,          \
+             Reg *d, Reg *v, Reg *s)                                     \
+     {                                                                   \
++        XPS_SSE_PS(name)                                                \
+         int i;                                                          \
+         for (i = 0; i < 2 << SHIFT; i++) {                              \
+             d->ZMM_S(i) = F(32, v->ZMM_S(i), s->ZMM_S(i));              \
+@@ -489,6 +626,7 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
+                                                                         \
+     void helper_ ## name ## ss(CPUX86State *env, Reg *d, Reg *v, Reg *s)\
+     {                                                                   \
++        XPS_SSE_SS(name)                                                \
+         int i;                                                          \
+         d->ZMM_S(0) = F(32, v->ZMM_S(0), s->ZMM_S(0));                  \
+         for (i = 1; i < 2 << SHIFT; i++) {                              \
+@@ -1181,6 +1319,7 @@ uint32_t glue(helper_movmskpd, SUFFIX)(CPUX86State *env, Reg *s)
+ void glue(helper_pack ## name, SUFFIX)(CPUX86State *env,      \
+         Reg *d, Reg *v, Reg *s)                               \
+ {                                                             \
++    XPS_MMX_PACK(XPS_PACK_ ## name)                                     \
+     uint8_t r[PACK_WIDTH * 2];                                \
+     int j, k;                                                 \
+     for (j = 0; j < 4 << SHIFT; j += PACK_WIDTH) {            \
+@@ -1201,6 +1340,7 @@ PACK_HELPER_B(uswb, satub)
+ 
+ void glue(helper_packssdw, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+ {
++    XPS_MMX_PACK(XPS_PACK_ssdw)
+     uint16_t r[PACK_WIDTH];
+     int j, k;
+ 
+@@ -1222,6 +1362,7 @@ void glue(helper_packssdw, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+     void glue(helper_punpck ## base_name ## bw, SUFFIX)(CPUX86State *env,\
+                                                 Reg *d, Reg *v, Reg *s) \
+     {                                                                   \
++        XPS_MMX_UNPCK(base, 8)                                          \
+         uint8_t r[PACK_WIDTH * 2];                                      \
+         int j, i;                                                       \
+                                                                         \
+@@ -1240,6 +1381,7 @@ void glue(helper_packssdw, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+     void glue(helper_punpck ## base_name ## wd, SUFFIX)(CPUX86State *env,\
+                                                 Reg *d, Reg *v, Reg *s) \
+     {                                                                   \
++        XPS_MMX_UNPCK(base, 16)                                         \
+         uint16_t r[PACK_WIDTH];                                         \
+         int j, i;                                                       \
+                                                                         \
+@@ -1258,6 +1400,7 @@ void glue(helper_packssdw, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
+     void glue(helper_punpck ## base_name ## dq, SUFFIX)(CPUX86State *env,\
+                                                 Reg *d, Reg *v, Reg *s) \
+     {                                                                   \
++        XPS_MMX_UNPCK(base, 32)                                         \
+         uint32_t r[PACK_WIDTH / 2];                                     \
+         int j, i;                                                       \
+                                                                         \
+diff --git a/target/i386/tcg/emit.c.inc b/target/i386/tcg/emit.c.inc
+index 540020c82b..a238871249 100644
+--- a/target/i386/tcg/emit.c.inc
++++ b/target/i386/tcg/emit.c.inc
+@@ -899,14 +899,76 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)
+                           gen_helper_##lname##_xmm,                                \
+                           gen_helper_##lname##_ymm);                               \
+ }
+-BINARY_INT_MMX(PUNPCKLBW,  punpcklbw)
+-BINARY_INT_MMX(PUNPCKLWD,  punpcklwd)
+-BINARY_INT_MMX(PUNPCKLDQ,  punpckldq)
++#ifdef __PROSPERO__
++/*
++ * XPSemu: MMX punpck{l,h}{bw,wd,dq} as a few 64-bit ops in the translated
++ * code instead of a helper call (Fable runs them constantly).
++ */
++static void xps_spread(TCGv_i64 x, int size)
++{
++    /* The low 32 bits' elements, each to the bottom of a lane twice as wide */
++    TCGv_i64 t = tcg_temp_new_i64();
++
++    tcg_gen_ext32u_i64(x, x);
++    tcg_gen_shli_i64(t, x, 16);
++    tcg_gen_or_i64(x, x, t);
++    tcg_gen_andi_i64(x, x, 0x0000ffff0000ffffull);
++    if (size == 8) {
++        tcg_gen_shli_i64(t, x, 8);
++        tcg_gen_or_i64(x, x, t);
++        tcg_gen_andi_i64(x, x, 0x00ff00ff00ff00ffull);
++    }
++}
++
++static bool xps_gen_punpck_mmx(DisasContext *s, X86DecodedInsn *decode,
++                               bool high, int size)
++{
++    TCGv_i64 a, b;
++
++    if (s->prefix & (PREFIX_DATA | PREFIX_VEX)) {
++        return false; /* XMM/YMM, or VEX (illegal for MMX): the usual way */
++    }
++    a = tcg_temp_new_i64();
++    b = tcg_temp_new_i64();
++    tcg_gen_ld_i64(a, tcg_env, vector_reg_offset(&decode->op[1]));
++    tcg_gen_ld_i64(b, tcg_env, vector_reg_offset(&decode->op[2]));
++    if (high) {
++        tcg_gen_shri_i64(a, a, 32);
++        tcg_gen_shri_i64(b, b, 32);
++    }
++    if (size == 32) {
++        tcg_gen_deposit_i64(a, a, b, 32, 32);
++    } else {
++        xps_spread(a, size);
++        xps_spread(b, size);
++        tcg_gen_shli_i64(b, b, size);
++        tcg_gen_or_i64(a, a, b);
++    }
++    tcg_gen_st_i64(a, tcg_env, vector_reg_offset(&decode->op[0]));
++    return true;
++}
++
++#define XPS_PUNPCK(uname, lname, high, size)                                       \
++static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
++{                                                                                  \
++    if (!xps_gen_punpck_mmx(s, decode, high, size)) {                              \
++        gen_binary_int_sse(s, decode,                                              \
++                              gen_helper_##lname##_mmx,                            \
++                              gen_helper_##lname##_xmm,                            \
++                              gen_helper_##lname##_ymm);                           \
++    }                                                                              \
++}
++#else
++#define XPS_PUNPCK(uname, lname, high, size) BINARY_INT_MMX(uname, lname)
++#endif
++XPS_PUNPCK(PUNPCKLBW,  punpcklbw, false, 8)
++XPS_PUNPCK(PUNPCKLWD,  punpcklwd, false, 16)
++XPS_PUNPCK(PUNPCKLDQ,  punpckldq, false, 32)
+ BINARY_INT_MMX(PACKSSWB,   packsswb)
+ BINARY_INT_MMX(PACKUSWB,   packuswb)
+-BINARY_INT_MMX(PUNPCKHBW,  punpckhbw)
+-BINARY_INT_MMX(PUNPCKHWD,  punpckhwd)
+-BINARY_INT_MMX(PUNPCKHDQ,  punpckhdq)
++XPS_PUNPCK(PUNPCKHBW,  punpckhbw, true, 8)
++XPS_PUNPCK(PUNPCKHWD,  punpckhwd, true, 16)
++XPS_PUNPCK(PUNPCKHDQ,  punpckhdq, true, 32)
+ BINARY_INT_MMX(PACKSSDW,   packssdw)
+ 
+ BINARY_INT_MMX(PAVGB,   pavgb)
+diff --git a/target/i386/tcg/ops_sse_header.h.inc b/target/i386/tcg/ops_sse_header.h.inc
+index d92c6faf6d..200e6b059e 100644
+--- a/target/i386/tcg/ops_sse_header.h.inc
++++ b/target/i386/tcg/ops_sse_header.h.inc
+@@ -28,6 +28,7 @@
+ #endif
+ #endif
+ 
++/* XPSemu: pure math helpers are TCG_CALL_NO_RWG (see ps5 notes). */
+ #define dh_alias_Reg ptr
+ #define dh_alias_ZMMReg ptr
+ #define dh_alias_MMXReg ptr
+@@ -74,9 +75,9 @@ SSE_HELPER_B(pavgb, FAVG)
+ SSE_HELPER_W(pavgw, FAVG)
+ 
+ DEF_HELPER_4(glue(pmuludq, SUFFIX), void, env, Reg, Reg, Reg)
+-DEF_HELPER_4(glue(pmaddwd, SUFFIX), void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_4(glue(pmaddwd, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
+ 
+-DEF_HELPER_4(glue(psadbw, SUFFIX), void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_4(glue(psadbw, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
+ #if SHIFT < 2
+ DEF_HELPER_4(glue(maskmov, SUFFIX), void, env, Reg, Reg, tl)
+ #endif
+@@ -94,29 +95,29 @@ DEF_HELPER_3(glue(pshufhw, SUFFIX), void, Reg, Reg, int)
+ /* XXX: not accurate */
+ 
+ #define SSE_HELPER_P4(name)                                             \
+-    DEF_HELPER_4(glue(name ## ps, SUFFIX), void, env, Reg, Reg, Reg)    \
+-    DEF_HELPER_4(glue(name ## pd, SUFFIX), void, env, Reg, Reg, Reg)
++    DEF_HELPER_FLAGS_4(glue(name ## ps, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)    \
++    DEF_HELPER_FLAGS_4(glue(name ## pd, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
+ 
+ #define SSE_HELPER_P3(name, ...)                                        \
+-    DEF_HELPER_3(glue(name ## ps, SUFFIX), void, env, Reg, Reg)         \
+-    DEF_HELPER_3(glue(name ## pd, SUFFIX), void, env, Reg, Reg)
++    DEF_HELPER_FLAGS_3(glue(name ## ps, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg)         \
++    DEF_HELPER_FLAGS_3(glue(name ## pd, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg)
+ 
+ #if SHIFT == 1
+ #define SSE_HELPER_S4(name)                                             \
+     SSE_HELPER_P4(name)                                                 \
+-    DEF_HELPER_4(name ## ss, void, env, Reg, Reg, Reg)                  \
+-    DEF_HELPER_4(name ## sd, void, env, Reg, Reg, Reg)
++    DEF_HELPER_FLAGS_4(name ## ss, TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)                  \
++    DEF_HELPER_FLAGS_4(name ## sd, TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
+ #define SSE_HELPER_S3(name)                                             \
+     SSE_HELPER_P3(name)                                                 \
+-    DEF_HELPER_4(name ## ss, void, env, Reg, Reg, Reg)                  \
+-    DEF_HELPER_4(name ## sd, void, env, Reg, Reg, Reg)
++    DEF_HELPER_FLAGS_4(name ## ss, TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)                  \
++    DEF_HELPER_FLAGS_4(name ## sd, TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
+ #else
+ #define SSE_HELPER_S4(name, ...) SSE_HELPER_P4(name)
+ #define SSE_HELPER_S3(name, ...) SSE_HELPER_P3(name)
+ #endif
+ 
+-DEF_HELPER_4(glue(shufps, SUFFIX), void, Reg, Reg, Reg, int)
+-DEF_HELPER_4(glue(shufpd, SUFFIX), void, Reg, Reg, Reg, int)
++DEF_HELPER_FLAGS_4(glue(shufps, SUFFIX), TCG_CALL_NO_RWG, void, Reg, Reg, Reg, int)
++DEF_HELPER_FLAGS_4(glue(shufpd, SUFFIX), TCG_CALL_NO_RWG, void, Reg, Reg, Reg, int)
+ 
+ SSE_HELPER_S4(add)
+ SSE_HELPER_S4(sub)
+@@ -127,46 +128,46 @@ SSE_HELPER_S4(max)
+ 
+ SSE_HELPER_S3(sqrt)
+ 
+-DEF_HELPER_3(glue(cvtps2pd, SUFFIX), void, env, Reg, Reg)
+-DEF_HELPER_3(glue(cvtpd2ps, SUFFIX), void, env, Reg, Reg)
+-DEF_HELPER_3(glue(cvtdq2ps, SUFFIX), void, env, Reg, Reg)
+-DEF_HELPER_3(glue(cvtdq2pd, SUFFIX), void, env, Reg, Reg)
++DEF_HELPER_FLAGS_3(glue(cvtps2pd, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg)
++DEF_HELPER_FLAGS_3(glue(cvtpd2ps, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg)
++DEF_HELPER_FLAGS_3(glue(cvtdq2ps, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg)
++DEF_HELPER_FLAGS_3(glue(cvtdq2pd, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg)
+ 
+-DEF_HELPER_3(glue(cvtps2dq, SUFFIX), void, env, ZMMReg, ZMMReg)
+-DEF_HELPER_3(glue(cvtpd2dq, SUFFIX), void, env, ZMMReg, ZMMReg)
++DEF_HELPER_FLAGS_3(glue(cvtps2dq, SUFFIX), TCG_CALL_NO_RWG, void, env, ZMMReg, ZMMReg)
++DEF_HELPER_FLAGS_3(glue(cvtpd2dq, SUFFIX), TCG_CALL_NO_RWG, void, env, ZMMReg, ZMMReg)
+ 
+-DEF_HELPER_3(glue(cvttps2dq, SUFFIX), void, env, ZMMReg, ZMMReg)
+-DEF_HELPER_3(glue(cvttpd2dq, SUFFIX), void, env, ZMMReg, ZMMReg)
++DEF_HELPER_FLAGS_3(glue(cvttps2dq, SUFFIX), TCG_CALL_NO_RWG, void, env, ZMMReg, ZMMReg)
++DEF_HELPER_FLAGS_3(glue(cvttpd2dq, SUFFIX), TCG_CALL_NO_RWG, void, env, ZMMReg, ZMMReg)
+ 
+ #if SHIFT == 1
+-DEF_HELPER_4(cvtss2sd, void, env, Reg, Reg, Reg)
+-DEF_HELPER_4(cvtsd2ss, void, env, Reg, Reg, Reg)
+-DEF_HELPER_3(cvtpi2ps, void, env, ZMMReg, MMXReg)
+-DEF_HELPER_3(cvtpi2pd, void, env, ZMMReg, MMXReg)
+-DEF_HELPER_3(cvtsi2ss, void, env, ZMMReg, i32)
+-DEF_HELPER_3(cvtsi2sd, void, env, ZMMReg, i32)
++DEF_HELPER_FLAGS_4(cvtss2sd, TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_4(cvtsd2ss, TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_3(cvtpi2ps, TCG_CALL_NO_RWG, void, env, ZMMReg, MMXReg)
++DEF_HELPER_FLAGS_3(cvtpi2pd, TCG_CALL_NO_RWG, void, env, ZMMReg, MMXReg)
++DEF_HELPER_FLAGS_3(cvtsi2ss, TCG_CALL_NO_RWG, void, env, ZMMReg, i32)
++DEF_HELPER_FLAGS_3(cvtsi2sd, TCG_CALL_NO_RWG, void, env, ZMMReg, i32)
+ 
+ #ifdef TARGET_X86_64
+-DEF_HELPER_3(cvtsq2ss, void, env, ZMMReg, i64)
+-DEF_HELPER_3(cvtsq2sd, void, env, ZMMReg, i64)
++DEF_HELPER_FLAGS_3(cvtsq2ss, TCG_CALL_NO_RWG, void, env, ZMMReg, i64)
++DEF_HELPER_FLAGS_3(cvtsq2sd, TCG_CALL_NO_RWG, void, env, ZMMReg, i64)
+ #endif
+ 
+-DEF_HELPER_3(cvtps2pi, void, env, MMXReg, ZMMReg)
+-DEF_HELPER_3(cvtpd2pi, void, env, MMXReg, ZMMReg)
+-DEF_HELPER_2(cvtss2si, s32, env, ZMMReg)
+-DEF_HELPER_2(cvtsd2si, s32, env, ZMMReg)
++DEF_HELPER_FLAGS_3(cvtps2pi, TCG_CALL_NO_RWG, void, env, MMXReg, ZMMReg)
++DEF_HELPER_FLAGS_3(cvtpd2pi, TCG_CALL_NO_RWG, void, env, MMXReg, ZMMReg)
++DEF_HELPER_FLAGS_2(cvtss2si, TCG_CALL_NO_RWG, s32, env, ZMMReg)
++DEF_HELPER_FLAGS_2(cvtsd2si, TCG_CALL_NO_RWG, s32, env, ZMMReg)
+ #ifdef TARGET_X86_64
+-DEF_HELPER_2(cvtss2sq, s64, env, ZMMReg)
+-DEF_HELPER_2(cvtsd2sq, s64, env, ZMMReg)
++DEF_HELPER_FLAGS_2(cvtss2sq, TCG_CALL_NO_RWG, s64, env, ZMMReg)
++DEF_HELPER_FLAGS_2(cvtsd2sq, TCG_CALL_NO_RWG, s64, env, ZMMReg)
+ #endif
+ 
+-DEF_HELPER_3(cvttps2pi, void, env, MMXReg, ZMMReg)
+-DEF_HELPER_3(cvttpd2pi, void, env, MMXReg, ZMMReg)
+-DEF_HELPER_2(cvttss2si, s32, env, ZMMReg)
+-DEF_HELPER_2(cvttsd2si, s32, env, ZMMReg)
++DEF_HELPER_FLAGS_3(cvttps2pi, TCG_CALL_NO_RWG, void, env, MMXReg, ZMMReg)
++DEF_HELPER_FLAGS_3(cvttpd2pi, TCG_CALL_NO_RWG, void, env, MMXReg, ZMMReg)
++DEF_HELPER_FLAGS_2(cvttss2si, TCG_CALL_NO_RWG, s32, env, ZMMReg)
++DEF_HELPER_FLAGS_2(cvttsd2si, TCG_CALL_NO_RWG, s32, env, ZMMReg)
+ #ifdef TARGET_X86_64
+-DEF_HELPER_2(cvttss2sq, s64, env, ZMMReg)
+-DEF_HELPER_2(cvttsd2sq, s64, env, ZMMReg)
++DEF_HELPER_FLAGS_2(cvttss2sq, TCG_CALL_NO_RWG, s64, env, ZMMReg)
++DEF_HELPER_FLAGS_2(cvttsd2sq, TCG_CALL_NO_RWG, s64, env, ZMMReg)
+ #endif
+ #endif
+ 
+@@ -235,20 +236,20 @@ DEF_HELPER_2(glue(movmskps, SUFFIX), i32, env, Reg)
+ DEF_HELPER_2(glue(movmskpd, SUFFIX), i32, env, Reg)
+ #endif
+ 
+-DEF_HELPER_4(glue(packsswb, SUFFIX), void, env, Reg, Reg, Reg)
+-DEF_HELPER_4(glue(packuswb, SUFFIX), void, env, Reg, Reg, Reg)
+-DEF_HELPER_4(glue(packssdw, SUFFIX), void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_4(glue(packsswb, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_4(glue(packuswb, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_4(glue(packssdw, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
+ #define UNPCK_OP(name, base)                                       \
+-    DEF_HELPER_4(glue(punpck ## name ## bw, SUFFIX), void, env, Reg, Reg, Reg) \
+-    DEF_HELPER_4(glue(punpck ## name ## wd, SUFFIX), void, env, Reg, Reg, Reg) \
+-    DEF_HELPER_4(glue(punpck ## name ## dq, SUFFIX), void, env, Reg, Reg, Reg)
++    DEF_HELPER_FLAGS_4(glue(punpck ## name ## bw, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg) \
++    DEF_HELPER_FLAGS_4(glue(punpck ## name ## wd, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg) \
++    DEF_HELPER_FLAGS_4(glue(punpck ## name ## dq, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
+ 
+ UNPCK_OP(l, 0)
+ UNPCK_OP(h, 1)
+ 
+ #if SHIFT >= 1
+-DEF_HELPER_4(glue(punpcklqdq, SUFFIX), void, env, Reg, Reg, Reg)
+-DEF_HELPER_4(glue(punpckhqdq, SUFFIX), void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_4(glue(punpcklqdq, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_4(glue(punpckhqdq, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
+ #endif
+ 
+ /* 3DNow! float ops */
+@@ -311,7 +312,7 @@ DEF_HELPER_3(glue(pmovsldup, SUFFIX), void, env, Reg, Reg)
+ DEF_HELPER_3(glue(pmovshdup, SUFFIX), void, env, Reg, Reg)
+ DEF_HELPER_3(glue(pmovdldup, SUFFIX), void, env, Reg, Reg)
+ DEF_HELPER_4(glue(pmuldq, SUFFIX), void, env, Reg, Reg, Reg)
+-DEF_HELPER_4(glue(packusdw, SUFFIX), void, env, Reg, Reg, Reg)
++DEF_HELPER_FLAGS_4(glue(packusdw, SUFFIX), TCG_CALL_NO_RWG, void, env, Reg, Reg, Reg)
+ #if SHIFT == 1
+ DEF_HELPER_3(glue(phminposuw, SUFFIX), void, env, Reg, Reg)
+ #endif
+diff --git a/tcg/region.c b/tcg/region.c
+index 2181267e48..0d2e27a761 100644
+--- a/tcg/region.c
++++ b/tcg/region.c
+@@ -482,6 +482,12 @@ static size_t tcg_n_regions(size_t tb_size, unsigned max_threads)
+  * buffer lest we make things too hard for the OS.
+  */
+ #define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (128 * MiB)
++#elif defined(__PROSPERO__)
++/*
++ * The PS5's JIT buffer comes from the title's flexible memory budget, which
++ * is far smaller than 1 GiB (the Xbox guest has 64 MiB of RAM anyway).
++ */
++#define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (128 * MiB)
+ #else
+ /*
+  * We expect most system emulation to run one or two guests per host.
+@@ -710,6 +716,13 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
+      * of syscalls, so always begin with PROT_NONE.
+      */
+     prot = PROT_NONE;
++#ifdef __PROSPERO__
++    /*
++     * The PS5 can't mprotect a reservation into memory: ask for RWX up front
++     * (JIT shared memory, see ps5/compat/mmap.c), which then needs no mprotect.
++     */
++    prot = PROT_READ | PROT_WRITE | PROT_EXEC;
++#endif
+     flags = MAP_PRIVATE | MAP_ANONYMOUS;
+ #ifdef CONFIG_DARWIN
+     /* Applicable to both iOS and macOS (Apple Silicon). */
+diff --git a/ui/meson.build b/ui/meson.build
+index ea46bf0f44..10df3a89b6 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -53,6 +53,8 @@ elif host_os == 'windows'
+   xemu_ss.add(files('xemu-os-utils-windows.c'))
+ elif host_os == 'darwin'
+   xemu_ss.add(files('xemu-os-utils-macos.m'))
++elif host_os == 'freebsd' # The PS5, the only FreeBSD-like target xemu builds for
++  xemu_ss.add(files('xemu-os-utils-ps5.c', 'xemu-input-ps5.c'))
+ endif
+ xemu_ss.add(imgui, implot, stb_image, sdl, opengl, fa, fpng, json, fatx, tomlplusplus, genconfig)
+ system_ss.add_all(xemu_ss)
+diff --git a/ui/qemu-pixman.c b/ui/qemu-pixman.c
+index aea09755b9..8096b7dbbd 100644
+--- a/ui/qemu-pixman.c
++++ b/ui/qemu-pixman.c
+@@ -278,6 +278,13 @@ qemu_pixman_shareable_alloc(const char *name, size_t size,
+ {
+ #ifdef WIN32
+     return qemu_win32_map_alloc(size, handle, errp);
++#elif defined(__PROSPERO__)
++    /*
++     * The PS5 has neither memfd nor a usable mkstemp, and no other process
++     * to share a surface with: plain memory, with no handle.
++     */
++    *handle = -1;
++    return g_malloc0(size);
+ #else
+     return qemu_memfd_alloc(name, size, 0, handle, errp);
+ #endif
+@@ -294,6 +301,8 @@ qemu_pixman_shareable_free(qemu_pixman_shareable handle,
+     if (err) {
+         error_report_err(err);
+     }
++#elif defined(__PROSPERO__)
++    g_free(ptr);
+ #else
+     qemu_memfd_free(ptr, size, handle);
+ #endif
+diff --git a/ui/xemu-input.c b/ui/xemu-input.c
+index 4fbc863147..64512b55f5 100644
+--- a/ui/xemu-input.c
++++ b/ui/xemu-input.c
+@@ -312,13 +312,23 @@ void xemu_input_init(void)
+     int port = xemu_input_get_controller_default_bind_port(new_con, 0);
+     if (port >= 0) {
+         xemu_input_bind(port, new_con, 0);
++#ifndef __PROSPERO__ /* Quiet start; the DualSense takes port 1 below */
+         char buf[128];
+         snprintf(buf, sizeof(buf), "Connected '%s' to port %d", new_con->name, port+1);
+         xemu_queue_notification(buf);
++#endif
+         xemu_input_rebind_xmu(port);
+     }
+ 
+     QTAILQ_INSERT_TAIL(&available_controllers, new_con, entry);
++
++#ifdef __PROSPERO__
++    /* The DualSense, on port 1 (in place of the keyboard if it was there) */
++    ControllerState *pad = xemu_input_ps5_pad_create();
++    QTAILQ_INSERT_TAIL(&available_controllers, pad, entry);
++    xemu_input_bind(0, pad, 0);
++    xemu_input_rebind_xmu(0);
++#endif
+ }
+ 
+ int xemu_input_get_controller_default_bind_port(ControllerState *state, int start)
+@@ -516,6 +526,10 @@ void xemu_input_update_controller(ControllerState *state)
+         xemu_input_update_sdl_kbd_controller_state(state);
+     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
+         xemu_input_update_sdl_controller_state(state);
++#ifdef __PROSPERO__
++    } else if (state->type == INPUT_DEVICE_PS5_PAD) {
++        xemu_input_update_ps5_pad_state(state);
++#endif
+     }
+ 
+     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+diff --git a/ui/xemu-input.h b/ui/xemu-input.h
+index 7023e30e23..70567cf2a8 100644
+--- a/ui/xemu-input.h
++++ b/ui/xemu-input.h
+@@ -71,6 +71,7 @@ enum controller_state_axis_index {
+ enum controller_input_device_type {
+     INPUT_DEVICE_SDL_KEYBOARD,
+     INPUT_DEVICE_SDL_GAMEPAD,
++    INPUT_DEVICE_PS5_PAD, // The PS5's controller, read with libScePad
+ };
+ 
+ enum peripheral_type { PERIPHERAL_NONE, PERIPHERAL_XMU, PERIPHERAL_TYPE_COUNT };
+@@ -130,6 +131,11 @@ void xemu_input_update_controllers(void);
+ void xemu_input_update_controller(ControllerState *state);
+ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state);
+ void xemu_input_update_sdl_controller_state(ControllerState *state);
++#ifdef __PROSPERO__
++// Implemented in xemu-input-ps5.c
++ControllerState *xemu_input_ps5_pad_create(void);
++void xemu_input_update_ps5_pad_state(ControllerState *state);
++#endif
+ void xemu_input_update_rumble(ControllerState *state);
+ ControllerState *xemu_input_get_bound(int index);
+ void xemu_input_bind(int index, ControllerState *state, int save);
+diff --git a/ui/xemu-os-utils.h b/ui/xemu-os-utils.h
+index e655bb9cab..b1f1d9171f 100644
+--- a/ui/xemu-os-utils.h
++++ b/ui/xemu-os-utils.h
+@@ -20,12 +20,42 @@
+ #ifndef XEMU_OS_UTILS_H
+ #define XEMU_OS_UTILS_H
+ 
++#include <stdbool.h>
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+ const char *xemu_get_os_info(void);
+ 
++#ifdef __PROSPERO__
++// Logs to /data/xemu/xemu.log and reports crashes there. First thing in main.
++void xemu_ps5_early_init(void);
++
++// The busiest threads, each given a core of its own (perf.cpu_pinning):
++// they register as they start, and the layout is applied once start-up is
++// over, from the UI thread.
++enum {
++    XEMU_PS5_THREAD_CPU, // The Xbox's CPU (TCG)
++    XEMU_PS5_THREAD_GPU, // The Xbox's GPU (nv2a's pfifo thread)
++    XEMU_PS5_THREAD__COUNT, // The pinned ones
++    XEMU_PS5_THREAD_UI = XEMU_PS5_THREAD__COUNT, // Profiled, not pinned
++    XEMU_PS5_THREAD__ALL
++};
++void xemu_ps5_register_thread(int role);
++void xemu_ps5_apply_pinning(void);
++const char *xemu_ps5_pinning_summary(void);
++// CPU time a registered thread has used, in seconds (as of its last
++// profiler sample); false if unknown.
++bool xemu_ps5_thread_cpu_seconds(int role, double *seconds);
++
++// The sampling profiler (for the game log): counting from start, the
++// report of where each thread's time went (malloc'd).
++void xemu_ps5_profile_start(void);
++void xemu_ps5_profile_stop(void);
++char *xemu_ps5_profile_report(void);
++#endif
++
+ #ifdef CONFIG_CPUID_H
+ #include <cpuid.h>
+ #endif
+diff --git a/ui/xemu-settings.cc b/ui/xemu-settings.cc
+index 5f9148af8a..1182666be0 100644
+--- a/ui/xemu-settings.cc
++++ b/ui/xemu-settings.cc
+@@ -77,6 +77,18 @@ const char *xemu_settings_get_base_path(void)
+         return base_path;
+     }
+ 
++#ifdef __PROSPERO__
++    /*
++     * The PS5 has no home directory for SDL's pref path, and a title's own
++     * folder is read-only: keep everything under /data (as PS5SX2 does with
++     * /data/PCSX2).
++     */
++    g_mkdir_with_parents("/data/xemu", 0777);
++    base_path = "/data/xemu/";
++    fprintf(stderr, "%s: base path: %s\n", __func__, base_path);
++    return base_path;
++#endif
++
+     if (xemu_settings_detect_portable_mode()) {
+         const char *base = SDL_GetBasePath();
+         assert(base != NULL);
+@@ -206,6 +218,8 @@ bool xemu_settings_load(void)
+     return success;
+ }
+ 
++void (*xemu_settings_save_hook)(bool before);
++
+ void xemu_settings_save(void)
+ {
+     FILE *fd = qemu_fopen(xemu_settings_get_path(), "wb");
+@@ -213,6 +227,9 @@ void xemu_settings_save(void)
+         fprintf(stderr, "Failed to open config file for writing. Check permissions.\n");
+         return;
+     }
++    if (xemu_settings_save_hook) {
++        xemu_settings_save_hook(true);
++    }
+ 
+     char *previous_numeric_locale = setlocale(LC_NUMERIC, NULL);
+     if (previous_numeric_locale) {
+@@ -230,6 +247,9 @@ void xemu_settings_save(void)
+     config_tree.update_from_struct(&g_config);
+     fprintf(fd, "%s", config_tree.generate_delta_toml().c_str());
+     fclose(fd);
++    if (xemu_settings_save_hook) {
++        xemu_settings_save_hook(false);
++    }
+ 
+     if (previous_numeric_locale) {
+         setlocale(LC_NUMERIC, previous_numeric_locale);
+diff --git a/ui/xemu-settings.h b/ui/xemu-settings.h
+index 880b62f261..0b5c40493b 100644
+--- a/ui/xemu-settings.h
++++ b/ui/xemu-settings.h
+@@ -63,6 +63,13 @@ bool xemu_settings_load(void);
+ // Save config file to disk
+ void xemu_settings_save(void);
+ 
++/*
++ * Called with true before the settings are written and false after, so
++ * values in effect for one game only (the PS5 dashboard's game settings)
++ * can be swapped for the user's own while the file is written.
++ */
++extern void (*xemu_settings_save_hook)(bool before);
++
+ static inline void xemu_settings_set_string(const char **str, const char *new_str)
+ {
+     assert(new_str);
+diff --git a/ui/xemu-snapshots.c b/ui/xemu-snapshots.c
+index 9d40864e66..5af5285b48 100644
+--- a/ui/xemu-snapshots.c
++++ b/ui/xemu-snapshots.c
+@@ -22,7 +22,6 @@
+ #include "xemu-xbe.h"
+ 
+ #include <SDL3/SDL.h>
+-#include <epoxy/gl.h>
+ 
+ #include "block/aio.h"
+ #include "block/block_int.h"
+@@ -115,15 +114,9 @@ static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
+     offset += 4;
+ 
+     if (thumbnail_size) {
+-        GLuint thumbnail;
+-        glGenTextures(1, &thumbnail);
+         assert(size >= (offset + thumbnail_size));
+-        if (xemu_snapshots_load_png_to_texture(thumbnail, &buf[offset],
+-                                               thumbnail_size)) {
+-            data->gl_thumbnail = thumbnail;
+-        } else {
+-            glDeleteTextures(1, &thumbnail);
+-        }
++        data->gl_thumbnail =
++            xemu_snapshots_load_png_to_texture(&buf[offset], thumbnail_size);
+         offset += thumbnail_size;
+     }
+ 
+@@ -143,7 +136,7 @@ static void xemu_snapshots_all_load_data(QEMUSnapshotInfo **info,
+         for (int i = 0; i < xemu_snapshots_len; ++i) {
+             g_free((*data)[i].xbe_title_name);
+             if ((*data)[i].gl_thumbnail) {
+-                glDeleteTextures(1, &((*data)[i].gl_thumbnail));
++                xemu_snapshots_free_texture((*data)[i].gl_thumbnail);
+             }
+         }
+         g_free(*data);
+diff --git a/ui/xemu-snapshots.h b/ui/xemu-snapshots.h
+index 9d793f0ced..8604c2f98b 100644
+--- a/ui/xemu-snapshots.h
++++ b/ui/xemu-snapshots.h
+@@ -27,7 +27,7 @@ extern "C" {
+ #endif
+ 
+ #include "block/snapshot.h"
+-#include <epoxy/gl.h>
++#include "ui/xemu-texture.h"
+ 
+ #define XEMU_SNAPSHOT_DATA_MAGIC 0x78656d75 // 'xemu'
+ #define XEMU_SNAPSHOT_DATA_VERSION 1
+@@ -40,7 +40,7 @@ extern const char **g_snapshot_shortcut_index_key_map[];
+ typedef struct XemuSnapshotData {
+     char *disc_path;
+     char *xbe_title_name;
+-    GLuint gl_thumbnail;
++    XemuTexture gl_thumbnail;
+ } XemuSnapshotData;
+ 
+ // Implemented in xemu-snapshots.c
+@@ -56,8 +56,10 @@ bool xemu_snapshots_offset_extra_data(QEMUFile *f);
+ void xemu_snapshots_mark_dirty(void);
+ 
+ // Implemented in xemu-thumbnail.cc
+-void xemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip);
+-bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size);
++void xemu_snapshots_set_framebuffer_texture(XemuTexture tex, bool flip);
++// A new texture with the PNG's pixels, or 0.
++XemuTexture xemu_snapshots_load_png_to_texture(void *buf, size_t size);
++void xemu_snapshots_free_texture(XemuTexture tex);
+ void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size);
+ 
+ #ifdef __cplusplus
+diff --git a/ui/xemu-thumbnail.cc b/ui/xemu-thumbnail.cc
+index 592408393c..16a4cca01a 100644
+--- a/ui/xemu-thumbnail.cc
++++ b/ui/xemu-thumbnail.cc
+@@ -24,24 +24,27 @@
+ #include "xemu-snapshots.h"
+ #include "xui/gl-helpers.hh"
+ 
+-static GLuint display_tex = 0;
++static XemuTexture display_tex = 0;
+ static bool display_flip = false;
+ 
+-void xemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip)
++void xemu_snapshots_set_framebuffer_texture(XemuTexture tex, bool flip)
+ {
+     display_tex = tex;
+     display_flip = flip;
+ }
+ 
+-bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size)
++XemuTexture xemu_snapshots_load_png_to_texture(void *buf, size_t size)
+ {
+     std::vector<uint8_t> pixels;
+     unsigned int width, height, channels;
+     if (fpng::fpng_decode_memory(buf, size, pixels, width, height, channels,
+                                  3) != fpng::FPNG_DECODE_SUCCESS) {
+-        return false;
++        return 0;
+     }
+ 
++#ifdef CONFIG_OPENGL
++    GLuint tex;
++    glGenTextures(1, &tex);
+     glActiveTexture(GL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, tex);
+ 
+@@ -52,11 +55,24 @@ bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size)
+     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB,
+                  GL_UNSIGNED_BYTE, pixels.data());
+ 
+-    return true;
++    return tex;
++#else
++    return xemu_vk_texture_create(pixels.data(), width, height, 3);
++#endif
++}
++
++void xemu_snapshots_free_texture(XemuTexture tex)
++{
++#ifdef CONFIG_OPENGL
++    glDeleteTextures(1, &tex);
++#else
++    xemu_vk_texture_destroy(tex);
++#endif
+ }
+ 
+ void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size)
+ {
++#ifdef CONFIG_OPENGL
+     /*
+      * Avoids crashing if a snapshot is made on a thread with no GL context
+      * Normally, this is not an issue, but it is better to fail safe than assert
+@@ -67,6 +83,11 @@ void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size)
+     if (!SDL_GL_GetCurrentContext() || display_tex == 0) {
+         return NULL;
+     }
++#else
++    if (display_tex == 0) {
++        return NULL;
++    }
++#endif
+ 
+     std::vector<uint8_t> png;
+     if (!RenderFramebufferToPng(display_tex, display_flip, png,
+diff --git a/ui/xemu.c b/ui/xemu.c
+index 18dc3b30f2..333d069e8f 100644
+--- a/ui/xemu.c
++++ b/ui/xemu.c
+@@ -53,6 +53,8 @@
+ 
+ #include "hw/xbox/smbus.h" // For eject, drive tray
+ #include "hw/xbox/nv2a/nv2a.h"
++#include "hw/xbox/nv2a/debug.h"
++#include "hw/xbox/xemu-timing.h"
+ #include "ui/xemu-notifications.h"
+ 
+ #include <stb_image.h>
+@@ -655,6 +657,7 @@ static void mouse_define(DisplayChangeListener *dcl,
+     }
+ }
+ 
++#ifdef CONFIG_OPENGL
+ static void xb_surface_gl_create_texture(DisplaySurface *surface)
+ {
+     assert(QEMU_IS_ALIGNED(surface_stride(surface), surface_bytes_per_pixel(surface)));
+@@ -703,6 +706,7 @@ static void xb_surface_gl_destroy_texture(DisplaySurface *surface)
+     glDeleteTextures(1, &surface->texture);
+     surface->texture = 0;
+ }
++#endif
+ 
+ static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
+                                        pixman_format_code_t format)
+@@ -710,8 +714,11 @@ static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
+     switch (format) {
+     case PIXMAN_BE_b8g8r8x8:
+     case PIXMAN_BE_b8g8r8a8:
++        return true;
++#ifdef CONFIG_OPENGL
+     case PIXMAN_r5g6b5:
+         return true;
++#endif
+     default:
+         return false;
+     }
+@@ -822,6 +829,7 @@ static void report_stats(void)
+ }
+ #endif
+ 
++#ifdef CONFIG_OPENGL
+ /**
+  * Renders the main interface. Usually called from the main thread,
+  * but may sometimes be called from another thread.
+@@ -917,6 +925,111 @@ static void gl_render_frame(struct xemu_console *scon)
+     report_stats();
+ #endif
+ }
++#else
++/**
++ * Renders the main interface with Vulkan (builds without OpenGL). Usually
++ * called from the main thread, but may sometimes be called from another thread.
++ */
++static void vk_render_frame(struct xemu_console *scon)
++{
++    static bool rendering;
++    if (qatomic_xchg(&rendering, true) || qatomic_read(&qemu_exiting)) {
++        return;
++    }
++
++    /* The UI draws with the NV2A renderer's device, created with the machine */
++    if (!xemu_vk_present_ready()) {
++        qatomic_set(&rendering, false);
++        return;
++    }
++
++    /* See gl_render_frame: the fast path first, then the VGA surface. */
++    XemuTexture tex = 0;
++    bool flip = false;
++    bool got_framebuffer = false;
++#ifdef __PROSPERO__
++    /*
++     * XPSemu: getting the framebuffer makes the GPU thread stop, draw the
++     * display image and wait for the PS5's GPU: at the TV's 60 Hz, while a
++     * game makes 10-30 frames, mostly for a frame already shown. Ask again
++     * only for a new game frame (or at least 20 times a second, for the
++     * video overlay); otherwise show the image from the last time.
++     */
++    static unsigned int shown_frame = ~0u;
++    static int64_t shown_at;
++    static XemuTexture shown_tex;
++    int64_t now = g_get_monotonic_time();
++    bool same = shown_tex && g_nv2a_stats.frame_count == shown_frame &&
++                now - shown_at < 50000;
++    if (same) {
++        tex = shown_tex;
++        flip = true;
++    } else
++#endif
++    {
++        /* Taken even when there's no surface: always released below. */
++        got_framebuffer = true;
++        uint64_t xt_frame = xemu_timing_now();
++        int have_surface = nv2a_get_framebuffer_surface();
++        xemu_timing_add(XT_UI_FRAME, xt_frame);
++        if (have_surface) {
++            tex = xemu_vk_get_display_texture();
++            /* The renderer's display image is bottom row first (for GL). */
++            flip = true;
++        }
++    }
++#ifdef __PROSPERO__
++    if (got_framebuffer) {
++        shown_tex = tex; /* 0 when there's no display image yet */
++        shown_frame = g_nv2a_stats.frame_count;
++        shown_at = now;
++    }
++#endif
++
++    if (tex == 0 && scon->surface) {
++        xemu_main_loop_lock();
++        DisplaySurface *s = scon->surface;
++        assert(surface_bytes_per_pixel(s) == 4);
++        tex = xemu_vk_update_surface_texture(surface_data(s),
++                                             surface_width(s),
++                                             surface_height(s),
++                                             surface_stride(s));
++        flip = false; /* Uploaded top row first */
++        xemu_main_loop_unlock();
++    }
++
++    xemu_snapshots_set_framebuffer_texture(tex, flip);
++    xemu_hud_set_framebuffer_texture(tex, flip);
++
++    xemu_main_loop_lock();
++    xemu_hud_update();
++    xemu_main_loop_unlock();
++
++    /* Presents, and waits for the frame so the display image can be reused */
++    uint64_t xt_present = xemu_timing_now();
++    xemu_hud_render();
++    xemu_timing_add(XT_UI_PRESENT, xt_present);
++
++    if (got_framebuffer) {
++        nv2a_release_framebuffer_surface();
++    }
++
++    qatomic_set(&rendering, false);
++
++#if DEBUG_XEMU_C
++    report_stats();
++#endif
++}
++#endif
++
++static void render_frame(struct xemu_console *scon)
++{
++#ifdef CONFIG_OPENGL
++    gl_render_frame(scon);
++#else
++    vk_render_frame(scon);
++#endif
++}
+ 
+ static bool event_watch_callback(void *userdata, SDL_Event *event)
+ {
+@@ -936,9 +1049,9 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
+             }
+         }
+ #endif
+-        gl_render_frame(scon);
++        render_frame(scon);
+     } else if (event->type == SDL_EVENT_WINDOW_EXPOSED) {
+-        gl_render_frame(scon);
++        render_frame(scon);
+     }
+ 
+     return true; // Ignored
+@@ -1029,6 +1142,7 @@ static void display_very_early_init(DisplayOptions *o)
+ #endif
+     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+ 
++#ifdef CONFIG_OPENGL
+     // Initialize rendering context
+     SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+     SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+@@ -1042,6 +1156,7 @@ static void display_very_early_init(DisplayOptions *o)
+         SDL_GL_CONTEXT_PROFILE_MASK,
+         SDL_GL_CONTEXT_PROFILE_CORE);
+     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
++#endif
+ 
+     char *title = g_strdup_printf("xemu | v%s"
+ #ifdef XEMU_DEBUG_BUILD
+@@ -1083,7 +1198,18 @@ static void display_very_early_init(DisplayOptions *o)
+         window_height = min_window_height;
+     }
+ 
++#ifdef __PROSPERO__
++    /* The PS5's VideoOut surface is always 3840x2160 (see vk-present.cc). */
++    window_width = 3840;
++    window_height = 2160;
++#endif
++
++#ifdef CONFIG_OPENGL
+     SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
++#else
++    /* The Vulkan UI presents on its own surface (vk-present.cc). */
++    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
++#endif
+ 
+     // Create main window
+     m_window = SDL_CreateWindow(
+@@ -1097,12 +1223,15 @@ static void display_very_early_init(DisplayOptions *o)
+     g_free(title);
+     SDL_SetWindowMinimumSize(m_window, min_window_width, min_window_height);
+ 
++#ifndef __PROSPERO__ /* SDL's dummy video driver doesn't know the display */
+     const SDL_DisplayMode *disp_mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(m_window));
+     if (disp_mode && (disp_mode->w < window_width || disp_mode->h < window_height)) {
+         SDL_SetWindowSize(m_window, min_window_width, min_window_height);
+         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+     }
++#endif
+ 
++#ifdef CONFIG_OPENGL
+     m_context = SDL_GL_CreateContext(m_window);
+ 
+     if (m_context != NULL && epoxy_gl_version() < 40) {
+@@ -1123,6 +1252,7 @@ static void display_very_early_init(DisplayOptions *o)
+         SDL_Quit();
+         exit(1);
+     }
++#endif
+ 
+     int width, height, channels = 0;
+     stbi_set_flip_vertically_on_load(0);
+@@ -1138,23 +1268,29 @@ static void display_very_early_init(DisplayOptions *o)
+ 
+     fprintf(stderr, "CPU: %s\n", xemu_get_cpu_info());
+     fprintf(stderr, "OS_Version: %s\n", xemu_get_os_info());
++#ifdef CONFIG_OPENGL
+     fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
+     fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
+     fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
+     fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
++#endif
+ 
+     // Initialize offscreen rendering context now
+     nv2a_context_init();
++#ifdef CONFIG_OPENGL
+     SDL_GL_MakeCurrent(NULL, NULL);
++#endif
+ }
+ 
+ static void display_early_init(DisplayOptions *o)
+ {
+     assert(o->type == DISPLAY_TYPE_XEMU);
++#ifdef CONFIG_OPENGL
+     display_opengl = 1;
+ 
+     SDL_GL_MakeCurrent(m_window, m_context);
+     SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
++#endif
+ #ifdef _WIN32
+     win32_dxgi_present_init(m_window);
+ #endif
+@@ -1175,7 +1311,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
+     int i;
+ 
+     assert(o->type == DISPLAY_TYPE_XEMU);
++#ifdef CONFIG_OPENGL
+     SDL_GL_MakeCurrent(m_window, m_context);
++#endif
+ 
+     gui_fullscreen = o->has_full_screen && o->full_screen;
+     gui_fullscreen |= g_config.display.window.fullscreen_on_startup;
+@@ -1231,7 +1369,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
+     }
+ 
+     /* Tell main thread to go ahead and create the app and enter the run loop */
++#ifdef CONFIG_OPENGL
+     SDL_GL_MakeCurrent(NULL, NULL);
++#endif
+     qemu_sem_post(&display_init_sem);
+ }
+ 
+@@ -1245,8 +1385,10 @@ static void display_finalize(void)
+ #ifdef _WIN32
+     win32_dxgi_present_cleanup();
+ #endif
++#ifdef CONFIG_OPENGL
+     SDL_GL_MakeCurrent(NULL, NULL);
+     SDL_GL_DestroyContext(m_context);
++#endif
+     SDL_DestroyWindow(m_window);
+     SDL_Quit();
+ }
+@@ -1267,9 +1409,21 @@ type_init(register_xemu_display);
+ int gArgc;
+ char **gArgv;
+ 
++#ifdef __PROSPERO__
++/* Exists while a start in 128 MB mode isn't known to work (see main). */
++#define XEMU_PS5_MEM128_MARKER "/data/xemu/.mem128-starting"
++
++/* Startup milestones in the log: the PS5 can kill a title without a signal. */
++#define PS5_STEP(step) fprintf(stderr, "xemu PS5: %s\n", step)
++#else
++#define PS5_STEP(step)
++#endif
++
+ static void *qemu_main(void *opaque)
+ {
++    PS5_STEP("qemu_init");
+     qemu_init(gArgc, gArgv);
++    PS5_STEP("qemu_init done, running the machine");
+     exit_status = qemu_main_loop();
+     qatomic_set(&qemu_exiting, true);
+     bql_unlock();
+@@ -1370,6 +1524,18 @@ int main(int argc, char **argv)
+     _set_error_mode(_OUT_TO_STDERR);
+ #endif
+ 
++#ifdef __PROSPERO__
++    xemu_ps5_early_init();
++
++    /*
++     * SDL has no PS5 drivers, only its dummy ones, which it never picks by
++     * itself. The UI presents with Vulkan (xui/vk-present.cc) regardless.
++     * TODO: PS5 audio and controller drivers.
++     */
++    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
++    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
++#endif
++
+     fprintf(stderr, "xemu_version: %s\n", xemu_version);
+     fprintf(stderr, "xemu_commit: %s\n", xemu_commit);
+     fprintf(stderr, "xemu_date: %s\n", xemu_date);
+@@ -1401,19 +1567,45 @@ int main(int argc, char **argv)
+     }
+     atexit(xemu_settings_save);
+ 
++#ifdef __PROSPERO__
++    /* Games in /data/xemu/games show in the quick menu's Games list: there's
++     * no file dialog on the PS5 to pick one elsewhere. */
++    if (!g_config.general.games_dir || !g_config.general.games_dir[0]) {
++        g_mkdir_with_parents("/data/xemu/games", 0777);
++        xemu_settings_set_string(&g_config.general.games_dir,
++                                 "/data/xemu/games");
++    }
++    /* The dashboard is the front end: no desktop menu bar over the games. */
++    g_config.display.ui.show_menubar = false;
++    /* Always start at the Xbox dashboard: the disc of the last session is
++     * saved in the config, don't boot it again. */
++    xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
++    /* The Xbox has 64 MB, like a retail one: every game is made for it.
++     * (128 MB mode was unreliable here and is off.) */
++    if (g_config.sys.mem_limit != CONFIG_SYS_MEM_LIMIT_64) {
++        fprintf(stderr, "xemu PS5: Xbox memory back to 64 MB\n");
++        g_config.sys.mem_limit = CONFIG_SYS_MEM_LIMIT_64;
++        xemu_settings_save();
++    }
++    unlink(XEMU_PS5_MEM128_MARKER);
++#endif
++
+ #ifdef _WIN32
+     if (g_config.display.setup_nvidia_profile) {
+         setup_nvidia_profile();
+     }
+ #endif
+ 
++    PS5_STEP("display_very_early_init");
+     display_very_early_init(NULL);
++    PS5_STEP("display_very_early_init done");
+ 
+     qemu_sem_init(&display_init_sem, 0);
+     qemu_sem_init(&display_shutdown_sem, 0);
+     qemu_thread_create(&thread, "qemu_main", qemu_main,
+                        NULL, QEMU_THREAD_JOINABLE);
+     qemu_sem_wait(&display_init_sem);
++    PS5_STEP("display ready");
+ 
+     gui_grab = 0;
+     if (gui_fullscreen) {
+@@ -1433,9 +1625,29 @@ int main(int argc, char **argv)
+     xemu_main_loop_unlock();
+ 
+     struct xemu_console *scon = &scon_list[0];
++    PS5_STEP("UI loop");
++#ifdef __PROSPERO__
++    xemu_ps5_register_thread(XEMU_PS5_THREAD_UI); /* For the profiler */
++    int64_t ui_started = g_get_monotonic_time();
++    bool mem128_ok = g_config.sys.mem_limit == CONFIG_SYS_MEM_LIMIT_64;
++    bool pinned = false;
++#endif
+     while (!qatomic_read(&qemu_exiting)) {
+         poll_events(scon);
+-        gl_render_frame(scon);
++        render_frame(scon);
++#ifdef __PROSPERO__
++        if (!pinned &&
++            g_get_monotonic_time() - ui_started > 8 * G_USEC_PER_SEC) {
++            pinned = true; /* Start-up's threads exist by now */
++            xemu_ps5_apply_pinning();
++        }
++        if (!mem128_ok &&
++            g_get_monotonic_time() - ui_started > 30 * G_USEC_PER_SEC) {
++            mem128_ok = true; /* 128 MB mode works */
++            unlink(XEMU_PS5_MEM128_MARKER);
++            fprintf(stderr, "xemu PS5: 128 MB mode running fine\n");
++        }
++#endif
+     }
+     qemu_sem_post(&display_shutdown_sem);
+     qemu_thread_join(&thread);
+diff --git a/ui/xui/common.hh b/ui/xui/common.hh
+index 7d0bbf338a..30eba3d3d6 100644
+--- a/ui/xui/common.hh
++++ b/ui/xui/common.hh
+@@ -19,14 +19,20 @@
+ #pragma once
+ 
+ #include <SDL3/SDL.h>
+-#include <epoxy/gl.h>
++#include "config-host.h"
++#include "ui/xemu-texture.h"
+ #include "ui/xemu-settings.h"
+ 
+ #define IMGUI_DEFINE_MATH_OPERATORS
+ #include <imgui.h>
+ #include <imgui_internal.h>
+ #include <imgui_impl_sdl3.h>
++#ifdef CONFIG_OPENGL
+ #include <imgui_impl_opengl3.h>
++#else
++#include <imgui_impl_vulkan.h>
++#include "hw/xbox/nv2a/pgraph/vk/vk-ui.h"
++#endif
+ #include <implot.h>
+ #include <misc/cpp/imgui_stdlib.h>
+ #include <stb_image.h>
+diff --git a/ui/xui/compat.cc b/ui/xui/compat.cc
+index c16d4a2776..55ca4029cb 100644
+--- a/ui/xui/compat.cc
++++ b/ui/xui/compat.cc
+@@ -74,10 +74,17 @@ void CompatibilityReporter::Draw()
+     }
+ 
+     if (ImGui::IsWindowAppearing()) {
++#ifdef CONFIG_OPENGL
+         report.gl_vendor = (const char *)glGetString(GL_VENDOR);
+         report.gl_renderer = (const char *)glGetString(GL_RENDERER);
+         report.gl_version = (const char *)glGetString(GL_VERSION);
+         report.gl_shading_language_version = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
++#else
++        report.gl_vendor = "AMD";
++        report.gl_renderer = pgraph_vk_get_device_name();
++        report.gl_version = "Vulkan";
++        report.gl_shading_language_version = "SPIR-V";
++#endif
+         struct xbe *xbe = xemu_get_xbe_info();
+         is_xbe_identified = xbe != NULL;
+         if (is_xbe_identified) {
+diff --git a/ui/xui/font-manager.cc b/ui/xui/font-manager.cc
+index bba2bdefea..872b801836 100644
+--- a/ui/xui/font-manager.cc
++++ b/ui/xui/font-manager.cc
+@@ -18,6 +18,9 @@
+ //
+ #include "font-manager.hh"
+ #include "viewport-manager.hh"
++#ifndef CONFIG_OPENGL
++#include "vk-present.hh"
++#endif
+ 
+ #include "data/Roboto-Medium.ttf.h"
+ #include "data/RobotoCondensed-Regular.ttf.h"
+@@ -99,8 +102,12 @@ void FontManager::Rebuild()
+         m_fixed_width_font = io.Fonts->AddFontDefault(&config);
+     }
+ 
++#ifdef CONFIG_OPENGL
+     ImGui_ImplOpenGL3_DestroyFontsTexture();
+     ImGui_ImplOpenGL3_CreateFontsTexture();
++#else
++    xemu_vk_rebuild_fonts();
++#endif
+ }
+ 
+ void FontManager::Update()
+diff --git a/ui/xui/gl-helpers.hh b/ui/xui/gl-helpers.hh
+index 82da963e6b..9f5c299cba 100644
+--- a/ui/xui/gl-helpers.hh
++++ b/ui/xui/gl-helpers.hh
+@@ -21,6 +21,7 @@
+ #include "common.hh"
+ #include "../xemu-input.h"
+ 
++#ifdef CONFIG_OPENGL
+ class Fbo
+ {
+ public:
+@@ -37,9 +38,24 @@ public:
+     void Target();
+     void Restore();
+ };
++#else
++// The Vulkan UI (vk-helpers.cc) doesn't render these offscreen yet: an Fbo
++// shows a fixed texture.
++class Fbo
++{
++public:
++    int w, h;
++    XemuTexture tex;
++
++    Fbo(int width, int height) : w(width), h(height), tex(0) {}
++    inline XemuTexture Texture() { return tex; }
++    void Target() {}
++    void Restore() {}
++};
++#endif
+ 
+ extern Fbo *controller_fbo, *xmu_fbo, *logo_fbo;
+-extern GLuint g_icon_tex;
++extern XemuTexture g_icon_tex;
+ 
+ void InitCustomRendering(void);
+ void RenderLogo(uint32_t time);
+@@ -49,8 +65,13 @@ void RenderControllerPort(float frame_x, float frame_y, int i,
+                           uint32_t port_color);
+ void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
+                uint32_t secondary_color);
++#ifdef CONFIG_OPENGL
+ void RenderFramebuffer(GLint tex, int width, int height, bool flip);
+ void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[2]);
+-bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, int max_width = 0, int max_height = 0);
+-void SaveScreenshot(GLuint tex, bool flip);
++#else
++// Queues the frame on ImGui's background draw list, below the UI.
++void RenderFramebuffer(XemuTexture tex, int width, int height, bool flip);
++#endif
++bool RenderFramebufferToPng(XemuTexture tex, bool flip, std::vector<uint8_t> &png, int max_width = 0, int max_height = 0);
++void SaveScreenshot(XemuTexture tex, bool flip);
+ void ScaleDimensions(int src_width, int src_height, int max_width, int max_height, int *out_width, int *out_height);
+diff --git a/ui/xui/input-manager.cc b/ui/xui/input-manager.cc
+index a18aa9f9ce..1dad539055 100644
+--- a/ui/xui/input-manager.cc
++++ b/ui/xui/input-manager.cc
+@@ -23,7 +23,8 @@ void InputManager::Update()
+     if (!g_main_menu.IsInputRebinding()) {
+         ControllerState *iter;
+         QTAILQ_FOREACH (iter, &available_controllers, entry) {
+-            if (iter->type != INPUT_DEVICE_SDL_GAMEPAD)
++            if (iter->type != INPUT_DEVICE_SDL_GAMEPAD &&
++                iter->type != INPUT_DEVICE_PS5_PAD)
+                 continue;
+             m_buttons |= iter->buttons;
+             // We simply take any axis that is >10 % activation
+diff --git a/ui/xui/main-menu.cc b/ui/xui/main-menu.cc
+index 85997c1a5e..7474948f45 100644
+--- a/ui/xui/main-menu.cc
++++ b/ui/xui/main-menu.cc
+@@ -524,7 +524,15 @@ void MainMenuInputView::Draw()
+         tc.w = 0.0f;
+         ImGui::PushStyleColor(ImGuiCol_Header, tc);
+ 
+-        if (ImGui::CollapsingHeader("Input Mapping")) {
++        if (bound_state->type == INPUT_DEVICE_PS5_PAD) {
++            // A fixed mapping: there is no SDL gamepad map to edit.
++            if (ImGui::CollapsingHeader("Input Mapping")) {
++                ImGui::TextWrapped(
++                    "DualSense: Cross A, Circle B, Square X, Triangle Y, "
++                    "L1 White, R1 Black, L2/R2 triggers, OPTIONS Start, "
++                    "Create Back, touchpad click opens the xemu menu.");
++            }
++        } else if (ImGui::CollapsingHeader("Input Mapping")) {
+             float p = ImGui::GetFrameHeight() * 0.3;
+             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(p, p));
+             if (ImGui::BeginTable("input_remap_tbl", 2,
+@@ -1190,14 +1198,21 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
+     draw_list->PushClipRect(p0, p1, true);
+ 
+     // Snapshot thumbnail
+-    GLuint thumbnail = data->gl_thumbnail ? data->gl_thumbnail : g_icon_tex;
++    XemuTexture thumbnail = data->gl_thumbnail ? data->gl_thumbnail : g_icon_tex;
+     int thumbnail_width, thumbnail_height;
++#ifdef CONFIG_OPENGL
+     glActiveTexture(GL_TEXTURE0);
+     glBindTexture(GL_TEXTURE_2D, thumbnail);
+     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
+                              &thumbnail_width);
+     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
+                              &thumbnail_height);
++#else
++    if (!xemu_vk_texture_get_size(thumbnail, &thumbnail_width,
++                                  &thumbnail_height)) {
++        thumbnail_width = thumbnail_height = 1;
++    }
++#endif
+ 
+     // Draw black background behind thumbnail
+     ImVec2 thumbnail_min(p0.x + thumbnail_pos.x, p0.y + thumbnail_pos.y);
+@@ -1617,11 +1632,18 @@ void MainMenuAboutView::Draw()
+ 
+     static const char *sys_info_text = NULL;
+     if (sys_info_text == NULL) {
++#ifdef CONFIG_OPENGL
+         const char *gl_shader_version =
+             (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+         const char *gl_version = (const char *)glGetString(GL_VERSION);
+         const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
+         const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
++#else
++        const char *gl_shader_version = "SPIR-V";
++        const char *gl_version = "Vulkan";
++        const char *gl_renderer = pgraph_vk_get_device_name();
++        const char *gl_vendor = "AMD";
++#endif
+         sys_info_text = g_strdup_printf(
+             "CPU:          %s\nOS Platform:  %s\nOS Version:   "
+             "%s\nManufacturer: %s\n"
+@@ -1803,11 +1825,20 @@ void MainMenuScene::HandleInput()
+     bool focus = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows |
+                                         ImGuiFocusedFlags_NoPopupHierarchy);
+ 
++    // B / Circle in a view goes back to its tab; in the tabs, it closes the
++    // menu. A press, not a hold, so one press doesn't do both.
++    if (focus && m_had_focus_last_frame && m_content_focused &&
++        ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
++        m_focus_tab = true;
++        m_had_focus_last_frame = focus;
++        return;
++    }
++
+     // XXX: Ensure we have focus for two frames. If a user cancels a popup
+     // window, we do not want to cancel main
+     //      window as well.
+     if (nofocus || (focus && m_had_focus_last_frame &&
+-                    (ImGui::IsKeyDown(ImGuiKey_GamepadFaceRight) ||
++                    (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+                      ImGui::IsKeyDown(ImGuiKey_Escape)))) {
+         Hide();
+         return;
+@@ -1893,12 +1924,17 @@ bool MainMenuScene::Draw()
+ 
+         int i = 0;
+         for (auto &button : m_tabs) {
+-            if (move_focus_to_tab && i == m_current_view_index) {
++            if ((move_focus_to_tab || m_focus_tab) &&
++                i == m_current_view_index) {
+                 ImGui::SetKeyboardFocusHere();
+                 move_focus_to_tab = false;
++                m_focus_tab = false;
+             }
+             if (button->Draw(i == m_current_view_index)) {
++                // Activating a tab (A / Cross) enters its view, so a
++                // controller can reach the settings in it.
+                 SetNextViewIndex(i);
++                m_focus_view = true;
+             }
+             if (i == m_current_view_index) {
+                 ImGui::SetItemDefaultFocus();
+@@ -1923,6 +1959,8 @@ bool MainMenuScene::Draw()
+                           true,
+                           ImGuiWindowFlags_AlwaysUseWindowPadding |
+                               ImGuiWindowFlags_NavFlattened);
++        m_content_focused =
++            ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+ 
+         if (!g_input_mgr.IsNavigatingWithController()) {
+             // Close button
+diff --git a/ui/xui/main-menu.hh b/ui/xui/main-menu.hh
+index dccb4da771..83ff7e9a15 100644
+--- a/ui/xui/main-menu.hh
++++ b/ui/xui/main-menu.hh
+@@ -169,6 +169,8 @@ class MainMenuScene : public virtual Scene {
+ protected:
+     EasingAnimation                 m_animation;
+     bool                            m_focus_view;
++    bool                            m_focus_tab = false;        // back from the view to its tab
++    bool                            m_content_focused = false;  // the view has focus, not the tabs
+     bool                            m_had_focus_last_frame;
+     int                             m_current_view_index;
+     int                             m_next_view_index;
+diff --git a/ui/xui/main.cc b/ui/xui/main.cc
+index ace02bc768..8b4dcb59b5 100644
+--- a/ui/xui/main.cc
++++ b/ui/xui/main.cc
+@@ -18,7 +18,6 @@
+ //
+ 
+ #include <SDL3/SDL.h>
+-#include <epoxy/gl.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <math.h>
+@@ -53,6 +52,18 @@
+ #if defined(_WIN32)
+ #include "update.hh"
+ #endif
++#ifndef CONFIG_OPENGL
++#include "vk-present.hh"
++#endif
++#ifdef __PROSPERO__
++#include "dashboard.hh"
++// XPSemu's own Xbox-style dashboard is the front end (it can also start the
++// original Microsoft dashboard from the HDD). Set to 0 for xemu's quick menu
++// on the touchpad instead, as on desktop.
++#ifndef PSEMU_CUSTOM_DASHBOARD
++#define PSEMU_CUSTOM_DASHBOARD 1
++#endif
++#endif
+ 
+ bool g_screenshot_pending;
+ const char *g_snapshot_pending_load_name;
+@@ -62,7 +73,7 @@ float g_main_menu_height;
+ static ImGuiStyle g_base_style;
+ static float g_last_scale;
+ static int g_vsync;
+-static GLuint g_tex;
++static XemuTexture g_tex;
+ static bool g_flip_req;
+ 
+ 
+@@ -133,7 +144,9 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
+     xemu_monitor_init();
+     g_vsync = g_config.display.window.vsync;
+ 
++#ifdef CONFIG_OPENGL
+     InitCustomRendering();
++#endif
+ 
+     // Setup Dear ImGui context
+     IMGUI_CHECKVERSION();
+@@ -144,8 +157,15 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
+     io.IniFilename = NULL;
+ 
+     // Setup Platform/Renderer bindings
++#ifdef CONFIG_OPENGL
+     ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
+     ImGui_ImplOpenGL3_Init("#version 150");
++#else
++    // The Vulkan backend (and InitCustomRendering) start with the first frame
++    // that has a device: vk-present.cc.
++    (void)sdl_gl_context;
++    ImGui_ImplSDL3_InitForVulkan(window);
++#endif
+     ImPlot::CreateContext();
+ 
+ #if defined(_WIN32)
+@@ -161,7 +181,9 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
+ 
+ void xemu_hud_cleanup(void)
+ {
++#ifdef CONFIG_OPENGL
+     ImGui_ImplOpenGL3_Shutdown();
++#endif
+     ImGui_ImplSDL3_Shutdown();
+     ImGui::DestroyContext();
+ }
+@@ -183,7 +205,7 @@ void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse)
+     if (mouse) *mouse = io.WantCaptureMouse;
+ }
+ 
+-void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
++void xemu_hud_set_framebuffer_texture(XemuTexture tex, bool flip)
+ {
+     g_tex = tex;
+     g_flip_req = flip;
+@@ -203,6 +225,7 @@ void xemu_hud_update(void)
+         g_last_scale = g_viewport_mgr.m_scale;
+     }
+ 
++#ifdef CONFIG_OPENGL
+     if (!first_boot_window.is_open) {
+         int ww, wh;
+         SDL_GetWindowSizeInPixels(xemu_get_window(), &ww, &wh);
+@@ -210,6 +233,9 @@ void xemu_hud_update(void)
+     }
+ 
+     ImGui_ImplOpenGL3_NewFrame();
++#else
++    ImGui_ImplVulkan_NewFrame();
++#endif
+     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+     ImGui_ImplSDL3_NewFrame();
+     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+@@ -219,6 +245,15 @@ void xemu_hud_update(void)
+     ImGui::NewFrame();
+     ProcessKeyboardShortcuts();
+ 
++#ifndef CONFIG_OPENGL
++    // The background draw list is reset by NewFrame.
++    if (!first_boot_window.is_open) {
++        int ww, wh;
++        SDL_GetWindowSizeInPixels(xemu_get_window(), &ww, &wh);
++        RenderFramebuffer(g_tex, ww, wh, g_flip_req);
++    }
++#endif
++
+ #if defined(CONFIG_RENDERDOC)
+     if (g_capture_renderdoc_frame) {
+         nv2a_dbg_renderdoc_capture_frames(1, false);
+@@ -269,15 +304,40 @@ void xemu_hud_update(void)
+         ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+     }
+ 
++#if defined(__PROSPERO__) && PSEMU_CUSTOM_DASHBOARD
++    // The dashboard is the PS5's front end: it comes up by itself once the
++    // boot animation has played (unless a game was set to boot), and the
++    // touchpad (Guide) brings it back. A press, not a hold, so the press
++    // that closes it doesn't reopen it.
++    static double started = ImGui::GetTime();
++    static bool booted_with_disc = g_config.sys.files.dvd_path &&
++                                   g_config.sys.files.dvd_path[0];
++    static bool guide_was_down = true;
++    bool guide_down = g_input_mgr.CombinedButtons() & CONTROLLER_BUTTON_GUIDE;
++    bool guide_pressed = guide_down && !guide_was_down;
++    guide_was_down = guide_down;
++    if (!g_scene_mgr.IsDisplayingScene()) {
++        if (!g_dashboard.m_auto_shown && !booted_with_disc &&
++            ImGui::GetTime() - started > 0.5) { // The Xbox is off (-S)
++            g_dashboard.m_auto_shown = true;
++            g_scene_mgr.PushScene(g_dashboard);
++        } else if (guide_pressed) {
++            g_scene_mgr.PushScene(g_dashboard);
++        }
++    }
++#endif
++
+     if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow) &&
+         !g_scene_mgr.IsDisplayingScene()) {
+ 
+         // If the guide button is pressed, wake the ui
+         bool menu_button = false;
+         uint32_t buttons = g_input_mgr.CombinedButtons();
++#if !defined(__PROSPERO__) || !PSEMU_CUSTOM_DASHBOARD /* else the touchpad opens the dashboard (above) */
+         if (buttons & CONTROLLER_BUTTON_GUIDE) {
+             menu_button = true;
+         }
++#endif
+ 
+         // Allow controllers without a guide button to also work
+         if ((buttons & CONTROLLER_BUTTON_BACK) &&
+@@ -315,6 +375,10 @@ void xemu_hud_update(void)
+     update_window.Draw();
+ #endif
+     g_scene_mgr.Draw();
++#ifdef __PROSPERO__
++    DashboardTick();
++    DrawPerfOverlay();
++#endif
+     if (!first_boot_window.is_open) notification_manager.Draw();
+     g_snapshot_mgr.Draw();
+ 
+@@ -325,15 +389,22 @@ void xemu_hud_update(void)
+ void xemu_hud_render()
+ {
+     ImGui::Render();
++#ifdef CONFIG_OPENGL
+     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+ 
+     if (g_vsync != g_config.display.window.vsync) {
+         g_vsync = g_config.display.window.vsync;
+         SDL_GL_SetSwapInterval(g_vsync ? 1 : 0);
+     }
++#endif
+ 
+     if (g_screenshot_pending) {
+         SaveScreenshot(g_tex, g_flip_req);
+         g_screenshot_pending = false;
+     }
++
++#ifndef CONFIG_OPENGL
++    // Presents too (the display's FIFO swapchain always waits for vblank).
++    xemu_vk_present_frame(ImGui::GetDrawData());
++#endif
+ }
+diff --git a/ui/xui/meson.build b/ui/xui/meson.build
+index 95d50cb303..8e87a22e48 100644
+--- a/ui/xui/meson.build
++++ b/ui/xui/meson.build
+@@ -4,7 +4,6 @@ xemu_ss.add(files(
+   'compat.cc',
+   'debug.cc',
+   'font-manager.cc',
+-  'gl-helpers.cc',
+   'input-manager.cc',
+   'main-menu.cc',
+   'main.cc',
+@@ -23,6 +22,20 @@ xemu_ss.add(files(
+   'widgets.cc',
+ ))
+ 
++if opengl.found()
++  xemu_ss.add(files('gl-helpers.cc'))
++else
++  # No OpenGL (the PS5): draw with the NV2A Vulkan renderer's device.
++  xemu_ss.add(volk, files('vk-helpers.cc', 'vk-present.cc'))
++endif
++
++if host_os == 'freebsd' # The PS5's front end
++  xemu_ss.add(files('dashboard.cc', 'game-log.cc', 'game-patches.cc',
++                    'game-profile.cc',
++                    'ui-sounds.cc',
++                    'xiso.cc'))
++endif
++
+ if host_os == 'windows'
+   xemu_ss.add(files('update.cc', 'win32-dxgi-present.cc'))
+ endif
+diff --git a/ui/xui/popup-menu.cc b/ui/xui/popup-menu.cc
+index f80ce9fd65..4bb7794dc8 100644
+--- a/ui/xui/popup-menu.cc
++++ b/ui/xui/popup-menu.cc
+@@ -362,6 +362,11 @@ public:
+         for (const auto &[label, file_path] : sorted_file_names) {
+             if (PopupMenuButton(label, ICON_FA_COMPACT_DISC)) {
+                 ActionLoadDiscFile(file_path.c_str());
++#ifdef __PROSPERO__
++                // Boot straight into it, whether the Xbox dashboard or
++                // another game is running.
++                ActionReset();
++#endif
+                 nav.ClearMenuStack();
+                 pop = true;
+             }
+@@ -448,10 +453,20 @@ public:
+             ActionEjectDisc();
+             pop = true;
+         }
++#ifdef __PROSPERO__
++        // No file dialogs on PS5 (games come from games_dir above).
++        // Empty tray + reset boots the dashboard from the HDD.
++        if (PopupMenuButton("Xbox Dashboard", ICON_FA_HOUSE)) {
++            ActionEjectDisc();
++            ActionReset();
++            pop = true;
++        }
++#else
+         if (PopupMenuButton("Load Disc...", ICON_FA_COMPACT_DISC)) {
+             ActionLoadDisc();
+             pop = true;
+         }
++#endif
+         if (PopupMenuSubmenuButton("Settings", ICON_FA_GEARS)) {
+             nav.PushFocus();
+             nav.PushMenu(settings);
+diff --git a/ui/xui/scene-components.cc b/ui/xui/scene-components.cc
+index 35e2434430..7c3e597497 100644
+--- a/ui/xui/scene-components.cc
++++ b/ui/xui/scene-components.cc
+@@ -182,7 +182,7 @@ public:
+ class TitleInfo
+ {
+ protected:
+-    GLuint screenshot;
++    XemuTexture screenshot;
+     ImVec2 size;
+     EasingAnimation m_animation;
+ 
+@@ -211,12 +211,15 @@ public:
+     void initScreenshot()
+     {
+         if (screenshot == 0) {
+-            glGenTextures(1, &screenshot);
+             int w, h, n;
+             stbi_set_flip_vertically_on_load(0);
+             unsigned char *data = stbi_load("./data/cover_front.jpg", &w, &h, &n, 4);
+             assert(data);
+             assert(n == 4 || n == 3);
++#ifndef CONFIG_OPENGL
++            screenshot = xemu_vk_texture_create(data, w, h, 4);
++#else
++            glGenTextures(1, &screenshot);
+             glActiveTexture(GL_TEXTURE0);
+             glBindTexture(GL_TEXTURE_2D, screenshot);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,  0);
+@@ -225,6 +228,7 @@ public:
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
++#endif
+             stbi_image_free(data);
+ 
+             // Fix width
+diff --git a/ui/xui/xemu-hud.h b/ui/xui/xemu-hud.h
+index 0e812fef94..3e554639e7 100644
+--- a/ui/xui/xemu-hud.h
++++ b/ui/xui/xemu-hud.h
+@@ -24,7 +24,7 @@
+ #define XEMU_HUD_H
+ 
+ #include <SDL3/SDL.h>
+-#include <epoxy/gl.h>
++#include "ui/xemu-texture.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -46,7 +46,18 @@ void xemu_hud_update(void);
+ void xemu_hud_render(void);
+ void xemu_hud_process_sdl_events(SDL_Event *event);
+ void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
+-void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip);
++void xemu_hud_set_framebuffer_texture(XemuTexture tex, bool flip);
++
++#ifndef CONFIG_OPENGL
++// Implemented in vk-present.cc
++// False until the Vulkan renderer's device exists (or if presenting failed).
++bool xemu_vk_present_ready(void);
++// The NV2A display image, after a successful nv2a_get_framebuffer_surface().
++XemuTexture xemu_vk_get_display_texture(void);
++// Uploads the VGA surface (x8r8g8b8) for guests that write the framebuffer.
++XemuTexture xemu_vk_update_surface_texture(const void *pixels, int width,
++                                           int height, int stride);
++#endif
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/util/oslib-posix.c b/util/oslib-posix.c
+index 3c14b72665..58a33c576d 100644
+--- a/util/oslib-posix.c
++++ b/util/oslib-posix.c
+@@ -736,6 +736,19 @@ void *qemu_alloc_stack(size_t *sz)
+     flags |= MAP_STACK;
+ #endif
+ 
++#ifdef __PROSPERO__
++    /*
++     * The PS5's anonymous mappings come from a small flexible memory budget
++     * that coroutine pools would soon use up, and can't take a guard page
++     * anyway. The heap is in direct memory (the SDK platform's malloc).
++     */
++    (void)flags;
++    ptr = qemu_try_memalign(pagesz, *sz);
++    if (ptr == NULL) {
++        perror("failed to allocate memory for stack");
++        abort();
++    }
++#else
+     ptr = mmap(NULL, *sz, PROT_READ | PROT_WRITE, flags, -1, 0);
+     if (ptr == MAP_FAILED) {
+         perror("failed to allocate memory for stack");
+@@ -747,6 +760,7 @@ void *qemu_alloc_stack(size_t *sz)
+         perror("failed to set up stack guard page");
+         abort();
+     }
++#endif
+ 
+ #ifdef CONFIG_DEBUG_STACK_USAGE
+     for (ptr2 = ptr + pagesz; ptr2 < ptr + *sz; ptr2 += sizeof(uint32_t)) {
+@@ -781,7 +795,11 @@ void qemu_free_stack(void *stack, size_t sz)
+     }
+ #endif
+ 
++#ifdef __PROSPERO__
++    qemu_vfree(stack); /* From qemu_alloc_stack's heap allocation */
++#else
+     munmap(stack, sz);
++#endif
+ }
+ 
+ /*

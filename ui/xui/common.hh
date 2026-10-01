@@ -1,0 +1,59 @@
+//
+// xemu User Interface
+//
+// Copyright (C) 2020-2022 Matt Borgerson
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+#pragma once
+
+#include <SDL3/SDL.h>
+#include "config-host.h"
+#include "ui/xemu-texture.h"
+#include "ui/xemu-settings.h"
+
+#define IMGUI_DEFINE_MATH_OPERATORS
+#include <imgui.h>
+#include <imgui_internal.h>
+#include <imgui_impl_sdl3.h>
+#ifdef CONFIG_OPENGL
+#include <imgui_impl_opengl3.h>
+#else
+#include <imgui_impl_vulkan.h>
+#include "hw/xbox/nv2a/pgraph/vk/vk-ui.h"
+#endif
+#include <implot.h>
+#include <misc/cpp/imgui_stdlib.h>
+#include <stb_image.h>
+
+#include "qemu/osdep.h"
+
+extern "C" {
+// Include necessary QEMU headers
+#include "qapi/error.h"
+#include "system/runstate.h"
+#include "hw/xbox/mcpx/apu/apu_debug.h"
+#include "hw/xbox/nv2a/debug.h"
+#include "hw/xbox/nv2a/nv2a.h"
+
+#undef typename
+#undef atomic_fetch_add
+#undef atomic_fetch_and
+#undef atomic_fetch_xor
+#undef atomic_fetch_or
+#undef atomic_fetch_sub
+}
+
+extern bool g_screenshot_pending;
+extern float g_main_menu_height;

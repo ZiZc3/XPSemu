@@ -1,0 +1,11 @@
+[wrap-git]
+url = https://github.com/libsdl-org/SDL
+revision = fa2c02bb6e21974a89ea9824bc53c9932abe5f9c
+depth = 1
+method = cmake
+
+[provide]
+dependency_names = sdl3
+
+[update]
+tag_regex = ^release-\d+\.\d+\.\d+$

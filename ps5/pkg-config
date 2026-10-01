@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# pkg-config for the PS5 build: only the libraries deps/build-deps.sh built.
+# (The SDK's prospero-pkg-config replaces PKG_CONFIG_LIBDIR with its own.)
+prefix=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/deps/prefix
+# FreeBSD targets (meson, SDL) install .pc files to libdata/pkgconfig.
+export PKG_CONFIG_LIBDIR=$prefix/lib/pkgconfig:$prefix/libdata/pkgconfig
+unset PKG_CONFIG_PATH PKG_CONFIG_SYSROOT_DIR
+exec pkg-config --static "$@"
