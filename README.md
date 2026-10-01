@@ -96,9 +96,12 @@ fail here too.
 ## Requirements
 
 - A **jailbroken PS5** that can run homebrew apps (fake-signed titles).
-- A HEN that **jailbreaks apps on request**: XPSemu asks for it the same way [PS5SX2](https://github.com/Swordpdf/PS5SX2) does (it writes its PID
-  to `/download0/etahen_jailbreak`, the [etaHEN](https://github.com/LightningMods/etaHEN) protocol). Tested with the **PS5SX2 Helper** payload (with [kstuff](https://github.com/EchoStretch/kstuff)), which only
-  jailbreaks title IDs listed in `/data/whitelist.txt`.
+- **XPSemu Tools** (`xpsemu_tools.elf`): included in the release. A standalone app-jailbreak daemon that
+  runs alongside [kstuff](https://github.com/EchoStretch/kstuff). When XPSemu starts, it writes its PID
+  to `/download0/etahen_jailbreak` (the [etaHEN](https://github.com/LightningMods/etaHEN) protocol);
+  XPSemu Tools picks it up, verifies the title ID against `/data/whitelist.txt`, and jailbreaks it
+  (root, sandbox escape, JIT). Multi-firmware: offsets resolve at runtime via the ps5-payload-sdk.
+  Replaces the PS5SX2 Helper — no third-party helper payload needed any more.
 - A way to install/mount the app folder, for example **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
 - **Your own** original Xbox files, dumped from your own console (not included, never will be):
   - MCPX boot ROM: `mcpx_1.0.bin`
@@ -110,11 +113,13 @@ fail here too.
 
 1. **Copy the app.** Put the `PPSA97358` folder from the release on your PS5 and install/mount it with your
    homebrew installer (for example ShadowMountPlus; one known-good place is `/data/homebrew/PPSA97358`).
-2. **Allow the app jailbreak.** Add this line to `/data/whitelist.txt` (create the file if needed):
+2. **Load XPSemu Tools.** Copy `xpsemu_tools.elf` from the release to your PS5 and load it together
+   with kstuff (e.g. add both to `/data/autoload.txt`, kstuff first). Then add this line to
+   `/data/whitelist.txt` (create the file if needed):
    ```
    PPSA97358
    ```
-   Then load your HEN / PS5SX2 Helper payload as usual before starting XPSemu.
+   XPSemu Tools watches for XPSemu's jailbreak request and handles it automatically.
 3. **Copy your Xbox files** to `/data/xemu/`:
    ```
    /data/xemu/mcpx_1.0.bin
@@ -133,7 +138,7 @@ fail here too.
 5. **Add games** to `/data/xemu/games/` (XISO `.iso` files).
 6. Start **XPSemu** from the home screen. The dashboard opens; pick a game in **Games** and press ✕.
 
-If the app closes right away or shows "jailbreak failed", check step 2 and that your HEN payload is loaded.
+If the app closes right away or shows "jailbreak failed", check that kstuff + XPSemu Tools are loaded and that `PPSA97358` is in `/data/whitelist.txt`.
 
 ## Folder layout on the PS5
 
@@ -279,7 +284,7 @@ A full diff of the modified upstream files is in [`ps5/XPSEMU-CHANGES.diff`](ps5
   flexible/direct memory, allocations kept out of the GPU's address window, the TCG JIT buffer in
   executable shared memory (as PS5SX2 does), coroutine stacks from the heap, file-mapping fallback to
   read-into-memory.
-- **Sandbox**: requests the app jailbreak from the HEN at startup; all data under `/data/xemu`.
+- **Sandbox**: requests the app jailbreak from XPSemu Tools at startup; all data under `/data/xemu`.
 - **DualSense input** (`ui/xemu-input-ps5.c`) through libScePad, mapped to an Xbox controller.
 - **Audio** through SceAudioOut (`hw/xbox/mcpx/apu/monitor.c`).
 - **Crash handler and logging**: crash address, backtrace and load address in `xemu.log`, kernel
@@ -334,6 +339,7 @@ the SSE math fast path only runs where the host's result is bit-identical by con
 | `hw/xbox/xemu-timing.h` | Stopwatches used by the game log. |
 | `ui/xemu-os-utils-ps5.c` | PS5 startup, jailbreak request, crash handler, pinning, profiler. |
 | `config_spec.yml` | New settings: performance overlay, menu sounds, CPU pinning, profiler, shader cache. |
+| `xpsemu-tools/` | Standalone app-jailbreak daemon (`xpsemu_tools.elf`): replaces the PS5SX2 Helper. |
 
 ## Building from source
 
@@ -388,9 +394,9 @@ Menu sounds: `ps5/sounds/embed-sounds.py` turns `ps5/sounds/*.wav` into `ui/xui/
 
 - **[xemu](https://github.com/xemu-project/xemu)** ([xemu.app](https://xemu.app)) and its contributors: the emulator this is built on.
 - **[QEMU](https://www.qemu.org/)** ([source](https://gitlab.com/qemu-project/qemu)): the machine emulation and the TCG JIT under xemu.
-- **[Mihawk-99](https://github.com/mihawk-99)'s PS5_Vulkan / PS5_Mesa**: RADV ([Mesa](https://gitlab.freedesktop.org/mesa/mesa)'s open-source AMD Vulkan driver) running on the PS5, the toolchain integration and title packaging XPSemu links against. (The repositories are not public at the time of writing.)
+- **[Mihawk-99](https://github.com/mihawk-99)'s [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan) / PS5_Mesa**: RADV ([Mesa](https://gitlab.freedesktop.org/mesa/mesa)'s open-source AMD Vulkan driver) running on the PS5, the toolchain integration and title packaging XPSemu links against.
 - **[ps5-payload-dev SDK](https://github.com/ps5-payload-dev/sdk)** (as pinned by Mihawk-99's PS5_PayloadSDK): the open PS5 payload SDK.
-- **[PS5SX2](https://github.com/Swordpdf/PS5SX2)** by Swordpdf: reference for the app jailbreak request, CPU core layout, JIT memory and DualSense reading on the PS5.
+- **[PS5SX2](https://github.com/Swordpdf/PS5SX2)** by Swordpdf: reference for the app jailbreak protocol, CPU core layout, JIT memory and DualSense reading on the PS5. XPSemu Tools replaces the PS5SX2 Helper with its own standalone daemon built on the ps5-payload-sdk.
 - **[etaHEN](https://github.com/LightningMods/etaHEN)** (LightningMods), **[kstuff](https://github.com/EchoStretch/kstuff)** (EchoStretch, from [ps5-payload-dev/kstuff](https://github.com/ps5-payload-dev/kstuff)), **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)** (drakmor) and the PS5 scene for making homebrew apps possible.
 - **Jay's Magic Patch / [JayXbox PatchHub](https://www.jayxbox.com/Retail-Game-Modification/PatchHub.php)**: the patch format and the community's patches.
 - **[Dear ImGui](https://github.com/ocornut/imgui)**, **[SDL3](https://github.com/libsdl-org/SDL)**, **[GLib](https://gitlab.gnome.org/GNOME/glib)**, **[glslang](https://github.com/KhronosGroup/glslang)**, **[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)** and the other libraries xemu uses.
