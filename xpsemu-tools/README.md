@@ -1,12 +1,12 @@
 # XPSemu Tools
 
-Standalone app-jailbreak daemon for XPSemu (`PPSA97358`). Replacement for the
-PS5SX2 Helper payload: it jailbreaks XPSemu on request so the emulator gets
-root + sandbox escape (needed for `/data` and the JIT), gated by a whitelist.
+Standalone app-jailbreak daemon for XPSemu (`PPSA97358`). It jailbreaks XPSemu
+on request so the emulator gets root + sandbox escape (needed for `/data` and
+the JIT), gated by a whitelist.
 
 - Watches `/mnt/sandbox/*` + `/download0/etahen_jailbreak` for XPSemu's
-  `{"PID":<pid>}` request (staged `.tmp` + rename, same etaHEN/OnionHEN
-  protocol XPSemu and PS5SX2 speak).
+  `{"PID":<pid>}` request (staged `.tmp` + rename, the same etaHEN/OnionHEN
+  protocol XPSemu speaks).
 - Verifies the PID's real title ID (`sceKernelGetAppInfo`) matches the sandbox
   directory it came from, and that the title is listed in
   `/data/whitelist.txt`.
@@ -28,17 +28,17 @@ root + sandbox escape (needed for `/data` and the JIT), gated by a whitelist.
 ## Install
 
 1. Build (on Linux, e.g. WSL2 Ubuntu):
-   ```sh
+```sh
    export PS5_PAYLOAD_SDK=~/ps5/PS5_Vulkan/.deps/native/ps5-payload-sdk
    make
-   ```
+```
    Output: `xpsemu_tools.elf`.
 2. Copy `xpsemu_tools.elf` to the PS5 and load it together with `kstuff`
    (e.g. add both paths to `/data/autoload.txt`, kstuff first).
 3. Allow XPSemu:
-   ```
+```
    PPSA97358
-   ```
+```
    in `/data/whitelist.txt` (create it if needed; see `whitelist.txt` here).
 4. Start XPSemu from the home screen (via ShadowMountPlus as usual).
 
@@ -50,7 +50,3 @@ XPSemu (`ui/xemu-os-utils-ps5.c`) writes `{"PID":<pid>}` to
 consumed (600 x 16.7 ms polls) plus ~7.5 s grace for creds to settle
 (450 polls). This daemon polls every 100 ms and unlinks the file once
 handled, which is the consume signal the app waits for.
-
-## License
-
-GPL-3.0-or-later (same as PS5SX2 / OnionHEN family).
