@@ -64,7 +64,7 @@ the PS5's Zen 2 processor.
 - **Games** page as a cover-flow carousel with box art, reflections and per-game info.
 - Game names from the ISO file name; covers you drop in a folder (`.jpg` / `.png`).
 - **Recently played** shelf and **play time** per game.
-- **Xbox Dashboard**: boots the original Microsoft dashboard from your HDD image (useful for Xbox system settings and saves). Only works if the dashboard is installed on your HDD image (see step 3).
+- **Xbox Dashboard**: boots the original Microsoft dashboard from your HDD image. Only works if the dashboard is installed on your HDD image (see step 3).
 - The emulated Xbox starts powered off and XPSemu always opens on its dashboard (no auto-resume of the last game).
 - Menu sounds (can be turned off), title shine animation, app icon and background art.
 
