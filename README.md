@@ -126,15 +126,7 @@ fail here too.
    /data/xemu/Complex_4627.bin
    /data/xemu/xbox_hdd.qcow2
    ```
-4. **Point XPSemu at them.** Create `/data/xemu/xemu.toml` (or edit the one XPSemu writes on first start):
-   ```toml
-   [sys.files]
-   bootrom_path = '/data/xemu/mcpx_1.0.bin'
-   flashrom_path = '/data/xemu/Complex_4627.bin'
-   hdd_path = '/data/xemu/xbox_hdd.qcow2'
-   eeprom_path = '/data/xemu/eeprom.bin'
-   ```
-   The EEPROM file is created automatically if it does not exist.
+   The EEPROM file and Xemu.toml is created automatically if it does not exist.
 5. **Add games** to `/data/xemu/games/` (XISO `.iso` files).
 6. Start **XPSemu** from the home screen. The dashboard opens; pick a game in **Games** and press ✕.
 
