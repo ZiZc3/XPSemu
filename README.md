@@ -64,7 +64,7 @@ the PS5's Zen 2 processor.
 - **Games** page as a cover-flow carousel with box art, reflections and per-game info.
 - Game names from the ISO file name; covers you drop in a folder (`.jpg` / `.png`).
 - **Recently played** shelf and **play time** per game.
-- **Xbox Dashboard** button to boot the original Microsoft dashboard from your HDD image.
+- **Xbox Dashboard**: boots the original Microsoft dashboard from your HDD image (useful for Xbox system settings and saves). Only works if the dashboard is installed on your HDD image (see step 3).
 - The emulated Xbox starts powered off and XPSemu always opens on its dashboard (no auto-resume of the last game).
 - Menu sounds (can be turned off), title shine animation, app icon and background art.
 
@@ -126,6 +126,9 @@ fail here too.
    /data/xemu/Complex_4627.bin
    /data/xemu/xbox_hdd.qcow2
    ```
+   If you want the **Xbox Dashboard** button to work, your `xbox_hdd.qcow2` must already have the
+   original Microsoft dashboard installed on it — a blank image boots nothing.
+   
    The EEPROM file and Xemu.toml is created automatically if it does not exist.
 5. **Add games** to `/data/xemu/games/` (XISO `.iso` files).
 6. Start **XPSemu** from the home screen. The dashboard opens; pick a game in **Games** and press ✕.
