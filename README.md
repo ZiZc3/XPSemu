@@ -52,7 +52,7 @@ to the PlayStation 5 as a native application. the whole emulator (Xbox CPU throu
 renderer, the MCPX audio, the controllers) runs as a PS5 app on top of an open-source Vulkan driver
 (RADV, from the PS5_Vulkan project).
 
-On top of the port, XPSemu adds its own controller-friendly dashboard, per-game settings, cover art,
+XPSemu adds its own controller-friendly dashboard, per-game settings, cover art,
 play time, game patches, a performance overlay, a per-game log and a set of CPU optimizations made for
 the PS5's Zen 2 processor.
 
@@ -101,7 +101,7 @@ Tested on a PS5 Fat with Alpha 2. many Xbox games are capped at 30 or 60.
 | Forza Motorsport | ⚠️ In-game | 30 FPS (its cap) in menus and intro, 15-21 FPS while racing. |
 | Fable: The Lost Chapters | ⚠️ In-game | 22-30 FPS in many areas (30 is its cap), 10-20 FPS in heavy areas. |
 | Crash Bandicoot: The Wrath of Cortex | ✅ Great | Runs smoothly. |
-| Halo: Combat Evolved | ✅ Playable | 30 FPS (its cap). 60 FPS with a 60 FPS patch. |
+| Halo: Combat Evolved | ✅ Playable | 30 FPS (its cap). 60 FPS with a FPS patch. |
 | Ninja Gaiden Black | ✅ Playable | 60 FPS. |
 | Jet Set Radio Future | ✅ Playable | 50-60 FPS. |
 | Crash Nitro Kart | ✅ Good | 30 FPS most of the time. |
