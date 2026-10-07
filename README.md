@@ -95,7 +95,18 @@ the PS5's Zen 2 processor.
 
 ## Compatibility
 
-See **[COMPATIBILITY.md](COMPATIBILITY.md)** for the list of tested games and how they run.
+Tested by the developer on a PS5 with Alpha 1. "FPS" is what the game itself draws; many Xbox games are capped at 30 or 60.
+
+| Game | Status | Notes |
+|---|---|---|
+| Halo 2 | ✅ Good | 30 FPS stock. With the Halo 2 60 FPS patch: 51-60 FPS in the opening, 36-50 in gameplay.. |
+| Forza Motorsport | ⚠️ In-game | 30 FPS (its cap) in menus and intro, 15-21 FPS while racing. |
+| Fable: The Lost Chapters | ⚠️ In-game | 22-30 FPS in many areas (30 is its cap), 10-20 FPS in heavy areas. |
+| Crash Bandicoot: The Wrath of Cortex | ✅ Great | Runs smoothly. |
+| Halo: Combat Evolved | ✅ Great | 30 FPS (its cap). 60 FPS with a 60 FPS patch. |
+| Ninja Gaiden Black | ✅ Great | 60 FPS. |
+| Jet Set Radio Future | ✅ Great | 60 FPS. |
+| Crash Nitro Kart | ✅ Good | 30 FPS most of the time. |
 
 Anything that runs well in xemu on PC has a good chance of running here, more slowly in CPU-heavy
 scenes (see [Performance notes](#performance-notes)). xemu's own
