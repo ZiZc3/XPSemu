@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <img alt="Status" src="https://img.shields.io/badge/status-Alpha%201-6fcf2f">
+  <img alt="Status" src="https://img.shields.io/badge/status-Alpha%202-6fcf2f">
   <img alt="Platform" src="https://img.shields.io/badge/platform-PS5%20(jailbroken)-1f1f1f">
   <img alt="Renderer" src="https://img.shields.io/badge/renderer-Vulkan%20(RADV)-3b7d23">
   <img alt="Based on" src="https://img.shields.io/badge/based%20on-xemu%200.8.136-2f6f1f">
