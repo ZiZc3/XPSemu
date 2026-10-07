@@ -35,13 +35,11 @@
 - [Controls](#controls)
 - [Using the dashboard](#using-the-dashboard)
 - [Game patches](#game-patches)
-- [Settings explained](#settings-explained)
 - [Performance notes](#performance-notes)
 - [Logs and reporting problems](#logs-and-reporting-problems)
 - [Known limitations](#known-limitations)
 - [What XPSemu changes in xemu](#what-xpsemu-changes-in-xemu)
 - [Building from source](#building-from-source)
-- [Roadmap](#roadmap)
 - [Credits](#credits)
 - [License and legal](#license-and-legal)
 
