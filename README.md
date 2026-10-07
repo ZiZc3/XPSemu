@@ -48,8 +48,7 @@
 ## What is XPSemu?
 
 XPSemu is [xemu](https://github.com/xemu-project/xemu), the open-source original Xbox emulator, ported
-to the PlayStation 5 as a native application (title ID `PPSA97358`). It is not a libretro core or a
-wrapper: the whole emulator (Xbox CPU through QEMU's TCG JIT, the NV2A GPU through xemu's Vulkan
+to the PlayStation 5 as a native application. the whole emulator (Xbox CPU through QEMU's TCG JIT, the NV2A GPU through xemu's Vulkan
 renderer, the MCPX audio, the controllers) runs as a PS5 app on top of an open-source Vulkan driver
 (RADV, from the PS5_Vulkan project).
 
@@ -62,7 +61,7 @@ the PS5's Zen 2 processor.
 **Setup**
 - Only your MCPX boot ROM and BIOS are needed: a blank Xbox hard disk is created for you if you have none.
 - A setup screen shows which files are missing and updates by itself as you copy them over.
-- Games from `/data/xemu/games/` or from `xemu/games/` on any USB or external drive; plug drives in or out and the list updates.
+- Games from `/data/xemu/games/` or from `xemu/games/` on any USB or external drive.
 
 **Dashboard**
 - Xbox-style dashboard made for the DualSense: animated green background, main menu, recently played shelf.
@@ -70,8 +69,7 @@ the PS5's Zen 2 processor.
 - **Box Art Viewer**: the full game case in 3D (front, back and spine) to turn, zoom and flip.
 - Game names from the ISO file name (rename any game from its settings); covers downloaded automatically, or your own in a folder (`.jpg` / `.png`).
 - **Recently played** shelf and **play time** per game.
-- **Xbox Dashboard**: boots the dashboard on your HDD image: the original Microsoft one if it's installed there, or the small free one on the hard disk XPSemu creates.
-- The emulated Xbox starts powered off and XPSemu always opens on its dashboard (no auto-resume of the last game).
+- **Original Xbox Dashboard**: boots the dashboard on your HDD image: the original Microsoft one, You will need to have it installed on the HDD.
 - Menu sounds and dashboard music (can be turned off), title shine animation, app icon and background art.
 - XPSemu startup logo and sound; the original Xbox startup animation can be turned on in Settings.
 - Settings in categories: Video, Sound, Interface, Controller, Patches, Advanced.
@@ -81,7 +79,7 @@ the PS5's Zen 2 processor.
 - **Game patches** in Jay's Magic Patch (`.jmp`) format, applied in memory while the game loads: your ISO files are never modified.
 - Automatic checksum matching: patches that are not made for your copy are blocked and labelled.
 - **Patch Store**: get patches for each game from Jay's Magic Patches, checked against your copy first; all active patches in Settings > Patches.
-- **Home-screen shortcuts**: any game as its own PS5 tile, with its cover and 4K background art, opening straight into the game.
+- **Home-screen shortcuts**: any game as its own PS5 title, with its cover and 4K background art, opening straight into the game.
 - Crash watcher: if a game crashes back to the Xbox dashboard, XPSemu tells you and notes it in the log.
 
 **System**
@@ -95,7 +93,7 @@ the PS5's Zen 2 processor.
 
 ## Compatibility
 
-Tested by the developer on a PS5 with Alpha 1. "FPS" is what the game itself draws; many Xbox games are capped at 30 or 60.
+Tested on a PS5 Fat with Alpha 2. many Xbox games are capped at 30 or 60.
 
 | Game | Status | Notes |
 |---|---|---|
@@ -108,20 +106,18 @@ Tested by the developer on a PS5 with Alpha 1. "FPS" is what the game itself dra
 | Jet Set Radio Future | ✅ Playable | 50-60 FPS. |
 | Crash Nitro Kart | ✅ Good | 30 FPS most of the time. |
 
-Anything that runs well in xemu on PC has a good chance of running here, more slowly in CPU-heavy
-scenes (see [Performance notes](#performance-notes)). xemu's own
-[compatibility list](https://xemu.app/#compatibility) is a good first check. Games that fail on PC xemu
-fail here too.
+Anything that runs well in xemu on PC has a good chance of running here.
+see xemu's own
+[compatibility list](https://xemu.app/#compatibility)
 
 ## Requirements
 
-- A **jailbroken PS5** that can run homebrew apps (fake-signed titles).
-- **`helper.elf`** (formerly XPSemu Tools): included in the release. A standalone payload that
-  runs alongside [kstuff](https://github.com/EchoStretch/kstuff); no `whitelist.txt` entry is needed.
-- A way to install/mount the app folder, for example **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
+- A **jailbroken PS5.**
+- **`helper.elf`**: included in the release.
+- **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
 - **Your own** original Xbox files, dumped from your own console (not included, never will be):
   - MCPX boot ROM: `mcpx_1.0.bin`
-  - Xbox BIOS / flash ROM, for example `Complex_4627.bin`
+  - Xbox BIOS / flash ROM: `Complex_4627.bin`
   - Optional: your own Xbox hard-disk image `xbox_hdd.qcow2`. Without one, XPSemu creates a blank one for you.
 - **Your own games** as **XISO** images (`.iso` / `.xiso`). Full "redump" disc images must be converted to XISO first (for example with [extract-xiso](https://github.com/XboxDev/extract-xiso)).
 
