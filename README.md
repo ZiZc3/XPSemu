@@ -97,10 +97,10 @@ Tested on a PS5 Fat with Alpha 2. many Xbox games are capped at 30 or 60.
 
 | Game | Status | Notes |
 |---|---|---|
-| Halo 2 | ✅ Good | 30 FPS stock. With the Halo 2 60 FPS patch: 51-60 FPS in the opening, 36-50 in gameplay.. |
-| Forza Motorsport | ⚠️ In-game | 30 FPS (its cap) in menus and intro, 15-21 FPS while racing. |
+| Halo 2 | ✅ Playable | 30 FPS stock. With the Halo 2 60 FPS patch: 51-60 FPS in the opening, 36-50 in gameplay.. |
+| Forza Motorsport | ⚠️ In-game | 30 FPS (its cap) in menus and intro, 18-25 FPS while racing. |
 | Fable: The Lost Chapters | ⚠️ In-game | 22-30 FPS in many areas (30 is its cap), 10-20 FPS in heavy areas. |
-| Crash Bandicoot: The Wrath of Cortex | ✅ Great | Runs smoothly. |
+| Crash Bandicoot: The Wrath of Cortex | ✅ Playable | 60 FPS. |
 | Halo: Combat Evolved | ✅ Playable | 30 FPS (its cap). 60 FPS with a FPS patch. |
 | Ninja Gaiden Black | ✅ Playable | 60 FPS. |
 | Jet Set Radio Future | ✅ Playable | 50-60 FPS. |
