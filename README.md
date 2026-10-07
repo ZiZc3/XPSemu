@@ -40,7 +40,7 @@
 - [What XPSemu changes in xemu](#what-xpsemu-changes-in-xemu)
 - [Building from source](#building-from-source)
 - [Credits](#credits)
-- [License and legal](#license-and-legal)
+- [License](#license-and-legal)
 
 ## What is XPSemu?
 
@@ -317,7 +317,7 @@ Menu sounds: `ps5/sounds/embed-sounds.py` turns `ps5/sounds/*.wav` into `ui/xui/
 
 XPSemu's icon, background and banner are original artwork (a green "X" emblem); they are not the Xbox logo.
 
-## License and legal
+## License
 
 XPSemu is licensed under the **GNU General Public License v2**, like xemu and QEMU (see [`LICENSE`](LICENSE) and [`COPYING`](COPYING)).
 Third-party components keep their own licenses.
