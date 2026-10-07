@@ -103,9 +103,9 @@ Tested by the developer on a PS5 with Alpha 1. "FPS" is what the game itself dra
 | Forza Motorsport | ⚠️ In-game | 30 FPS (its cap) in menus and intro, 15-21 FPS while racing. |
 | Fable: The Lost Chapters | ⚠️ In-game | 22-30 FPS in many areas (30 is its cap), 10-20 FPS in heavy areas. |
 | Crash Bandicoot: The Wrath of Cortex | ✅ Great | Runs smoothly. |
-| Halo: Combat Evolved | ✅ Great | 30 FPS (its cap). 60 FPS with a 60 FPS patch. |
-| Ninja Gaiden Black | ✅ Great | 60 FPS. |
-| Jet Set Radio Future | ✅ Great | 60 FPS. |
+| Halo: Combat Evolved | ✅ Playable | 30 FPS (its cap). 60 FPS with a 60 FPS patch. |
+| Ninja Gaiden Black | ✅ Playable | 60 FPS. |
+| Jet Set Radio Future | ✅ Playable | 50-60 FPS. |
 | Crash Nitro Kart | ✅ Good | 30 FPS most of the time. |
 
 Anything that runs well in xemu on PC has a good chance of running here, more slowly in CPU-heavy
