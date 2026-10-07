@@ -899,14 +899,26 @@ static MString* psh_convert(struct PixelShader *ps)
         "    float lo_f = float(lo_i) / float(0xffff);\n"
         "    return vec3(hi_f, lo_f, 1.0);\n"
         "}\n"
+        "vec2 hilo_signed(vec4 col) {\n"
+        "    uint hi_i = uint(col.a * float(0xff)) << 8\n"
+        "              | uint(col.r * float(0xff));\n"
+        "    uint lo_i = uint(col.g * float(0xff)) << 8\n"
+        "              | uint(col.b * float(0xff));\n"
+        "    float hi_f = float(hi_i) - (hi_i >= 0x8000u ? 65536.0 : 0.0);\n"
+        "    float lo_f = float(lo_i) - (lo_i >= 0x8000u ? 65536.0 : 0.0);\n"
+        "    return vec2(hi_f, lo_f);\n"
+        "}\n"
         "vec3 dotmap_hilo_hemisphere_d3d(vec4 col) {\n"
-        "    return col.rgb;\n" // FIXME
+        "    vec2 hilo = hilo_signed(col) / 32768.0;\n"
+        "    return vec3(hilo, sqrt(max(0.0, 1.0 - dot(hilo, hilo))));\n"
         "}\n"
         "vec3 dotmap_hilo_hemisphere_gl(vec4 col) {\n"
-        "    return col.rgb;\n" // FIXME
+        "    vec2 hilo = (hilo_signed(col) + 0.5) / 32767.5;\n"
+        "    return vec3(hilo, sqrt(max(0.0, 1.0 - dot(hilo, hilo))));\n"
         "}\n"
         "vec3 dotmap_hilo_hemisphere(vec4 col) {\n"
-        "    return col.rgb;\n" // FIXME
+        "    vec2 hilo = hilo_signed(col) / 32767.0;\n"
+        "    return vec3(hilo, sqrt(max(0.0, 1.0 - dot(hilo, hilo))));\n"
         "}\n"
         // Kahan's algorithm for computing determinant using FMA for higher
         // precision. See e.g.:
@@ -1101,7 +1113,9 @@ static MString* psh_convert(struct PixelShader *ps)
 
         assert(ps->dot_map[i] < 8);
         const char *dotmap_func = dotmap_funcs[ps->dot_map[i]];
-        if (ps->dot_map[i] > 3) {
+        // HILO_1 has a shader implementation above; only the three
+        // hemisphere variants remain unsupported.
+        if (ps->dot_map[i] > PS_DOTMAPPING_HILO_1) {
             NV2A_UNIMPLEMENTED("Dot Mapping mode %s", dotmap_func);
         }
 

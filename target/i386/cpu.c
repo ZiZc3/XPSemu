@@ -9320,10 +9320,17 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
     Error *local_err = NULL;
     unsigned requested_lbr_fmt;
 
-#if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
+#if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY) && !defined(__PROSPERO__)
     /* Use pc-relative instructions in system-mode */
     tcg_cflags_set(cs, CF_PCREL);
 #endif
+    /*
+     * XPSemu: not on the PS5. Every translated block thrown away (Fable:
+     * 1500-3000 a second) wiped the CPU's whole jump cache when blocks are
+     * pc-relative (tb_jmp_cache_inval_tb), and every lookup after missed
+     * into the hash table. Without, only that block's entry goes. The Xbox
+     * has one address space, so pc-relative blocks gain nothing here.
+     */
 
     /*
      * x-vendor-cpuid-only and v2 should be initernal only. But

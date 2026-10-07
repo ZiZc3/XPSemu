@@ -195,6 +195,10 @@ DEF(smin_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(umin_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(smax_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(umax_vec, 1, 2, 0, TCG_OPF_VECTOR)
+/* XPSemu: host SSE for guest SSE (include/tcg/xps-sse.h) */
+DEF(xps_sse_vec, 1, 2, 1, TCG_OPF_VECTOR)
+DEF(xps_sse_x2r, 1, 1, 1, TCG_OPF_VECTOR)
+DEF(xps_sse_r2x, 1, 2, 1, TCG_OPF_VECTOR)
 
 DEF(and_vec, 1, 2, 0, TCG_OPF_VECTOR)
 DEF(or_vec, 1, 2, 0, TCG_OPF_VECTOR)

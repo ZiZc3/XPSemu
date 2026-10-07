@@ -2061,6 +2061,10 @@ typedef struct CPUArchState {
     uint64_t msr_rapl_power_unit;
     uint64_t msr_pkg_energy_status;
 
+    /* XPSemu: the host's MXCSR holds the guest's, the translated code may
+     * run its SSE natively (target/i386/tcg/fpu_helper.c) */
+    uint32_t xps_sse_native;
+
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
 

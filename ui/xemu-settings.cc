@@ -34,6 +34,10 @@
 #include "xemu-controllers.h"
 #include "xemu-settings.h"
 
+#ifdef __PROSPERO__
+#include "../ps5/default-xemu-config.h"
+#endif
+
 #define DEFINE_CONFIG_TREE
 #include "xemu-config.h"
 
@@ -167,14 +171,60 @@ static const char *read_file(FILE *fd)
     return buf;
 }
 
+#ifdef __PROSPERO__
+static bool xemu_ps5_create_default_config(const char *path)
+{
+    if (qemu_access(path, F_OK) == 0) {
+        return true;
+    }
+
+    std::string temp_path = std::string(path) + ".tmp";
+    FILE *fd = qemu_fopen(temp_path.c_str(), "wb");
+    if (!fd) {
+        return false;
+    }
+
+    const size_t size = sizeof(XEMU_PS5_DEFAULT_CONFIG) - 1;
+    bool success = fwrite(XEMU_PS5_DEFAULT_CONFIG, 1, size, fd) == size;
+    if (fclose(fd) != 0) {
+        success = false;
+    }
+    if (!success) {
+        remove(temp_path.c_str());
+        return false;
+    }
+
+    /* Preserve a config created by another launch while we wrote the template. */
+    if (qemu_access(path, F_OK) == 0) {
+        remove(temp_path.c_str());
+        return true;
+    }
+    if (rename(temp_path.c_str(), path) != 0) {
+        remove(temp_path.c_str());
+        return qemu_access(path, F_OK) == 0;
+    }
+
+    fprintf(stderr, "Created default PS5 config: %s\n", path);
+    return true;
+}
+#endif
+
 bool xemu_settings_load(void)
 {
     const char *settings_path = xemu_settings_get_path();
     bool success = false;
 
+#ifdef __PROSPERO__
+    if (qemu_access(settings_path, F_OK) == -1 &&
+        !xemu_ps5_create_default_config(settings_path)) {
+        error_msg = "Failed to create the default PS5 config. Check /data/xemu permissions.\n";
+    }
+#endif
     if (qemu_access(settings_path, F_OK) == -1) {
-        fprintf(stderr, "Config file not found, starting with default settings.\n");
-        success = true;
+        if (error_msg.empty()) {
+            fprintf(stderr, "Config file not found, starting with default settings.\n");
+        }
+        success = error_msg.empty();
     } else {
         FILE *fd = qemu_fopen(settings_path, "rb");
         if (fd) {

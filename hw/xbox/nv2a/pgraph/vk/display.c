@@ -569,6 +569,54 @@ static void destroy_current_display_image(PGRAPHState *pg)
     d->draw_time = 0;
 }
 
+#ifdef __PROSPERO__
+/*
+ * XPSemu: when the game's picture changes size (a game going from 640x480
+ * to 720x480 as it starts, ...), the old display image isn't destroyed
+ * there and then: it's kept until the next change and freed once the GPU
+ * is idle, so nothing still drawing it can touch freed memory (a PS5
+ * GPU_FAULT_PAGE_FAULT, seen starting the same game a second time).
+ */
+static struct {
+    VkImage image;
+    VkImageView view;
+    VkDeviceMemory memory;
+    VkFramebuffer framebuffer;
+} g_old_display;
+
+static void free_old_display_image(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    if (g_old_display.image == VK_NULL_HANDLE) {
+        return;
+    }
+    qemu_mutex_lock(&r->queue_lock);
+    vkQueueWaitIdle(r->queue);
+    qemu_mutex_unlock(&r->queue_lock);
+    vkDestroyFramebuffer(r->device, g_old_display.framebuffer, NULL);
+    vkDestroyImageView(r->device, g_old_display.view, NULL);
+    vkDestroyImage(r->device, g_old_display.image, NULL);
+    vkFreeMemory(r->device, g_old_display.memory, NULL);
+    memset(&g_old_display, 0, sizeof(g_old_display));
+}
+
+static void retire_display_image(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    PGRAPHVkDisplayState *d = &r->display;
+    free_old_display_image(pg);
+    g_old_display.image = d->image;
+    g_old_display.view = d->image_view;
+    g_old_display.memory = d->memory;
+    g_old_display.framebuffer = d->framebuffer;
+    d->image = VK_NULL_HANDLE;
+    d->image_view = VK_NULL_HANDLE;
+    d->memory = VK_NULL_HANDLE;
+    d->framebuffer = VK_NULL_HANDLE;
+    d->draw_time = 0;
+}
+#endif
+
 // FIXME: We may need to use two images. One for actually rendering display,
 // and another for GL in the correct tiling mode
 
@@ -578,7 +626,11 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
     PGRAPHVkDisplayState *d = &r->display;
 
     if (r->display.image != VK_NULL_HANDLE) {
+#ifdef __PROSPERO__
+        retire_display_image(pg);
+#else
         destroy_current_display_image(pg);
+#endif
     }
 
     bool use_optimal_tiling = true;
@@ -1058,6 +1110,9 @@ void pgraph_vk_finalize_display(PGRAPHState *pg)
     if (r->display.image != VK_NULL_HANDLE) {
         destroy_current_display_image(pg);
     }
+#ifdef __PROSPERO__
+    free_old_display_image(pg);
+#endif
 
     destroy_surface_sampler(pg);
     destroy_display_pipeline(pg);
@@ -1093,6 +1148,12 @@ void pgraph_vk_render_display(PGRAPHState *pg)
 
     PGRAPHVkDisplayState *disp = &r->display;
     if (!disp->image || disp->width != width || disp->height != height) {
+        fprintf(stderr, "nv2a: picture %ux%u%s (was %dx%d), surface %ux%u\n",
+                width, height,
+                d->vga.cr[NV_PRMCIO_INTERLACE_MODE] !=
+                        NV_PRMCIO_INTERLACE_MODE_DISABLED ? " interlaced" : "",
+                disp->image ? disp->width : 0, disp->image ? disp->height : 0,
+                surface->width, surface->height);
         create_display_image(pg, width, height);
     }
 

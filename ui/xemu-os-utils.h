@@ -43,6 +43,9 @@ enum {
     XEMU_PS5_THREAD__ALL
 };
 void xemu_ps5_register_thread(int role);
+// Whether the console resolved this import (calling one it didn't jumps
+// to 0).
+int xemu_ps5_import_ok(const char *name);
 void xemu_ps5_apply_pinning(void);
 const char *xemu_ps5_pinning_summary(void);
 // CPU time a registered thread has used, in seconds (as of its last

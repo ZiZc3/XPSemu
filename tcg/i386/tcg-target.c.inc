@@ -4090,6 +4090,65 @@ static void tcg_out_cmpsel_vec(TCGContext *s, TCGType type, unsigned vece,
     }
 }
 
+/*
+ * XPSemu: one guest SSE instruction as the host's own (VEX encoded: three
+ * operands, so the scalar forms take the upper lanes from a). Only the
+ * 128-bit forms; V64 operands are xmm registers with zero upper halves.
+ */
+#include "tcg/xps-sse.h"
+
+static void tcg_out_xps_sse(TCGContext *s, TCGOpcode opc, TCGReg r,
+                            TCGReg a, TCGReg b, TCGArg sel)
+{
+    static const uint8_t fp[] = {
+        [XPSV_ADD] = 0x58, [XPSV_SUB] = 0x5c, [XPSV_MUL] = 0x59,
+        [XPSV_DIV] = 0x5e, [XPSV_MIN] = 0x5d, [XPSV_MAX] = 0x5f,
+        [XPSV_SQRT] = 0x51, [XPSV_CMP] = 0xc2,
+    };
+    int op = sel & 0xff;
+    int ss = sel & XPSV_SS ? P_SIMDF3 : 0;
+
+    if (opc == INDEX_op_xps_sse_x2r) { /* r: GPR, a: xmm */
+        tcg_out_vex_modrm(s, (op == XPSR_CVTSS2SI ? 0x2d : 0x2c) |
+                             P_EXT | P_SIMDF3, r, 0, a);
+        return;
+    }
+    if (opc == INDEX_op_xps_sse_r2x) { /* b: GPR */
+        tcg_out_vex_modrm(s, 0x2a | P_EXT | P_SIMDF3, r, a, b);
+        return;
+    }
+    switch (op) {
+    case XPSV_ADD: case XPSV_SUB: case XPSV_MUL: case XPSV_DIV:
+    case XPSV_MIN: case XPSV_MAX: case XPSV_CMP:
+        tcg_out_vex_modrm(s, fp[op] | P_EXT | ss, r, a, b);
+        if (op == XPSV_CMP) {
+            tcg_out8(s, (sel >> 16) & 7);
+        }
+        break;
+    case XPSV_SQRT:
+        tcg_out_vex_modrm(s, fp[op] | P_EXT | ss, r, ss ? a : 0, b);
+        break;
+    case XPSV_CVTPS2DQ:
+        tcg_out_vex_modrm(s, 0x5b | P_EXT | P_DATA16, r, 0, b);
+        break;
+    case XPSV_CVTTPS2DQ:
+        tcg_out_vex_modrm(s, 0x5b | P_EXT | P_SIMDF3, r, 0, b);
+        break;
+    case XPSV_CVTPI2PS:
+        tcg_out_vex_modrm(s, 0x5b | P_EXT, TCG_TMP_VEC, 0, b);
+        tcg_out_vex_modrm(s, 0x10 | P_EXT | P_SIMDF2, r, a, TCG_TMP_VEC);
+        break;
+    case XPSV_PACKSSWB: case XPSV_PACKUSWB: case XPSV_PACKSSDW:
+        tcg_out_vex_modrm(s, OPC_PUNPCKLQDQ, r, a, b);
+        tcg_out_vex_modrm(s, op == XPSV_PACKSSWB ? OPC_PACKSSWB :
+                             op == XPSV_PACKUSWB ? OPC_PACKUSWB :
+                                                   OPC_PACKSSDW, r, r, r);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
 static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                            unsigned vecl, unsigned vece,
                            const TCGArg args[TCG_MAX_OP_ARGS],
@@ -4183,6 +4242,13 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
     a2 = args[2];
 
     switch (opc) {
+    case INDEX_op_xps_sse_vec:
+    case INDEX_op_xps_sse_r2x:
+        tcg_out_xps_sse(s, opc, a0, a1, a2, args[3]);
+        break;
+    case INDEX_op_xps_sse_x2r:
+        tcg_out_xps_sse(s, opc, a0, a1, 0, args[2]);
+        break;
     case INDEX_op_add_vec:
         insn = add_insn[vece];
         goto gen_simd;
@@ -4488,6 +4554,13 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_st_vec:
         return C_O0_I2(x, r);
 
+    case INDEX_op_xps_sse_vec:
+        return C_O1_I2(x, x, x);
+    case INDEX_op_xps_sse_x2r:
+        return C_O1_I1(r, x);
+    case INDEX_op_xps_sse_r2x:
+        return C_O1_I2(x, x, r);
+
     case INDEX_op_add_vec:
     case INDEX_op_sub_vec:
     case INDEX_op_mul_vec:
@@ -4557,6 +4630,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
 int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
 {
     switch (opc) {
+    case INDEX_op_xps_sse_vec:
+    case INDEX_op_xps_sse_x2r:
+    case INDEX_op_xps_sse_r2x:
+        return type <= TCG_TYPE_V128;
     case INDEX_op_add_vec:
     case INDEX_op_sub_vec:
     case INDEX_op_and_vec:

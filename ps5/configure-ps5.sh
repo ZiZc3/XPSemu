@@ -7,6 +7,7 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 src=$(dirname "$here")
 sdk=${PS5_PAYLOAD_SDK:-$HOME/ps5/PS5_Vulkan/.deps/native/ps5-payload-sdk}
 prefix=$here/deps/prefix
+python3 "$here/embed-default-config.py"
 
 mkdir -p "$src/build-ps5"
 cd "$src/build-ps5"
@@ -18,6 +19,7 @@ PKG_CONFIG="$here/pkg-config" "$src/configure" \
     --extra-ldflags="-L$prefix/lib -lps5compat" \
     --target-list=i386-softmmu \
     --disable-werror \
+    --enable-trace-backends=nop --disable-qom-cast-debug \
     --enable-slirp \
     --disable-opengl --disable-gtk --disable-vnc --disable-curses \
     --disable-user --disable-bsd-user --disable-tools --disable-docs \

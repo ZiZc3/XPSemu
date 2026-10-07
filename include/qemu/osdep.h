@@ -572,6 +572,9 @@ int madvise(char *, size_t, int);
       Valgrind does not support alignments larger than 1 MiB,
       therefore we need special code which handles running on Valgrind. */
 #  define QEMU_VMALLOC_ALIGN (512 * 4096)
+#elif defined(__PROSPERO__)
+   /* XPSemu: guest RAM in 2 MB-aligned direct memory (ps5/compat/mmap.c) */
+#  define QEMU_VMALLOC_ALIGN (512 * 4096)
 #elif defined(__linux__) && defined(__s390x__)
    /* Use 1 MiB (segment size) alignment so gmap can be used by KVM. */
 #  define QEMU_VMALLOC_ALIGN (256 * 4096)

@@ -8,7 +8,9 @@ general:
       default: true
   screenshot_dir: string
   games_dir: string
-  skip_boot_anim: bool
+  skip_boot_anim:
+    type: bool
+    default: true
   # throttle_io: bool
   last_viewed_menu_index: integer
   user_token: string
@@ -267,6 +269,27 @@ display:
     menu_sounds:
       type: bool
       default: true
+    menu_music:
+      type: bool
+      default: true
+    download_covers:
+      type: bool
+      default: true
+    blades_sides:
+      type: bool
+      default: true
+    blades_style:
+      type: integer
+      default: 0  # 0 green, 1 orange
+    rumble:
+      type: bool
+      default: true
+    trigger_feel:
+      type: integer
+      default: 0  # 0 off, 1 light, 2 firm
+    boot_logo:
+      type: bool
+      default: true
     perf_overlay:
       type: enum
       values: ['off', fps, full]
@@ -376,8 +399,23 @@ sys:
 perf:
   profiler:
     type: bool
-    default: true
+    default: false
   cpu_pinning:
+    type: bool
+    default: true
+  thread_priority:
+    type: bool
+    default: true
+  lockless_doorbell:
+    type: bool
+    default: true
+  direct_guest_ram:
+    type: bool
+    default: true
+  sse_fast_more:
+    type: bool
+    default: true
+  sse_inline:
     type: bool
     default: true
   hard_fpu:

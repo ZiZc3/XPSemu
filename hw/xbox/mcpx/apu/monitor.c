@@ -41,6 +41,12 @@ int sceAudioOutClose(int handle);
 /* The dashboard's sounds, mixed in (ui/xui/ui-sounds.cc). */
 void xemu_ps5_ui_sound_mix(int16_t *buf, int frames);
 
+/* XPSemu: the console's sound under the launch screen (0 while it covers
+ * the Xbox's boot, back to 1 as it fades; ui/xui/dashboard.cc). The
+ * dashboard's own sounds are mixed in after it. */
+extern float g_xemu_apu_ui_gain;
+float g_xemu_apu_ui_gain = 1.0f;
+
 static QemuThread ps5_audio_thread;
 static int ps5_audio_handle = -1;
 static bool ps5_audio_running;
@@ -177,6 +183,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     if (d->monitor.stream) {
         float vu = pow(fmax(0.0, fmin(g_config.audio.volume_limit, 1.0)), M_E);
+#ifdef __PROSPERO__
+        vu *= g_xemu_apu_ui_gain;
+#endif
         SDL_SetAudioStreamGain(d->monitor.stream, vu);
         SDL_PutAudioStreamData(d->monitor.stream, d->monitor.frame_buf,
                             sizeof(d->monitor.frame_buf));

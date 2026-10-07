@@ -112,8 +112,8 @@ static bool hen_jailbreak(char *msg, size_t msg_size)
         if (++polls >= HEN_MAX_POLLS) {
             unlink(HEN_REQUEST);
             snprintf(msg, msg_size,
-                     "no HEN took the request (pid %d): load the PS5SX2 "
-                     "Helper and add PPSA97358 to /data/whitelist.txt",
+                     "helper.elf didn't answer (pid %d): load helper.elf "
+                     "with kstuff, then start XPSemu again",
                      pid);
             return false;
         }
@@ -205,6 +205,15 @@ static void crash_handler(int sig, siginfo_t *info, void *context)
  * title's imports.txt (ps5/build-title.sh) lists each GOT slot's address in
  * the ELF and the symbol it holds.
  */
+static char g_missing_imports[2048] = " "; /* " name name ... " */
+
+int xemu_ps5_import_ok(const char *name)
+{
+    char token[160];
+    snprintf(token, sizeof(token), " %s ", name);
+    return strstr(g_missing_imports, token) == NULL;
+}
+
 static void report_unresolved_imports(void)
 {
     /* The title's own folder: /app0 isn't mounted for ShadowMountPlus titles,
@@ -229,6 +238,9 @@ static void report_unresolved_imports(void)
         checked++;
         if (*(const uint64_t *)(EBOOT_BASE + offset) == 0) {
             fprintf(stderr, "xemu PS5: unresolved import: %s\n", name);
+            size_t used = strlen(g_missing_imports);
+            snprintf(g_missing_imports + used, sizeof(g_missing_imports) - used,
+                     "%s ", name);
             if (missing++ < 12) {
                 snprintf(list + strlen(list), sizeof(list) - strlen(list),
                          "%s%s", missing > 1 ? " " : "", name);
@@ -290,6 +302,7 @@ void xemu_ps5_early_init(void)
             (void *)xemu_ps5_early_init);
     fprintf(stderr, "xemu PS5: jailbreak %s: %s\n",
             jailbroken ? "ok" : "NOT CONFIRMED", jailbreak_msg);
+
     report_unresolved_imports();
 
     /* The main thread's handler runs on its own stack, so a broken stack
@@ -330,10 +343,11 @@ void xemu_ps5_early_init(void)
  */
 int scePthreadGetaffinity(pthread_t thread, unsigned long long *mask);
 int scePthreadSetaffinity(pthread_t thread, unsigned long long mask);
+int scePthreadSetprio(pthread_t thread, int prio);
 
 static pthread_t pin_threads[XEMU_PS5_THREAD__COUNT];
 static bool pin_registered[XEMU_PS5_THREAD__COUNT];
-static char pin_summary[160] = "not applied";
+static char pin_summary[256] = "not applied";
 
 static void prof_register(int role);
 
@@ -343,9 +357,11 @@ void xemu_ps5_register_thread(int role)
         pin_threads[role] = pthread_self();
         pin_registered[role] = true;
     }
+#ifdef XPS_PROFILER /* Removed from the build: it interrupted threads */
     if (role >= 0 && role < XEMU_PS5_THREAD__ALL) {
         prof_register(role);
     }
+#endif
 }
 
 const char *xemu_ps5_pinning_summary(void)
@@ -411,10 +427,23 @@ void xemu_ps5_apply_pinning(void)
                     scePthreadSetaffinity(pin_threads[i], 1ull << cpu[i]) :
                     -1;
     }
+
+    /* Top priority for the two hot threads, each alone on its core
+     * (PS5SX2 does the same: default-priority threads get delayed). */
+    char prio[48] = "default priority";
+    if (g_config.perf.thread_priority) {
+        int rp[XEMU_PS5_THREAD__COUNT];
+        for (int i = 0; i < XEMU_PS5_THREAD__COUNT; i++) {
+            rp[i] = pin_registered[i] && rc[i] == 0 ?
+                        scePthreadSetprio(pin_threads[i], 256) : -1;
+        }
+        snprintf(prio, sizeof(prio), "priority 256 (rc %#x, %#x)",
+                 rp[0], rp[1]);
+    }
     snprintf(pin_summary, sizeof(pin_summary),
              "Xbox CPU on CPU %d (rc %#x), Xbox GPU on CPU %d (rc %#x), "
-             "others %#llx (rc %d), of %#llx",
-             cpu[0], rc[0], cpu[1], rc[1], rest, rc_all, all);
+             "others %#llx (rc %d), of %#llx, %s",
+             cpu[0], rc[0], cpu[1], rc[1], rest, rc_all, all, prio);
     fprintf(stderr, "xemu PS5: pinning: %s\n", pin_summary);
 }
 
@@ -603,6 +632,9 @@ static int prof_slot_cmp(const void *a, const void *b)
 
 char *xemu_ps5_profile_report(void)
 {
+#ifndef XPS_PROFILER
+    return NULL; /* No profiler in the build */
+#endif
     static const char *const names[XEMU_PS5_THREAD__ALL] = {
         "Xbox CPU thread", "Xbox GPU thread", "UI thread"
     };
@@ -648,4 +680,52 @@ char *xemu_ps5_profile_report(void)
     }
 #undef PUT
     return out;
+}
+
+/*
+ * No hard disk image: XPSemu makes one, xemu-dashboard's blank Xbox disk
+ * (ui/xui/blank-hdd.h: formatted C, E and the X/Y/Z caches, a small free
+ * dashboard, no Microsoft files). Written whole beside it, then renamed in.
+ */
+#include <zlib.h>
+#include "xui/blank-hdd.h"
+
+int xemu_ps5_hdd_created;
+
+void xemu_ps5_blank_hdd(const char *path)
+{
+    struct stat st;
+    if (!path || !path[0] || stat(path, &st) == 0 || errno != ENOENT) {
+        return;
+    }
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash && slash != dir) {
+        *slash = 0;
+        mkdir(dir, 0777);
+    }
+    uLongf size = XPS_BLANK_HDD_SIZE;
+    unsigned char *data = malloc(size);
+    if (!data || uncompress(data, &size, kBlankHddZ, sizeof(kBlankHddZ)) != Z_OK ||
+        size != XPS_BLANK_HDD_SIZE) {
+        fprintf(stderr, "XPSemu: blank hard disk: can't unpack it\n");
+        free(data);
+        return;
+    }
+    char part[600];
+    snprintf(part, sizeof(part), "%s.part", path);
+    FILE *f = fopen(part, "wb");
+    int ok = f && fwrite(data, 1, size, f) == size;
+    ok = f && fclose(f) == 0 && ok;
+    free(data);
+    if (!ok || rename(part, path) != 0) {
+        fprintf(stderr, "XPSemu: blank hard disk: can't write %s (%d)\n", path,
+                errno);
+        unlink(part);
+        return;
+    }
+    chmod(path, 0666);
+    xemu_ps5_hdd_created = 1;
+    fprintf(stderr, "XPSemu: no hard disk: made a blank one, %s\n", path);
 }

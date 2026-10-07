@@ -191,11 +191,22 @@ static bool g_scale_now;
 
 static void WriteConfig(const int values[GO__COUNT], bool live)
 {
+#ifdef __PROSPERO__
+    // XPSemu: the resolution doesn't change while XPSemu runs. Switching it
+    // between games (one game's surfaces rebuilt at the next one's size)
+    // made the PS5's GPU fault (GPU_FAULT_PAGE_FAULT) every time a game
+    // followed another, and on the PS5 it costs no speed anyway: every game
+    // uses Settings > Video > Resolution, from XPSemu's next start (a game's
+    // own resolution is left out: Apply).
+    (void)live;
+    g_config.display.quality.surface_scale = values[GO_SCALE];
+#else
     if (live && g_scale_now &&
         (int)nv2a_get_surface_scale_factor() != values[GO_SCALE]) {
         nv2a_set_surface_scale_factor(values[GO_SCALE]);
     }
     g_config.display.quality.surface_scale = values[GO_SCALE];
+#endif
     g_config.display.ui.aspect_ratio = values[GO_ASPECT];
     g_config.display.ui.fit = values[GO_FIT];
     g_config.display.filtering = values[GO_FILTER];
@@ -220,6 +231,11 @@ static void Apply()
         merged[i] = g_profile.value[i] == GAME_DEFAULT ? g_globals[i] :
                                                          g_profile.value[i];
     }
+#ifdef __PROSPERO__
+    merged[GO_SCALE] = g_globals[GO_SCALE]; // Never a game's own (WriteConfig)
+    merged[GO_FILTER] = g_globals[GO_FILTER]; // Main settings only too
+    merged[GO_DSP] = g_globals[GO_DSP];
+#endif
     WriteConfig(merged, true);
 }
 

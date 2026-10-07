@@ -67,8 +67,13 @@ int __real_munmap(void *addr, size_t len);
 #define ADDRESS_HINT ((void *)0x1000000000ULL) /* 64 GiB */
 
 #define DIRECT_TYPE_CPU 12                  /* CPU-only direct memory */
-#define DIRECT_ALIGNMENT ((size_t)0x10000)  /* Its unit */
-#define DIRECT_MIN_SIZE ((size_t)96 << 20)  /* Smaller maps stay flexible */
+/* 2 MB: large pages for the Xbox's 64 MB of RAM (the code touches it on
+ * nearly every instruction); it also leaves the small flexible pool. */
+#define DIRECT_ALIGNMENT ((size_t)2 << 20)
+/* Smaller maps stay flexible; xemu.c sets 96 MB with perf.direct_guest_ram
+ * off (the old rule: guest RAM flexible). */
+size_t xemu_ps5_direct_min_size = (size_t)64 << 20;
+#define DIRECT_MIN_SIZE xemu_ps5_direct_min_size
 
 /* The direct memory mapped, to release it on munmap. */
 static struct {

@@ -21,7 +21,7 @@
   <img src="ps5/screenshots/dashboard.jpg" alt="XPSemu dashboard on PS5" width="100%">
 </p>
 
-> **Alpha 1** is the first public build. It boots and plays real games, but expect bugs, slow scenes in
+> **Alpha 2** is an early build. It boots and plays real games, but expect bugs, slow scenes in
 > CPU-heavy games, and missing features. Please report problems with your `xemu-game.log` attached (see [Logs](#logs-and-reporting-problems)).
 
 ## Table of contents
@@ -59,26 +59,38 @@ the PS5's Zen 2 processor.
 
 ## Features
 
+**Setup**
+- Only your MCPX boot ROM and BIOS are needed: a blank Xbox hard disk is created for you if you have none.
+- A setup screen shows which files are missing and updates by itself as you copy them over.
+- Games from `/data/xemu/games/` or from `xemu/games/` on any USB or external drive; plug drives in or out and the list updates.
+
 **Dashboard**
 - Xbox-style dashboard made for the DualSense: animated green background, main menu, recently played shelf.
-- **Games** page as a cover-flow carousel with box art, reflections and per-game info.
-- Game names from the ISO file name; covers you drop in a folder (`.jpg` / `.png`).
+- **Games** page: a 3D row of game cases with box art, reflections, smooth scrolling and a launch animation.
+- **Box Art Viewer**: the full game case in 3D (front, back and spine) to turn, zoom and flip.
+- Game names from the ISO file name (rename any game from its settings); covers downloaded automatically, or your own in a folder (`.jpg` / `.png`).
 - **Recently played** shelf and **play time** per game.
-- **Xbox Dashboard**: boots the original Microsoft dashboard from your HDD image. Only works if the dashboard is installed on your HDD image.
+- **Xbox Dashboard**: boots the dashboard on your HDD image: the original Microsoft one if it's installed there, or the small free one on the hard disk XPSemu creates.
 - The emulated Xbox starts powered off and XPSemu always opens on its dashboard (no auto-resume of the last game).
-- Menu sounds (can be turned off), title shine animation, app icon and background art.
+- Menu sounds and dashboard music (can be turned off), title shine animation, app icon and background art.
+- XPSemu startup logo and sound; the original Xbox startup animation can be turned on in Settings.
+- Settings in categories: Video, Sound, Interface, Controller, Patches, Advanced.
 
 **Per-game**
-- Own settings per game: resolution, screen shape, fit, smoothing, DSP, volume, performance overlay.
+- Own settings per game: screen shape, fit, volume, performance overlay.
 - **Game patches** in Jay's Magic Patch (`.jmp`) format, applied in memory while the game loads: your ISO files are never modified.
 - Automatic checksum matching: patches that are not made for your copy are blocked and labelled.
+- **Patch Store**: get patches for each game from Jay's Magic Patches, checked against your copy first; all active patches in Settings > Patches.
+- **Home-screen shortcuts**: any game as its own PS5 tile, with its cover and 4K background art, opening straight into the game.
 - Crash watcher: if a game crashes back to the Xbox dashboard, XPSemu tells you and notes it in the log.
 
 **System**
-- Xbox video switches (widescreen, 480p, 720p, 1080i), written to the emulated Xbox's EEPROM.
+- Xbox video modes (widescreen, 720p) set per game automatically, in the emulated Xbox's EEPROM.
+- DualSense button remapping with a live tester.
+- Blades side art beside 4:3 games (optional).
 - Resolution scaling 1x (480p) to 4x, with the resolution shown next to each option.
 - Performance overlay (FPS, frame time, CPU, memory).
-- Per-game log (`xemu-game.log`) with FPS, frame times, thread load and a built-in CPU profiler.
+- Per-game log (`xemu-game.log`) with FPS, frame times and what the emulator spends its time on.
 - Shader, pipeline and driver caches on disk, so a second run of a game stutters much less.
 
 ## Compatibility
@@ -100,40 +112,37 @@ fail here too.
 ## Requirements
 
 - A **jailbroken PS5** that can run homebrew apps (fake-signed titles).
-- **XPSemu Tools** (`xpsemu_tools.elf`): included in the release. A standalone app
-  runs alongside [kstuff](https://github.com/EchoStretch/kstuff).
+- **`helper.elf`** (formerly XPSemu Tools): included in the release. A standalone payload that
+  runs alongside [kstuff](https://github.com/EchoStretch/kstuff); no `whitelist.txt` entry is needed.
 - A way to install/mount the app folder, for example **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
 - **Your own** original Xbox files, dumped from your own console (not included, never will be):
   - MCPX boot ROM: `mcpx_1.0.bin`
   - Xbox BIOS / flash ROM, for example `Complex_4627.bin`
-  - An Xbox hard-disk image, for example xemu's blank `xbox_hdd.qcow2` (see [xemu's setup guide](https://xemu.app/docs/required-files/))
+  - Optional: your own Xbox hard-disk image `xbox_hdd.qcow2`. Without one, XPSemu creates a blank one for you.
 - **Your own games** as **XISO** images (`.iso` / `.xiso`). Full "redump" disc images must be converted to XISO first (for example with [extract-xiso](https://github.com/XboxDev/extract-xiso)).
 
 ## Installation
 
 1. **Copy the app.** Put the `PPSA97358` folder from the release on your PS5 and install/mount it with your
    homebrew installer (for example ShadowMountPlus; one known-good place is `/data/homebrew/PPSA97358`).
-2. **Load XPSemu Tools.** Copy `xpsemu_tools.elf` from the release to your PS5 and load it together
-   with kstuff (e.g. add both to `/data/autoload.txt`, kstuff first). Then add this line to
-   `/data/whitelist.txt` (create the file if needed):
-   ```
-   PPSA97358
-   ```
-   XPSemu Tools watches for XPSemu's request and handles it automatically.
+2. **Load the helper.** Copy `helper.elf` from the release to your PS5 and load it together
+   with kstuff (e.g. add both to `/data/autoload.txt`, kstuff first). It handles XPSemu's request
+   automatically; no whitelist entry is needed.
 3. **Copy your Xbox files** to `/data/xemu/`:
    ```
    /data/xemu/mcpx_1.0.bin
    /data/xemu/Complex_4627.bin
-   /data/xemu/xbox_hdd.qcow2
+   /data/xemu/xbox_hdd.qcow2   (optional)
    ```
-   If you want the **Xbox Dashboard** button to work, your `xbox_hdd.qcow2` must already have the
-   original Microsoft dashboard installed on it — a blank image boots nothing.
+   Without `xbox_hdd.qcow2`, XPSemu creates a blank one with a small free dashboard. If you want the
+   **Xbox Dashboard** button to open the original Microsoft dashboard, use your own `xbox_hdd.qcow2`
+   with it installed.
    
    The EEPROM file and Xemu.toml is created automatically if it does not exist.
-5. **Add games** to `/data/xemu/games/` (XISO `.iso` files).
+5. **Add games** to `/data/xemu/games/` (XISO `.iso` files), or to `xemu/games/` on a USB drive.
 6. Start **XPSemu** from the home screen. The dashboard opens; pick a game in **Games** and press ✕.
 
-If the app closes right away or shows "XPSemuTools failed", check that kstuff + XPSemu Tools are loaded and that `PPSA97358` is in `/data/whitelist.txt`.
+If the app closes right away or says "helper.elf didn't answer", check that kstuff + `helper.elf` are loaded, then start XPSemu again. If a file is missing, XPSemu shows a setup screen listing what's needed.
 
 ## Folder layout on the PS5
 
@@ -206,12 +215,10 @@ XPSemu reads patches in **Jay's Magic Patch** format (`.jmp`, as published on [J
 | Setting | What it does |
 |---|---|
 | Resolution (1x-4x) | Internal rendering scale: 1x is the Xbox's own 480p. The PS5 GPU has plenty of headroom, so higher values look sharper at almost no cost. |
-| Screen shape | 4:3, 16:9 stretch or Auto. Games only render true widescreen if they support it (turn on the Xbox widescreen switch in Advanced). |
+| Screen shape | 4:3, 16:9 stretch or Auto. Games only render true widescreen if they support it (XPSemu turns on the Xbox's widescreen mode for games set to 16:9). |
 | DSP | Emulates the Xbox audio DSP. **Keep it Off**: without a JIT on the PS5 it is very slow (Halo 2 freezes, Forza crawls). |
-| Xbox widescreen / 480p / 720p / 1080i | The Xbox's video settings in its EEPROM. Only games that support them use them. Applied at the next game start. |
-| Xbox memory | Locked to 64 MB in Alpha 1 (128 MB needs more PS5 memory than is available to apps). |
+| Xbox memory | Locked to 64 MB (128 MB needs more PS5 memory than is available to apps). |
 | CPU pinning | Gives the Xbox CPU and GPU threads their own PS5 cores (recommended, default on). |
-| Profiler | Samples where the emulator spends time and writes it to the game log (very low cost; default on). |
 | Performance overlay | Off / FPS / full statistics on screen. |
 
 ## Performance notes
@@ -222,7 +229,7 @@ freely) and why upscalers like FSR do not add FPS here.
 
 xemu translates Xbox CPU code with QEMU's general-purpose TCG translator. The PS5's Zen 2 cores (3.5 GHz)
 are slower per core than a fast PC, so CPU-heavy games (Fable's busy areas, Forza races) drop below their
-cap. XPSemu already removes the biggest costs it found with its built-in profiler (see the
+cap. XPSemu already removes the biggest costs it found by profiling (see the
 [CPU optimizations](#cpu-and-performance)): Fable's opening went from ~7 FPS in the first PS5 builds to 23-30 FPS.
 
 Tips:
@@ -235,7 +242,6 @@ Tips:
 After playing, copy `/data/xemu/xemu-game.log` (and `xemu.log`) from the PS5. The game log has:
 - a header with the game, title ID, file, settings, caches and patches,
 - every 5 s: FPS, slowest frame, CPU load per emulator thread, GPU work, and time spent per step,
-- profiler reports (where the Xbox CPU thread spends its time) at 30 s, every 2 minutes and at the end.
 
 When reporting a problem, include the game name, what happened, and both logs.
 
@@ -279,13 +285,13 @@ A full diff of the modified upstream files is in [`ps5/XPSEMU-CHANGES.diff`](ps5
   flexible/direct memory, allocations kept out of the GPU's address window, the TCG JIT buffer in
   executable shared memory, coroutine stacks from the heap, file-mapping fallback to
   read-into-memory.
-- **Sandbox**: requests the app from XPSemu Tools at startup; all data under `/data/xemu`.
+- **Sandbox**: requests the app from `helper.elf` at startup; all data under `/data/xemu`.
 - **DualSense input** (`ui/xemu-input-ps5.c`) through libScePad, mapped to an Xbox controller.
 - **Audio** through SceAudioOut (`hw/xbox/mcpx/apu/monitor.c`).
 - **Crash handler and logging**: crash address, backtrace and load address in `xemu.log`, kernel
   notifications on fatal errors, hide the PS5 splash screen after the first frame.
 - **Startup behaviour**: Xbox starts powered off (`-S`), no auto-resume of the last game, 64 MB forced,
-  `geteuid`/`getegid` wrapped so Mesa's shader cache works after the XPSemuTools.
+  `geteuid`/`getegid` wrapped so Mesa's shader cache works after helper.elf grants access.
 
 ### Fixes
 
@@ -300,7 +306,7 @@ A full diff of the modified upstream files is in [`ps5/XPSEMU-CHANGES.diff`](ps5
 
 ### CPU and performance
 
-All found and measured with the built-in profiler and stopwatches in the game log.
+All found and measured with profiling and the stopwatches in the game log.
 
 | Change | Where | Effect |
 |---|---|---|
@@ -328,13 +334,13 @@ the SSE math fast path only runs where the host's result is bit-identical by con
 | `ui/xui/xiso.cc/.hh` | Reads `default.xbe` from XISO/redump images: title, title ID, checksum. |
 | `ui/xui/game-profile.cc/.hh` | Per-game settings and play time. |
 | `ui/xui/game-patches.cc/.hh` | `.jmp` parser, checksum matching, in-memory patching (hook in `block/raw-format.c`). |
-| `ui/xui/game-log.cc/.hh` | The per-game log, profiler reports and cache saves. |
+| `ui/xui/game-log.cc/.hh` | The per-game log and cache saves. |
 | `ui/xui/ui-sounds.cc/.hh` | Menu sounds (built-in, embedded, or your own `.wav`). |
 | `hw/xbox/xemu-eeprom.h`, `hw/xbox/smbus_storage.c` | Xbox video switches in the EEPROM (with checksum). |
 | `hw/xbox/xemu-timing.h` | Stopwatches used by the game log. |
-| `ui/xemu-os-utils-ps5.c` | PS5 startup, XPSemuTools request, crash handler, pinning, profiler. |
-| `config_spec.yml` | New settings: performance overlay, menu sounds, CPU pinning, profiler, shader cache. |
-| `xpsemu-tools/` | Standalone app-request daemon (`xpsemu_tools.elf`) |
+| `ui/xemu-os-utils-ps5.c` | PS5 startup, helper.elf request, blank hard disk, crash handler, pinning. |
+| `config_spec.yml` | New settings: performance overlay, menu sounds, CPU pinning, shader cache. |
+| `xpsemu-tools/` | Standalone app-request payload (`helper.elf`) |
 
 ## Building from source
 
@@ -380,7 +386,7 @@ Menu sounds: `ps5/sounds/embed-sounds.py` turns `ps5/sounds/*.wav` into `ui/xui/
 ## Roadmap
 
 - **Smooth mode**: optional frame generation (FSR 3 frame interpolation through an open-source Vulkan port) to show 30 FPS games at 60.
-- More CPU fast paths guided by the profiler.
+- More CPU fast paths guided by profiling.
 - Save manager and save states.
 
 ## Credits
@@ -389,7 +395,7 @@ Menu sounds: `ps5/sounds/embed-sounds.py` turns `ps5/sounds/*.wav` into `ui/xui/
 - **[QEMU](https://www.qemu.org/)** ([source](https://gitlab.com/qemu-project/qemu)): the machine emulation and the TCG JIT under xemu.
 - **[Mihawk-99](https://github.com/mihawk-99)'s [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan) / PS5_Mesa**: RADV ([Mesa](https://gitlab.freedesktop.org/mesa/mesa)'s open-source AMD Vulkan driver) running on the PS5, the toolchain integration and title packaging XPSemu links against.
 - **[ps5-payload-dev SDK](https://github.com/ps5-payload-dev/sdk)** (as pinned by Mihawk-99's PS5_PayloadSDK): the open PS5 payload SDK.
-- **[PS5SX2](https://github.com/Swordpdf/PS5SX2)** by Swordpdf: reference for the app protocol, CPU core layout, JIT memory and DualSense reading on the PS5. XPSemu Tools replaces the PS5SX2 Helper with its own standalone daemon built on the ps5-payload-sdk.
+- **[PS5SX2](https://github.com/Swordpdf/PS5SX2)** by Swordpdf: reference for the app protocol, CPU core layout, JIT memory and DualSense reading on the PS5. XPSemu's `helper.elf` is its own standalone payload built on the ps5-payload-sdk.
 - **[etaHEN](https://github.com/LightningMods/etaHEN)** (LightningMods), **[kstuff](https://github.com/EchoStretch/kstuff)** (EchoStretch, from [ps5-payload-dev/kstuff](https://github.com/ps5-payload-dev/kstuff)), **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)** (drakmor) and the PS5 scene for making homebrew apps possible.
 - **Jay's Magic Patch / [JayXbox PatchHub](https://www.jayxbox.com/Retail-Game-Modification/PatchHub.php)**: the patch format and the community's patches.
 - **[Dear ImGui](https://github.com/ocornut/imgui)**, **[SDL3](https://github.com/libsdl-org/SDL)**, **[GLib](https://gitlab.gnome.org/GNOME/glib)**, **[glslang](https://github.com/KhronosGroup/glslang)**, **[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)** and the other libraries xemu uses.

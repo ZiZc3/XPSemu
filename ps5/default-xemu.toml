@@ -1,0 +1,25 @@
+[general]
+show_welcome = false
+skip_boot_anim = true
+
+[general.updates]
+check = false
+
+[display]
+renderer = 'VULKAN'
+
+[display.ui]
+auto_scale = false
+scale = 2
+
+[net]
+enable = false
+
+[sys]
+mem_limit = '64'
+
+[sys.files]
+bootrom_path = '/data/xemu/mcpx_1.0.bin'
+flashrom_path = '/data/xemu/Complex_4627.bin'
+hdd_path = '/data/xemu/xbox_hdd.qcow2'
+eeprom_path = '/data/xemu/eeprom.bin'

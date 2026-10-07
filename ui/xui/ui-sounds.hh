@@ -25,6 +25,9 @@ enum UiSound {
     UI_SOUND_OPEN,   // The dashboard opens
     UI_SOUND_LAUNCH, // A game (or the Xbox dashboard) starts
     UI_SOUND_ERROR,  // Can't do that
+    UI_SOUND_NOTIFY, // A notification shows
+    UI_SOUND_STARTUP, // XPSemu starts (once)
+    UI_SOUND_FLASH,  // The startup logo's emblem flashes in
     UI_SOUND__COUNT
 };
 
@@ -32,6 +35,14 @@ enum UiSound {
 // time: /data/xemu/sounds/<name>.wav if there is one (any WAV SDL reads),
 // else XPSemu's own.
 void UiSoundPlay(UiSound sound);
+
+// The dashboard's music (display.ui.menu_music): one track looping, its
+// end blended into its start. /data/xemu/sounds/music.wav if there is one,
+// else XPSemu's own. Prepare loads it (slow the first time: do it while
+// something else stalls anyway); Play fades it in (true) or out (false),
+// carrying on from where it was.
+void UiMusicPrepare(void);
+void UiMusicPlay(bool on);
 
 // Set by UiSoundPlay; the dashboard clears it before handling input.
 extern bool g_ui_sound_played;

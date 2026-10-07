@@ -445,6 +445,10 @@ void tcg_gen_neg_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
 void tcg_gen_abs_vec(unsigned vece, TCGv_vec r, TCGv_vec a);
 void tcg_gen_ssadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_usadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
+/* XPSemu: see include/tcg/xps-sse.h */
+void tcg_gen_xps_sse_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned sel);
+void tcg_gen_xps_sse_x2r(TCGv_i32 r, TCGv_vec a, unsigned sel);
+void tcg_gen_xps_sse_r2x(TCGv_vec r, TCGv_vec a, TCGv_i32 b, unsigned sel);
 void tcg_gen_sssub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_ussub_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);
 void tcg_gen_smin_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b);

@@ -29,10 +29,19 @@
 
 /* Frob eflags into and out of the CPU temporary format.  */
 
+#include "tcg/xps-sse.h"
+#ifdef XPS_SSE_INLINE
+void xps_sse_sync(CPUX86State *env, bool clear);
+#endif
+
 static void x86_cpu_exec_enter(CPUState *cs)
 {
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
+
+#ifdef XPS_SSE_INLINE
+    xps_sse_sync(env, !env->xps_sse_native);
+#endif
 
     CC_SRC = env->eflags & (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C);
     env->df = 1 - (2 * ((env->eflags >> 10) & 1));

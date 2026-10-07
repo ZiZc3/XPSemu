@@ -144,6 +144,9 @@ typedef struct PGRAPHState {
 
     int frame_time;
     int draw_time;
+    /* Subchannel the CTX_SWITCH registers currently reflect (-1 = must
+     * refresh); avoids rewriting them on every method dispatch. */
+    int ctx_switch_subchannel;
 
     /* subchannels state we're not sure the location of... */
     ContextSurfaces2DState context_surfaces_2d;

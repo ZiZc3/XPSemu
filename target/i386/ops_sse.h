@@ -31,6 +31,10 @@
  * and ~20% in emulated float math).
  */
 #include <immintrin.h>
+#include "xps-sse-fast.h"
+
+/* Set from perf.sse_fast_more at start (min/max, sqrt, rcp, cmp). */
+extern bool xps_sse_more;
 
 /* MMX punpck{l,h}{bw,wd,dq}: interleave the low (or high) halves. */
 static inline void xps_mmx_unpck(void *d, const void *v, const void *s,
@@ -86,13 +90,48 @@ static inline bool xps_sse_fast(CPUX86State *env, int op, void *d,
     __m128 va, vb, vr;
     int i;
 
-    if (op > XPS_OP_div ||
-        !(st->float_exception_flags & float_flag_inexact) ||
+    if (op >= XPS_OP_min) {
+        return xps_sse_more && xps_sse_minmax(op == XPS_OP_max, d, v, s,
+                                              lanes);
+    }
+    if (!(st->float_exception_flags & float_flag_inexact) ||
         st->float_rounding_mode != float_round_nearest_even) {
         return false;
     }
     va = _mm_loadu_ps((const float *)v);
     vb = _mm_loadu_ps((const float *)s);
+    if (lanes == 1) {
+        uint32_t a0 = (uint32_t)_mm_cvtsi128_si32(_mm_castps_si128(va));
+        uint32_t b0 = (uint32_t)_mm_cvtsi128_si32(_mm_castps_si128(vb));
+        uint32_t r0, m;
+
+        if (!xps_lane_ok(a0) || !xps_lane_ok(b0) ||
+            (op == XPS_OP_div && !(b0 & 0x7f800000))) {
+            return false;
+        }
+        switch (op) {
+        case XPS_OP_add: vr = _mm_add_ss(va, vb); break;
+        case XPS_OP_sub: vr = _mm_sub_ss(va, vb); break;
+        case XPS_OP_mul: vr = _mm_mul_ss(va, vb); break;
+        default:         vr = _mm_div_ss(va, vb); break;
+        }
+        r0 = (uint32_t)_mm_cvtsi128_si32(_mm_castps_si128(vr));
+        m = r0 & 0x7fffffff;
+        if ((r0 & 0x7f800000) == 0x7f800000) {
+            return false; /* overflow */
+        }
+        if (m <= 0x00800000) { /* zero, denormal or FLT_MIN */
+            bool az = !(a0 & 0x7fffffff), bz = !(b0 & 0x7fffffff);
+            bool exact = m == 0 &&
+                         (op == XPS_OP_mul ? (az || bz) :
+                          op == XPS_OP_div ? az : (az && bz));
+            if (!exact) {
+                return false;
+            }
+        }
+        _mm_storeu_ps((float *)d, vr);
+        return true;
+    }
     _mm_storeu_si128((__m128i *)a, _mm_castps_si128(va));
     _mm_storeu_si128((__m128i *)b, _mm_castps_si128(vb));
     for (i = 0; i < lanes; i++) {
@@ -123,15 +162,7 @@ static inline bool xps_sse_fast(CPUX86State *env, int op, void *d,
             }
         }
     }
-    if (lanes == 4) {
-        _mm_storeu_ps((float *)d, vr);
-    } else {
-        uint32_t *o = d;
-        o[0] = r[0];
-        o[1] = a[1];
-        o[2] = a[2];
-        o[3] = a[3];
-    }
+    _mm_storeu_ps((float *)d, vr);
     return true;
 }
 #endif
@@ -140,7 +171,34 @@ static inline bool xps_sse_fast(CPUX86State *env, int op, void *d,
 #undef XPS_MMX_PACK
 #undef XPS_SSE_PS
 #undef XPS_SSE_SS
+#undef XPS_SSE_FN
+#undef XPS_SSE_CMP_PS
+#undef XPS_SSE_CMP_SS
 #ifdef __PROSPERO__
+/* Run call (a bool xps_sse_* fast path) and return if it did the work. */
+#define XPS_SSE_FN(call) \
+    if (xps_sse_more && (call)) { return; }
+#define XPS_SSE_CMP_PS(C) \
+    if (SHIFT == 1 && xps_sse_more) { \
+        int xr_[4], xi_; \
+        if (xps_sse_rel(v, s, 4, xr_)) { \
+            for (xi_ = 0; xi_ < 4; xi_++) { \
+                d->ZMM_L(xi_) = C(xr_[xi_]) ? -1 : 0; \
+            } \
+            return; \
+        } \
+    }
+#define XPS_SSE_CMP_SS(C) \
+    if (xps_sse_more) { \
+        int xr_[1], xi_; \
+        if (xps_sse_rel(v, s, 1, xr_)) { \
+            d->ZMM_L(0) = C(xr_[0]) ? -1 : 0; \
+            for (xi_ = 1; xi_ < 4; xi_++) { \
+                d->ZMM_L(xi_) = v->ZMM_L(xi_); \
+            } \
+            return; \
+        } \
+    }
 #define XPS_MMX_UNPCK(high, size) \
     if (SHIFT == 0) { xps_mmx_unpck(d, v, s, high, size); return; }
 #define XPS_MMX_PACK(kind) \
@@ -156,6 +214,9 @@ static inline bool xps_sse_fast(CPUX86State *env, int op, void *d,
 #define XPS_MMX_PACK(kind)
 #define XPS_SSE_PS(name)
 #define XPS_SSE_SS(name)
+#define XPS_SSE_FN(call)
+#define XPS_SSE_CMP_PS(C)
+#define XPS_SSE_CMP_SS(C)
 #endif
 
 #if SHIFT == 0
@@ -672,6 +733,7 @@ SSE_HELPER_S(max, FPU_MAX)
 
 void glue(helper_sqrtps, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 {
+    XPS_SSE_FN(SHIFT == 1 && xps_sse_sqrt(&env->sse_status, d, s, s, 4))
     int i;
     for (i = 0; i < 2 << SHIFT; i++) {
         d->ZMM_S(i) = float32_sqrt(s->ZMM_S(i), &env->sse_status);
@@ -689,6 +751,7 @@ void glue(helper_sqrtpd, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 #if SHIFT == 1
 void helper_sqrtss(CPUX86State *env, Reg *d, Reg *v, Reg *s)
 {
+    XPS_SSE_FN(xps_sse_sqrt(&env->sse_status, d, v, s, 1))
     int i;
     d->ZMM_S(0) = float32_sqrt(s->ZMM_S(0), &env->sse_status);
     for (i = 1; i < 2 << SHIFT; i++) {
@@ -980,6 +1043,7 @@ int64_t helper_cvttsd2sq(CPUX86State *env, ZMMReg *s)
 
 void glue(helper_rsqrtps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
+    XPS_SSE_FN(SHIFT == 1 && xps_sse_recip(&env->sse_status, 1, d, s, s, 4))
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     for (i = 0; i < 2 << SHIFT; i++) {
@@ -993,6 +1057,7 @@ void glue(helper_rsqrtps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 #if SHIFT == 1
 void helper_rsqrtss(CPUX86State *env, ZMMReg *d, ZMMReg *v, ZMMReg *s)
 {
+    XPS_SSE_FN(xps_sse_recip(&env->sse_status, 1, d, v, s, 1))
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     d->ZMM_S(0) = float32_div(float32_one,
@@ -1007,6 +1072,7 @@ void helper_rsqrtss(CPUX86State *env, ZMMReg *d, ZMMReg *v, ZMMReg *s)
 
 void glue(helper_rcpps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 {
+    XPS_SSE_FN(SHIFT == 1 && xps_sse_recip(&env->sse_status, 0, d, s, s, 4))
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     for (i = 0; i < 2 << SHIFT; i++) {
@@ -1018,6 +1084,7 @@ void glue(helper_rcpps, SUFFIX)(CPUX86State *env, ZMMReg *d, ZMMReg *s)
 #if SHIFT == 1
 void helper_rcpss(CPUX86State *env, ZMMReg *d, ZMMReg *v, ZMMReg *s)
 {
+    XPS_SSE_FN(xps_sse_recip(&env->sse_status, 0, d, v, s, 1))
     int old_flags = get_float_exception_flags(&env->sse_status);
     int i;
     d->ZMM_S(0) = float32_div(float32_one, s->ZMM_S(0), &env->sse_status);
@@ -1138,6 +1205,7 @@ void glue(helper_addsubpd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
     void glue(helper_ ## name ## ps, SUFFIX)(CPUX86State *env,          \
                                              Reg *d, Reg *v, Reg *s)    \
     {                                                                   \
+        XPS_SSE_CMP_PS(C)                                               \
         int i;                                                          \
         for (i = 0; i < 2 << SHIFT; i++) {                              \
             d->ZMM_L(i) = C(F(32, v->ZMM_S(i), s->ZMM_S(i))) ? -1 : 0;  \
@@ -1158,6 +1226,7 @@ void glue(helper_addsubpd, SUFFIX)(CPUX86State *env, Reg *d, Reg *v, Reg *s)
     SSE_HELPER_CMP_P(name, F, C)                                            \
     void helper_ ## name ## ss(CPUX86State *env, Reg *d, Reg *v, Reg *s)    \
     {                                                                       \
+        XPS_SSE_CMP_SS(C)                                                   \
         int i;                                                              \
         d->ZMM_L(0) = C(F(32, v->ZMM_S(0), s->ZMM_S(0))) ? -1 : 0;          \
         for (i = 1; i < 2 << SHIFT; i++) {                                  \

@@ -2988,7 +2988,11 @@ void qemu_init(int argc, char **argv)
             char *msg = g_strdup_printf("Failed to open BootROM file '%s'. "
                                         "Please check machine settings.",
                                         bootrom_path);
+#ifndef __PROSPERO__ /* XPSemu's first-run checklist says it instead */
             xemu_queue_error_message(msg);
+#else
+            autostart = 0; /* Not without it: the checklist waits */
+#endif
             g_free(msg);
             bootrom_path = "";
         } else if (bootrom_size != 512) {
@@ -2999,6 +3003,9 @@ void qemu_init(int argc, char **argv)
             xemu_queue_error_message(msg);
             g_free(msg);
             bootrom_path = "";
+#ifdef __PROSPERO__
+            autostart = 0;
+#endif
         } else {
             char *escaped_bootrom_path = strdup_double_commas(bootrom_path);
             bootrom_arg = g_strdup_printf(",bootrom=%s", escaped_bootrom_path);
@@ -3045,7 +3052,9 @@ void qemu_init(int argc, char **argv)
         autostart = 0;
     } else if (xemu_check_file(flashrom_path)) {
         char *msg = g_strdup_printf("Failed to open flash file '%s'. Please check machine settings.", flashrom_path);
+#ifndef __PROSPERO__ /* XPSemu's first-run checklist says it instead */
         xemu_queue_error_message(msg);
+#endif
         g_free(msg);
         autostart = 0;
     } else {
@@ -3058,10 +3067,21 @@ void qemu_init(int argc, char **argv)
     fake_argv[fake_argc++] = g_strdup_printf("%d", mem);
 
     const char *hdd_path = g_config.sys.files.hdd_path;
+#ifdef __PROSPERO__
+    {
+        /* None yet: a blank one (ui/xemu-os-utils-ps5.c). */
+        extern void xemu_ps5_blank_hdd(const char *path);
+        xemu_ps5_blank_hdd(hdd_path);
+    }
+#endif
     if (strlen(hdd_path) > 0) {
         if (xemu_check_file(hdd_path)) {
             char *msg = g_strdup_printf("Failed to open hard disk image file '%s'. Please check machine settings.", hdd_path);
+#ifndef __PROSPERO__ /* XPSemu's first-run checklist says it instead */
             xemu_queue_error_message(msg);
+#else
+            autostart = 0;
+#endif
             g_free(msg);
         } else {
             fake_argv[fake_argc++] = strdup("-drive");
@@ -3097,9 +3117,11 @@ void qemu_init(int argc, char **argv)
     fake_argv[fake_argc++] = strdup("-display");
     fake_argv[fake_argc++] = strdup("xemu");
 #ifdef __PROSPERO__
-    /* XPSemu: the Xbox stays off until its dashboard starts a game or the
-     * Xbox's own dashboard (so neither shows before it). */
-    fake_argv[fake_argc++] = strdup("-S");
+    /* XPSemu: honor Skip boot animation on app startup. Otherwise let the
+     * Xbox play its one full startup animation before the PS5 dashboard. */
+    if (g_config.general.skip_boot_anim) {
+        fake_argv[fake_argc++] = strdup("-S");
+    }
 #endif
 
     // Create USB Daughterboard for 1.0 Xbox. This is connected to Port 1 of the Root hub.

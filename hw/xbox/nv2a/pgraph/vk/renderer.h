@@ -361,6 +361,7 @@ typedef struct PGRAPHVkState {
 
     VkCommandBuffer aux_command_buffer;
     bool in_aux_command_buffer;
+    VkFence aux_fence; /* XPSemu: the one-off submission, to poll for */
 
     VkFramebuffer framebuffers[50];
     int framebuffer_index;
@@ -379,7 +380,9 @@ typedef struct PGRAPHVkState {
 
     VkDescriptorPool descriptor_pool;
     VkDescriptorSetLayout descriptor_set_layout;
-    VkDescriptorSet descriptor_sets[1024];
+    /* Sized so that a full frame of draws fits without forcing a mid-frame
+     * pipeline drain (FINISH_NEED_BUFFER_SPACE); LightGun Edition ae6bbcd. */
+    VkDescriptorSet descriptor_sets[8192];
     int descriptor_set_index;
 
     StorageBuffer storage_buffers[BUFFER_COUNT];
@@ -497,6 +500,7 @@ void pgraph_vk_init_command_buffers(PGRAPHState *pg);
 void pgraph_vk_finalize_command_buffers(PGRAPHState *pg);
 VkCommandBuffer pgraph_vk_begin_single_time_commands(PGRAPHState *pg);
 void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd);
+void pgraph_vk_poll_fence(PGRAPHState *pg, VkFence fence);
 
 // image.c
 void pgraph_vk_transition_image_layout(PGRAPHState *pg, VkCommandBuffer cmd,

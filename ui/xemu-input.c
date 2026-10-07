@@ -667,6 +667,12 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
 
 void xemu_input_update_rumble(ControllerState *state)
 {
+#ifdef __PROSPERO__
+    if (state->type == INPUT_DEVICE_PS5_PAD) {
+        xemu_input_update_ps5_pad_rumble(state);
+        return;
+    }
+#endif
     if (state->type != INPUT_DEVICE_SDL_GAMEPAD) {
         return;
     }

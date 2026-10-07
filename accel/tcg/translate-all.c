@@ -302,8 +302,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
         g_assert(removed);
         if (phys_pc != -1) {
             tb_lock_page0(phys_pc);
-            if (tb->page_addr[1] != -1) {
-                tb_lock_page1(phys_pc, tb->page_addr[1]);
+            if (tb_page_addr1(tb) != -1) {
+                tb_lock_page1(phys_pc, tb_page_addr1(tb));
             }
         }
         recycled = true;

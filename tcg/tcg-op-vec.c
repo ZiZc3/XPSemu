@@ -602,6 +602,28 @@ void tcg_gen_ssadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
     do_op3_nofail(vece, r, a, b, INDEX_op_ssadd_vec);
 }
 
+/* XPSemu: host SSE ops (include/tcg/xps-sse.h); only where supported. */
+void tcg_gen_xps_sse_vec(TCGv_vec r, TCGv_vec a, TCGv_vec b, unsigned sel)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    vec_gen_4(INDEX_op_xps_sse_vec, rt->base_type, 0, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_vec_arg(b), sel);
+}
+
+void tcg_gen_xps_sse_x2r(TCGv_i32 r, TCGv_vec a, unsigned sel)
+{
+    TCGTemp *at = tcgv_vec_temp(a);
+    vec_gen_3(INDEX_op_xps_sse_x2r, at->base_type, 0, tcgv_i32_arg(r),
+              temp_arg(at), sel);
+}
+
+void tcg_gen_xps_sse_r2x(TCGv_vec r, TCGv_vec a, TCGv_i32 b, unsigned sel)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+    vec_gen_4(INDEX_op_xps_sse_r2x, rt->base_type, 0, temp_arg(rt),
+              tcgv_vec_arg(a), tcgv_i32_arg(b), sel);
+}
+
 void tcg_gen_usadd_vec(unsigned vece, TCGv_vec r, TCGv_vec a, TCGv_vec b)
 {
     if (!do_op3(vece, r, a, b, INDEX_op_usadd_vec)) {

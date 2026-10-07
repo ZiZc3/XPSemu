@@ -57,6 +57,8 @@ void xemu_snapshots_mark_dirty(void);
 
 // Implemented in xemu-thumbnail.cc
 void xemu_snapshots_set_framebuffer_texture(XemuTexture tex, bool flip);
+// XPSemu: the game's latest picture (the dashboard's backdrop), or 0.
+XemuTexture xemu_snapshots_get_framebuffer_texture(bool *flip);
 // A new texture with the PNG's pixels, or 0.
 XemuTexture xemu_snapshots_load_png_to_texture(void *buf, size_t size);
 void xemu_snapshots_free_texture(XemuTexture tex);

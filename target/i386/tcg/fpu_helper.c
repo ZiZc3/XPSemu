@@ -3444,6 +3444,65 @@ void helper_xsetbv(CPUX86State *env, uint32_t ecx, uint64_t mask)
 #define SSE_RC_MASK         (3 << SSE_RC_SHIFT)
 #define SSE_FZ              0x8000
 
+#include "tcg/xps-sse.h"
+#ifdef XPS_SSE_INLINE
+#include <immintrin.h>
+/*
+ * XPSemu: native SSE in the translated code (emit.c.inc). The Xbox has one
+ * CPU, so one host thread runs it; that thread's MXCSR gets the game's
+ * flush/denormal settings, all exceptions masked (QEMU raises no SSE
+ * exceptions either), whenever the game rounds to nearest (nearly always;
+ * else the translated code calls the emulated helpers as before:
+ * env->xps_sse_native says which). Then every result is the one a real x86
+ * gives. The exception flags the host raises are the game's: added to its
+ * MXCSR when it reads it. (The emulator's own float code on that thread
+ * may add a stray flag; games don't read them in practice.)
+ */
+bool xps_sse_inline = true;      /* perf.sse_inline, set at start */
+#ifdef XPS_RIG
+/* Test rig (native qemu-i386): XPS_INLINE=0 runs the old way, to compare */
+static void __attribute__((constructor)) xps_rig_init(void)
+{
+    const char *e = getenv("XPS_INLINE");
+    xps_sse_inline = !(e && e[0] == '0');
+}
+#endif
+static uint32_t xps_host_csr;    /* The thread's own MXCSR (0: not seen) */
+
+static uint32_t xps_sse_want(CPUX86State *env)
+{
+    if (!xps_sse_inline || (env->mxcsr & SSE_RC_MASK)) {
+        return 0;
+    }
+    return 0x1f80 | (env->mxcsr & (SSE_DAZ | SSE_FZ));
+}
+
+static bool xps_on_cpu_thread(CPUX86State *env)
+{
+    return current_cpu && cpu_env(current_cpu) == env;
+}
+
+/* On the guest CPU's thread: host MXCSR to match; clear: drop host flags. */
+void xps_sse_sync(CPUX86State *env, bool clear);
+void xps_sse_sync(CPUX86State *env, bool clear)
+{
+    uint32_t csr = _mm_getcsr();
+    uint32_t want = xps_sse_want(env);
+
+    if (!xps_host_csr) {
+        xps_host_csr = (csr & ~0x3fu) | 0x10000; /* non-zero marker */
+    }
+    if (!want) {
+        want = xps_host_csr & 0xffff;
+        clear = true;
+    }
+    if (clear || (csr & ~0x3fu) != want) {
+        _mm_setcsr(want | (clear ? 0 : (csr & 0x3f)));
+    }
+    env->xps_sse_native = xps_sse_want(env) != 0;
+}
+#endif
+
 void update_mxcsr_status(CPUX86State *env)
 {
     uint32_t mxcsr = env->mxcsr;
@@ -3467,11 +3526,29 @@ void update_mxcsr_status(CPUX86State *env)
 
     /* set flush to zero */
     set_flush_to_zero((mxcsr & SSE_FZ) ? 1 : 0, &env->sse_status);
+
+#ifdef XPS_SSE_INLINE
+    /* The guest set its MXCSR: flags start from it, not from the host's. */
+    if (xps_on_cpu_thread(env)) {
+        xps_sse_sync(env, true);
+    } else {
+        env->xps_sse_native = 0; /* Its thread syncs when it runs again */
+    }
+#endif
 }
 
 void update_mxcsr_from_sse_status(CPUX86State *env)
 {
     int flags = get_float_exception_flags(&env->sse_status);
+#ifdef XPS_SSE_INLINE
+    if (env->xps_sse_native && xps_on_cpu_thread(env)) {
+        uint32_t csr = _mm_getcsr();
+        if (csr & 0x3f) { /* Same bits as the guest's MXCSR flags */
+            env->mxcsr |= csr & 0x3f;
+            _mm_setcsr(csr & ~0x3fu);
+        }
+    }
+#endif
     env->mxcsr |= ((flags & float_flag_invalid ? FPUS_IE : 0) |
                    (flags & float_flag_input_denormal_used ? FPUS_DE : 0) |
                    (flags & float_flag_divbyzero ? FPUS_ZE : 0) |
@@ -3505,6 +3582,10 @@ void helper_emms(CPUX86State *env)
     *(uint32_t *)(env->fptags) = 0x01010101;
     *(uint32_t *)(env->fptags + 4) = 0x01010101;
 }
+
+#ifdef __PROSPERO__
+bool xps_sse_more = true;
+#endif
 
 #define SHIFT 0
 #include "ops_sse.h"

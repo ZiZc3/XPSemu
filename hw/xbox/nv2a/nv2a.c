@@ -21,6 +21,7 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "qemu/main-loop.h"
+#include "ui/xemu-settings.h"
 
 void nv2a_update_irq(NV2AState *d)
 {
@@ -367,6 +368,14 @@ static void nv2a_realize(PCIDevice *dev, Error **errp)
         memory_region_add_subregion(&d->mmio, blocktable[i].offset,
                                     &d->block_mmio[i]);
     }
+#ifdef __PROSPERO__
+    /* XPSemu: the game rings this doorbell on every GPU push; skip the
+     * BQL wait (the UI and main loop hold it often). */
+    if (g_config.perf.lockless_doorbell) {
+        memory_region_enable_lockless_io(&d->block_mmio[NV_USER]);
+        fprintf(stderr, "nv2a: USER doorbell lockless\n");
+    }
+#endif
 
     qemu_mutex_init(&d->pfifo.lock);
     qemu_cond_init(&d->pfifo.fifo_cond);

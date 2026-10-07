@@ -223,3 +223,9 @@ ssize_t xemu_ps5_readlink(const char *path, char *buf, size_t size)
     errno = EINVAL; /* "not a symbolic link": there are none */
     return -1;
 }
+
+/* setbuf (mbedTLS's file reads): setvbuf, which the console does have. */
+void xemu_ps5_setbuf(FILE *stream, char *buf)
+{
+    setvbuf(stream, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
+}

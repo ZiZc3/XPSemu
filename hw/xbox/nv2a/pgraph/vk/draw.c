@@ -1346,6 +1346,7 @@ void pgraph_vk_finish(PGRAPHState *pg, FinishReason finish_reason)
         }
 
         uint64_t xt_wait = xemu_timing_now();
+        pgraph_vk_poll_fence(pg, r->command_buffer_fence);
         VK_CHECK(vkWaitForFences(r->device, 1, &r->command_buffer_fence,
                                  VK_TRUE, UINT64_MAX));
         xemu_timing_add(XT_FINISH_WAIT, xt_wait);

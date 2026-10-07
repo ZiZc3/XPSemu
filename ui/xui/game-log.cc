@@ -183,7 +183,7 @@ void GameLogStart(const GameLogInfo &info)
     std::string h = "== XPSemu game log ==\n";
     snprintf(buf, sizeof(buf),
              "Started      %s\n"
-             "XPSemu       based on xemu %s\n"
+             "XPSemu       Alpha 2, based on xemu %s\n"
              "Game         %s\n"
              "File         %s (%lld MB, %s)\n"
              "Title ID     %08X   key %s\n"

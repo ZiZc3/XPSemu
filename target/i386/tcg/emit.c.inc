@@ -534,6 +534,71 @@ static void gen_3dnow(DisasContext *s, X86DecodedInsn *decode)
  * f3 = v*ss Vss, Hss, Wps
  * f2 = v*sd Vsd, Hsd, Wps
  */
+#include "tcg/xps-sse.h"
+#ifdef XPS_SSE_INLINE
+/*
+ * XPSemu: the guest's SSE as the host's (see target/i386/tcg/fpu_helper.c).
+ * Legacy (non-VEX) 128-bit forms only: what a Pentium III has. Each float
+ * one runs natively while env->xps_sse_native, else the helper as before:
+ *     if (!native) goto slow; <host op>; goto done; slow: <helper>; done:
+ */
+extern bool xps_sse_inline;
+
+static bool xps_legacy(DisasContext *s)
+{
+    return xps_sse_inline && !(s->prefix & PREFIX_VEX) && !s->vex_l;
+}
+
+static TCGLabel *xps_guard(void)
+{
+    TCGLabel *slow = gen_new_label();
+    TCGv_i32 t = tcg_temp_new_i32();
+    tcg_gen_ld_i32(t, tcg_env, offsetof(CPUX86State, xps_sse_native));
+    tcg_gen_brcondi_i32(TCG_COND_EQ, t, 0, slow);
+    return slow;
+}
+
+static TCGLabel *xps_guard_end(TCGLabel *slow)
+{
+    TCGLabel *done = gen_new_label();
+    tcg_gen_br(done);
+    gen_set_label(slow);
+    return done;
+}
+
+static TCGv_vec xps_ld(int ofs, TCGType type)
+{
+    TCGv_vec v = tcg_temp_new_vec(type);
+    tcg_gen_ld_vec(v, tcg_env, ofs);
+    return v;
+}
+
+/* op0 = sel(a, b): a from op1 (or op0 when absent), b from op2. Returns the
+ * label to set after the helper call, or NULL (no native path). */
+static TCGLabel *xps_fp(DisasContext *s, X86DecodedInsn *decode, int sel)
+{
+    X86DecodedOp *opa = decode->op[1].unit == X86_OP_SSE ? &decode->op[1]
+                                                         : &decode->op[0];
+    TCGLabel *slow = xps_guard();
+    TCGv_vec a = xps_ld(vector_reg_offset(opa), TCG_TYPE_V128);
+    TCGv_vec b = xps_ld(vector_reg_offset(&decode->op[2]), TCG_TYPE_V128);
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_xps_sse_vec(r, a, b, sel);
+    tcg_gen_st_vec(r, tcg_env, vector_reg_offset(&decode->op[0]));
+    return xps_guard_end(slow);
+}
+
+/* ps (no prefix) or ss (F3): the selector, or -1 */
+static int xps_fp_sel(DisasContext *s, int op)
+{
+    if (!xps_legacy(s) || (s->prefix & (PREFIX_DATA | PREFIX_REPNZ))) {
+        return -1;
+    }
+    return op | (s->prefix & PREFIX_REPZ ? XPSV_SS : 0);
+}
+#endif
+
 static inline void gen_unary_fp_sse(DisasContext *s, X86DecodedInsn *decode,
                               SSEFunc_0_epp pd_xmm, SSEFunc_0_epp ps_xmm,
                               SSEFunc_0_epp pd_ymm, SSEFunc_0_epp ps_ymm,
@@ -569,7 +634,23 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                      gen_helper_##lname##sd,                                       \
                      gen_helper_##lname##ss);                                      \
 }
+#ifdef XPS_SSE_INLINE
+static void gen_VSQRT(DisasContext *s, X86DecodedInsn *decode)
+{
+    int sel = xps_fp_sel(s, XPSV_SQRT);
+    TCGLabel *done = sel >= 0 ? xps_fp(s, decode, sel) : NULL;
+
+    gen_unary_fp_sse(s, decode,
+                     gen_helper_sqrtpd_xmm, gen_helper_sqrtps_xmm,
+                     gen_helper_sqrtpd_ymm, gen_helper_sqrtps_ymm,
+                     gen_helper_sqrtsd, gen_helper_sqrtss);
+    if (done) {
+        gen_set_label(done);
+    }
+}
+#else
 UNARY_FP_SSE(VSQRT, sqrt)
+#endif
 
 /*
  * 00 = v*ps Vps, Hps, Wpd
@@ -597,9 +678,20 @@ static inline void gen_fp_sse(DisasContext *s, X86DecodedInsn *decode,
     }
 }
 
-#define FP_SSE(uname, lname)                                                       \
+#ifdef XPS_SSE_INLINE
+#define XPS_FP_BEGIN(op) \
+    int sel_ = xps_fp_sel(s, op); \
+    TCGLabel *done_ = sel_ >= 0 ? xps_fp(s, decode, sel_) : NULL;
+#define XPS_FP_END() \
+    if (done_) { gen_set_label(done_); }
+#else
+#define XPS_FP_BEGIN(op)
+#define XPS_FP_END()
+#endif
+#define FP_SSE(uname, lname, xop)                                                  \
 static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
 {                                                                                  \
+    XPS_FP_BEGIN(xop)                                                              \
     gen_fp_sse(s, decode,                                                          \
                gen_helper_##lname##pd_xmm,                                         \
                gen_helper_##lname##ps_xmm,                                         \
@@ -607,13 +699,14 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
                gen_helper_##lname##ps_ymm,                                         \
                gen_helper_##lname##sd,                                             \
                gen_helper_##lname##ss);                                            \
+    XPS_FP_END()                                                                   \
 }
-FP_SSE(VADD, add)
-FP_SSE(VMUL, mul)
-FP_SSE(VSUB, sub)
-FP_SSE(VMIN, min)
-FP_SSE(VDIV, div)
-FP_SSE(VMAX, max)
+FP_SSE(VADD, add, XPSV_ADD)
+FP_SSE(VMUL, mul, XPSV_MUL)
+FP_SSE(VSUB, sub, XPSV_SUB)
+FP_SSE(VMIN, min, XPSV_MIN)
+FP_SSE(VDIV, div, XPSV_DIV)
+FP_SSE(VMAX, max, XPSV_MAX)
 
 #define FMA_SSE_PACKED(uname, ptr0, ptr1, ptr2, even, odd)                         \
 static void gen_##uname##Px(DisasContext *s, X86DecodedInsn *decode)               \
@@ -964,12 +1057,40 @@ static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                
 XPS_PUNPCK(PUNPCKLBW,  punpcklbw, false, 8)
 XPS_PUNPCK(PUNPCKLWD,  punpcklwd, false, 16)
 XPS_PUNPCK(PUNPCKLDQ,  punpckldq, false, 32)
-BINARY_INT_MMX(PACKSSWB,   packsswb)
-BINARY_INT_MMX(PACKUSWB,   packuswb)
+#ifdef XPS_SSE_INLINE
+static bool xps_pack_mmx(DisasContext *s, X86DecodedInsn *decode, int sel)
+{
+    TCGv_vec a, b, r;
+
+    if (!xps_sse_inline || (s->prefix & (PREFIX_DATA | PREFIX_VEX))) {
+        return false;
+    }
+    a = xps_ld(vector_reg_offset(&decode->op[1]), TCG_TYPE_V64);
+    b = xps_ld(vector_reg_offset(&decode->op[2]), TCG_TYPE_V64);
+    r = tcg_temp_new_vec(TCG_TYPE_V64);
+    tcg_gen_xps_sse_vec(r, a, b, sel);
+    tcg_gen_st_vec(r, tcg_env, vector_reg_offset(&decode->op[0]));
+    return true;
+}
+#define XPS_PACK(uname, lname, sel)                                                \
+static void gen_##uname(DisasContext *s, X86DecodedInsn *decode)                   \
+{                                                                                  \
+    if (!xps_pack_mmx(s, decode, sel)) {                                           \
+        gen_binary_int_sse(s, decode,                                              \
+                              gen_helper_##lname##_mmx,                            \
+                              gen_helper_##lname##_xmm,                            \
+                              gen_helper_##lname##_ymm);                           \
+    }                                                                              \
+}
+#else
+#define XPS_PACK(uname, lname, sel) BINARY_INT_MMX(uname, lname)
+#endif
+XPS_PACK(PACKSSWB,   packsswb, XPSV_PACKSSWB)
+XPS_PACK(PACKUSWB,   packuswb, XPSV_PACKUSWB)
 XPS_PUNPCK(PUNPCKHBW,  punpckhbw, true, 8)
 XPS_PUNPCK(PUNPCKHWD,  punpckhwd, true, 16)
 XPS_PUNPCK(PUNPCKHDQ,  punpckhdq, true, 32)
-BINARY_INT_MMX(PACKSSDW,   packssdw)
+XPS_PACK(PACKSSDW,   packssdw, XPSV_PACKSSDW)
 
 BINARY_INT_MMX(PAVGB,   pavgb)
 BINARY_INT_MMX(PAVGW,   pavgw)
@@ -1974,34 +2095,73 @@ static void gen_CRC32(DisasContext *s, X86DecodedInsn *decode)
     gen_helper_crc32(s->T0, tmp, s->T1, tcg_constant_i32(8 << ot));
 }
 
+#ifdef XPS_SSE_INLINE
+/*
+ * cvtpi2ps / cvt(t)ps2pi with 64-bit loads: the registers' upper halves
+ * are zero, so the unused lanes convert 0 and raise no flag.
+ */
+static TCGLabel *xps_cvt_mmx(DisasContext *s, X86DecodedInsn *decode, int sel)
+{
+    TCGLabel *slow;
+    TCGv_vec b, r;
+
+    if (!xps_legacy(s) || (s->prefix & PREFIX_DATA)) {
+        return NULL;
+    }
+    slow = xps_guard();
+    b = xps_ld(vector_reg_offset(&decode->op[2]), TCG_TYPE_V64);
+    if (sel == XPSV_CVTPI2PS) {
+        TCGv_vec a = xps_ld(vector_reg_offset(&decode->op[0]), TCG_TYPE_V128);
+        r = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_xps_sse_vec(r, a, b, sel);
+    } else {
+        r = tcg_temp_new_vec(TCG_TYPE_V64);
+        tcg_gen_xps_sse_vec(r, b, b, sel);
+    }
+    tcg_gen_st_vec(r, tcg_env, vector_reg_offset(&decode->op[0]));
+    return xps_guard_end(slow);
+}
+#define XPS_CVT_BEGIN(sel) TCGLabel *done_ = xps_cvt_mmx(s, decode, sel);
+#define XPS_CVT_END() if (done_) { gen_set_label(done_); }
+#else
+#define XPS_CVT_BEGIN(sel)
+#define XPS_CVT_END()
+#endif
+
 static void gen_CVTPI2Px(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_enter_mmx(s);
+    XPS_CVT_BEGIN(XPSV_CVTPI2PS)
     if (s->prefix & PREFIX_DATA) {
         gen_helper_cvtpi2pd(tcg_env, OP_PTR0, OP_PTR2);
     } else {
         gen_helper_cvtpi2ps(tcg_env, OP_PTR0, OP_PTR2);
     }
+    XPS_CVT_END()
 }
 
 static void gen_CVTPx2PI(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_enter_mmx(s);
+    XPS_CVT_BEGIN(XPSV_CVTPS2DQ)
     if (s->prefix & PREFIX_DATA) {
         gen_helper_cvtpd2pi(tcg_env, OP_PTR0, OP_PTR2);
     } else {
         gen_helper_cvtps2pi(tcg_env, OP_PTR0, OP_PTR2);
     }
+    XPS_CVT_END()
 }
 
 static void gen_CVTTPx2PI(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_enter_mmx(s);
+    XPS_CVT_BEGIN(XPSV_CVTTPS2DQ)
     if (s->prefix & PREFIX_DATA) {
         gen_helper_cvttpd2pi(tcg_env, OP_PTR0, OP_PTR2);
     } else {
         gen_helper_cvttps2pi(tcg_env, OP_PTR0, OP_PTR2);
     }
+    XPS_CVT_END()
 }
 
 static void gen_CWD(DisasContext *s, X86DecodedInsn *decode)
@@ -4328,8 +4488,18 @@ static void gen_VCMP(DisasContext *s, X86DecodedInsn *decode)
         s->prefix & PREFIX_REPZ  ? 2 /* ss */ :
         s->prefix & PREFIX_REPNZ ? 3 /* sd */ :
         !!(s->prefix & PREFIX_DATA) /* pd */ + (s->vex_l << 2);
+#ifdef XPS_SSE_INLINE
+    int sel = xps_fp_sel(s, XPSV_CMP);
+    TCGLabel *done = sel >= 0 ? xps_fp(s, decode, sel | XPSV_IMM(index))
+                              : NULL;
+#endif
 
     gen_helper_cmp_funcs[index][b](tcg_env, OP_PTR0, OP_PTR1, OP_PTR2);
+#ifdef XPS_SSE_INLINE
+    if (done) {
+        gen_set_label(done);
+    }
+#endif
 }
 
 static void gen_VCOMI(DisasContext *s, X86DecodedInsn *decode)
@@ -4405,11 +4575,28 @@ static void gen_VCVTSI2Sx(DisasContext *s, X86DecodedInsn *decode)
     in = s->T1;
 #endif
 
+#ifdef XPS_SSE_INLINE
+    TCGLabel *done = NULL;
+    if (xps_legacy(s) && !(s->prefix & PREFIX_REPNZ)) {
+        TCGLabel *slow = xps_guard();
+        TCGv_vec a = xps_ld(vector_reg_offset(&decode->op[0]),
+                            TCG_TYPE_V128);
+        TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+        tcg_gen_xps_sse_r2x(r, a, in, XPSX_CVTSI2SS);
+        tcg_gen_st_vec(r, tcg_env, vector_reg_offset(&decode->op[0]));
+        done = xps_guard_end(slow);
+    }
+#endif
     if (s->prefix & PREFIX_REPNZ) {
         gen_helper_cvtsi2sd(tcg_env, OP_PTR0, in);
     } else {
         gen_helper_cvtsi2ss(tcg_env, OP_PTR0, in);
     }
+#ifdef XPS_SSE_INLINE
+    if (done) {
+        gen_set_label(done);
+    }
+#endif
 }
 
 static inline void gen_VCVTtSx2SI(DisasContext *s, X86DecodedInsn *decode,
@@ -4433,11 +4620,26 @@ static inline void gen_VCVTtSx2SI(DisasContext *s, X86DecodedInsn *decode,
 #else
     out = s->T0;
 #endif
+#ifdef XPS_SSE_INLINE
+    TCGLabel *done = NULL;
+    if (xps_legacy(s) && !(s->prefix & PREFIX_REPNZ)) {
+        TCGLabel *slow = xps_guard();
+        TCGv_vec a = xps_ld(vector_reg_offset(&decode->op[2]), TCG_TYPE_V128);
+        tcg_gen_xps_sse_x2r(out, a, ss2si == gen_helper_cvtss2si ?
+                                    XPSR_CVTSS2SI : XPSR_CVTTSS2SI);
+        done = xps_guard_end(slow);
+    }
+#endif
     if (s->prefix & PREFIX_REPNZ) {
         sd2si(out, tcg_env, OP_PTR2);
     } else {
         ss2si(out, tcg_env, OP_PTR2);
     }
+#ifdef XPS_SSE_INLINE
+    if (done) {
+        gen_set_label(done);
+    }
+#endif
 #ifdef TARGET_X86_64
     tcg_gen_extu_i32_tl(s->T0, out);
 #endif

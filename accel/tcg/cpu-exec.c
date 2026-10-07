@@ -816,7 +816,16 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
      * cpu->interrupt_request (see also store-release in
      * tcg_kick_vcpu_thread())
      */
-    qatomic_set_mb(&cpu->neg.icount_decr.u16.high, 0);
+    /*
+     * XPSemu: the full barrier (a locked instruction, on every pass of the
+     * loop) only when there is something to clear. A kick posts its request
+     * before setting this to -1; if it reads 0 here, every earlier request
+     * was cleared (and read) by an earlier pass, and a later kick stops the
+     * next TB and comes back through the barrier.
+     */
+    if (qatomic_read(&cpu->neg.icount_decr.u16.high)) {
+        qatomic_set_mb(&cpu->neg.icount_decr.u16.high, 0);
+    }
 
 #ifdef CONFIG_USER_ONLY
     assert(!cpu_test_interrupt(cpu, ~0));

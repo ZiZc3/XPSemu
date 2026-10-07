@@ -1588,6 +1588,21 @@ int main(int argc, char **argv)
         xemu_settings_save();
     }
     unlink(XEMU_PS5_MEM128_MARKER);
+    {
+        extern size_t xemu_ps5_direct_min_size;
+        extern bool xps_sse_more;
+        if (!g_config.perf.direct_guest_ram) {
+            xemu_ps5_direct_min_size = (size_t)96 << 20;
+        }
+        xps_sse_more = g_config.perf.sse_fast_more;
+        extern bool xps_sse_inline;
+        xps_sse_inline = g_config.perf.sse_inline;
+        fprintf(stderr, "xemu PS5: guest RAM %s, SSE fast paths %s, "
+                "native SSE %s\n",
+                g_config.perf.direct_guest_ram ? "direct (2 MB)" : "flexible",
+                xps_sse_more ? "more" : "basic",
+                xps_sse_inline ? "on" : "off");
+    }
 #endif
 
 #ifdef _WIN32

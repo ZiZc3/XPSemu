@@ -24,6 +24,9 @@
 #include "ui/xemu-widescreen.h"
 #include "gl-helpers.hh"
 #include "common.hh"
+#ifdef __PROSPERO__
+#include "dashboard.hh"
+#endif
 #include "data/controller_mask.png.h"
 #include "data/xemu_64x64.png.h"
 #include "data/xmu_mask.png.h"
@@ -138,8 +141,18 @@ static float GetDisplayAspectRatio(int width, int height)
 void RenderFramebuffer(XemuTexture tex, int width, int height, bool flip)
 {
     int tw, th;
+#ifdef __PROSPERO__
+    // The side art stays where it was while the game shows nothing.
+    static ImVec2 last0, last1;
+    static bool have_last;
+#endif
     if (!tex || nv2a_get_screen_off() ||
         !xemu_vk_texture_get_size(tex, &tw, &th)) {
+#ifdef __PROSPERO__
+        if (have_last) {
+            DrawBladeSides(ImGui::GetBackgroundDrawList(), last0, last1);
+        }
+#endif
         return;
     }
 
@@ -170,6 +183,12 @@ void RenderFramebuffer(XemuTexture tex, int width, int height, bool flip)
     ImGui::GetBackgroundDrawList()->AddImage(
         (ImTextureID)tex, p0, ImVec2(p0.x + size.x, p0.y + size.y),
         ImVec2(0, flip ? 1 : 0), ImVec2(1, flip ? 0 : 1));
+#ifdef __PROSPERO__
+    last0 = p0;
+    last1 = ImVec2(p0.x + size.x, p0.y + size.y);
+    have_last = true;
+    DrawBladeSides(ImGui::GetBackgroundDrawList(), last0, last1);
+#endif
 }
 
 bool RenderFramebufferToPng(XemuTexture tex, bool flip, std::vector<uint8_t> &png, int max_width, int max_height)

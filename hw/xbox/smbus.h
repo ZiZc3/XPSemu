@@ -25,6 +25,10 @@
 #ifndef HW_SMBUS_H
 #define HW_SMBUS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void smbus_xbox_smc_init(I2CBus *smbus, int address);
 void smbus_cx25871_init(I2CBus *smbus, int address);
 void smbus_fs454_init(I2CBus *smbus, int address);
@@ -37,5 +41,10 @@ void xbox_smc_append_smc_version_hint(Error **errp);
 void xbox_smc_power_button(void);
 void xbox_smc_eject_button(void);
 void xbox_smc_update_tray_state(void);
+void xbox_smc_set_short_animation(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

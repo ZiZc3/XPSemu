@@ -156,6 +156,27 @@ static Samples Make(UiSound sound)
         s.Echo(0.14f, 0.3f);
         return s.out;
     }
+    case UI_SOUND_NOTIFY: { // Two soft bright notes
+        Synth s(0.5f);
+        s.Tone(0.00f, 0.3f, 1319, 1319, 0.20f, 0.003f, 0.08f, -0.2f, 0.2f);
+        s.Tone(0.09f, 0.4f, 1760, 1760, 0.20f, 0.003f, 0.10f, 0.2f, 0.2f);
+        s.Echo(0.1f, 0.2f);
+        return s.out;
+    }
+    case UI_SOUND_FLASH: { // A bright burst: a low hit, a crack of air,
+                           // a shimmering chord ringing out
+        Synth s(2.2f);
+        s.Tone(0, 0.5f, 110, 55, 0.30f, 0.002f, 0.12f, 0, 0.5f);
+        s.Whoosh(0, 0.35f, 9000, 1500, 0.22f, 0.04f);
+        const float chord[] = { 659.3f, 987.8f, 1318.5f, 1975.5f, 2637.0f };
+        for (int i = 0; i < 5; i++) {
+            s.Tone(0.01f + i * 0.012f, 1.6f, chord[i], chord[i] * 1.004f,
+                   0.07f, 0.004f, 0.45f, i % 2 ? 0.5f : -0.5f, 0.1f);
+        }
+        s.Tone(0.02f, 1.2f, 3951, 3960, 0.025f, 0.01f, 0.25f);
+        s.Echo(0.16f, 0.32f);
+        return s.out;
+    }
     case UI_SOUND_ERROR: { // Two dull low bumps
         Synth s(0.3f);
         s.Tone(0.00f, 0.09f, 220, 200, 0.28f, 0.003f, 0.04f, 0, 0.6f);
@@ -199,6 +220,7 @@ static bool LoadWav(SDL_IOStream *io, const char *what, Samples *out)
 
 static const char *const kNames[UI_SOUND__COUNT] = {
     "move", "change", "select", "back", "open", "launch", "error",
+    "notify", "startup", "flash",
 };
 
 static std::mutex g_lock;
@@ -223,7 +245,11 @@ void UiSoundPlay(UiSound sound)
         // The user's own, else the recording in the app, else synthesized.
         std::string file = std::string(xemu_settings_get_base_path()) +
                            "sounds/" + kNames[sound] + ".wav";
-        const auto &embedded = kEmbeddedSounds[sound];
+        const size_t embedded_count =
+            sizeof(kEmbeddedSounds) / sizeof(kEmbeddedSounds[0]);
+        const auto &embedded = (size_t)sound < embedded_count ?
+                                   kEmbeddedSounds[sound] :
+                                   kEmbeddedSounds[0]; // { NULL, 0 }
         Samples s;
         if (LoadWav(SDL_IOFromFile(file.c_str(), "rb"), file.c_str(), &s)) {
         } else if (embedded.data &&
@@ -264,10 +290,91 @@ void UiSoundPlay(UiSound sound)
     best->pos = 0;
 }
 
+//
+// Music
+//
+
+static Samples g_music;         // The loop
+static bool g_music_tried;
+static size_t g_music_pos;      // In frames
+static float g_music_gain;      // 0 .. 1, eased towards the target
+static float g_music_target;
+static float g_music_step;      // Gain change per frame
+
+void UiMusicPrepare(void)
+{
+    if (g_music_tried) {
+        return;
+    }
+    g_music_tried = true;
+    std::string file = std::string(xemu_settings_get_base_path()) +
+                       "sounds/music.wav";
+    Samples s;
+    if (!LoadWav(SDL_IOFromFile(file.c_str(), "rb"), file.c_str(), &s)) {
+#ifdef XPS_EMBEDDED_MUSIC
+        LoadWav(SDL_IOFromConstMem(kSound_music, sizeof(kSound_music)), "music",
+                &s);
+#endif
+    }
+    size_t frames = s.size() / 2;
+    size_t blend = std::min((size_t)(3 * kRate), frames / 4);
+    if (frames < (size_t)kRate) {
+        return; // Nothing (or too short to loop)
+    }
+    // The last seconds faded out over the first ones faded in (equal
+    // power), then dropped from the end: the loop runs on without a seam.
+    for (size_t i = 0; i < blend; i++) {
+        float k = (float)i / blend * (float)M_PI / 2;
+        for (int ch = 0; ch < 2; ch++) {
+            float head = s[i * 2 + ch], tail = s[(frames - blend + i) * 2 + ch];
+            s[i * 2 + ch] = head * sinf(k) + tail * cosf(k);
+        }
+    }
+    s.resize((frames - blend) * 2);
+    std::lock_guard<std::mutex> guard(g_lock);
+    g_music = std::move(s);
+    g_music_pos = 0;
+}
+
+void UiMusicPlay(bool on)
+{
+    on = on && g_config.display.ui.menu_music;
+    if (on) {
+        UiMusicPrepare();
+    }
+    std::lock_guard<std::mutex> guard(g_lock);
+    g_music_target = on ? 1 : 0;
+    g_music_step = 1.0f / (kRate * (on ? 2.5f : 0.9f)); // Slow in, quicker out
+}
+
 // Called by the audio thread for each block it's about to output.
 extern "C" void xemu_ps5_ui_sound_mix(int16_t *buf, int frames)
 {
     std::lock_guard<std::mutex> guard(g_lock);
+    // The music, under everything.
+    size_t music_frames = g_music.size() / 2;
+    if (music_frames && (g_music_gain > 0 || g_music_target > 0)) {
+        const float music_gain = 0.2f;
+        for (int f = 0; f < frames; f++) {
+            if (g_music_gain < g_music_target) {
+                g_music_gain = std::min(g_music_gain + g_music_step,
+                                        g_music_target);
+            } else if (g_music_gain > g_music_target) {
+                g_music_gain = std::max(g_music_gain - g_music_step,
+                                        g_music_target);
+            }
+            float k = g_music_gain * g_music_gain * music_gain; // Eased
+            for (int ch = 0; ch < 2; ch++) {
+                int mixed = buf[f * 2 + ch] +
+                            (int)(g_music[g_music_pos * 2 + ch] * k * 32767);
+                buf[f * 2 + ch] = (int16_t)(mixed > 32767 ? 32767 :
+                                            mixed < -32768 ? -32768 : mixed);
+            }
+            if (++g_music_pos >= music_frames) {
+                g_music_pos = 0;
+            }
+        }
+    }
     const float gain = 0.32f; // Under the games: 60% down from 0.8
     for (Voice &v : g_voices) {
         if (!v.samples) {

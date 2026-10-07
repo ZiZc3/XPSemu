@@ -26,7 +26,7 @@ void InputManager::Update()
             if (iter->type != INPUT_DEVICE_SDL_GAMEPAD &&
                 iter->type != INPUT_DEVICE_PS5_PAD)
                 continue;
-            m_buttons |= iter->buttons;
+            m_buttons |= iter->buttons; // (The DualSense as remapped)
             // We simply take any axis that is >10 % activation
             for (int i = 0; i < CONTROLLER_AXIS__COUNT; i++) {
                 if ((iter->axis[i] > 3276) || (iter->axis[i] < -3276)) {

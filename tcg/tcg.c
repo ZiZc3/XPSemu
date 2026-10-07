@@ -2618,6 +2618,14 @@ bool tcg_op_supported(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_smax_vec:
     case INDEX_op_umax_vec:
         return has_type && TCG_TARGET_HAS_minmax_vec;
+    case INDEX_op_xps_sse_vec:
+    case INDEX_op_xps_sse_x2r:
+    case INDEX_op_xps_sse_r2x:
+#ifdef TCG_TARGET_HAS_xps_sse
+        return has_type && TCG_TARGET_HAS_xps_sse;
+#else
+        return false;
+#endif
     case INDEX_op_bitsel_vec:
         return has_type && TCG_TARGET_HAS_bitsel_vec;
     case INDEX_op_cmpsel_vec:

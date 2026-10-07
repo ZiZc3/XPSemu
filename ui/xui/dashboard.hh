@@ -15,6 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 #pragma once
+#include <map>
 #include <string>
 #include <vector>
 #include "scene.hh"
@@ -37,6 +38,11 @@ public:
 
     // True once shown by itself after the boot animation (see main.cc).
     bool m_auto_shown = false;
+    bool m_startup_show = false;
+
+    bool Visible() const { return m_visible; }
+    // The game running behind the dashboard, if any.
+    const Game *NowPlayingGame();
 
 protected:
     // The main menu: three pages, then the Xbox's own dashboard.
@@ -46,6 +52,11 @@ protected:
 
     bool m_visible = false;
     float m_alpha = 0;      // Fades in on Show, out on Hide
+    bool m_startup_fade = false;
+    float m_startup_fade_elapsed = 0;
+    float m_startup_black = 0;     // The screen going black before the fade
+    int m_startup_smooth = 0;      // Smooth frames in a row since Show
+    bool m_startup_settled = false; // The fade has started
     int m_page = PAGE_GAMES;
     bool m_in_page = false; // A page is open, or the main menu shows
     float m_page_anim = 0;  // 0 main menu .. 1 page, eased
@@ -68,9 +79,13 @@ protected:
     int m_gs_row = 0;
     std::string m_header = "Games"; // The page header's title (see there)
     // Its rows: the game options, then these.
+public: // (The rows' order is kGameRows, dashboard.cc)
     static const int GS_PATCHES = GO__COUNT;
-    static const int GS_RESET = GO__COUNT + 1;
-    static const int GS__COUNT = GO__COUNT + 2;
+    static const int GS_SHORTCUT = GO__COUNT + 1; // Home screen shortcut
+    static const int GS_RESET = GO__COUNT + 2;
+    static const int GS_NAME = GO__COUNT + 3;     // The game's own name
+    static const int GS__COUNT = GO__COUNT + 4;
+protected:
     // Its patches (every group of every .JMP file for it), and the list.
     struct PatchItem {
         const PatchFile *file;
@@ -89,11 +104,115 @@ protected:
     float m_shelf_focus = 0;  // 0 menu .. 1 shelf, eased
     int m_game = 0;
     float m_game_anim = 0;  // List scroll position, following m_game
+    float m_game_vel = 0;   // Its speed, springing towards m_game
+    int m_glint_game = -1;  // Selection the glint is for
+    float m_glint_start = 0; // When its glint starts (m_time)
+    ImVec2 m_sel0, m_sel1;   // The selected case's box on screen
+    float m_music_at = -1;   // When the music starts (after startup)
+    int m_covers_new = 0;    // Covers downloaded, not yet told
+    int m_settings_cat = -1; // Settings: the category open, or -1
+    int m_cat_sel = 0;       // Settings: the category selected
+    bool m_boot = false;     // The startup animation is playing
+    // The orb: leaning towards the focus and the stick, spinning when
+    // things move, rippling at each move, asleep when nothing happens.
+    float m_orb_lean_x = 0, m_orb_lean_y = 0;
+    float m_orb_phase[2] = { 0, 1.2f }; // Its rings' turn
+    float m_orb_spin = 0;               // Extra spin (dies away)
+    float m_orb_sleep = 0;              // 0 awake .. 1 asleep
+    float m_orb_ripple[4] = { -9, -9, -9, -9 }; // When they started
+    float m_orb_wake = -9;              // When it last woke
+    void OrbPoke(float strength);
+    // The Box Art Viewer (Square on a game).
+    bool m_view = false, m_view_closing = false;
+    float m_view_t = 0;                       // When it opened/closed
+    float m_view_yaw = 0, m_view_pitch = 0;    // Its turn
+    float m_view_vyaw = 0, m_view_vpitch = 0;  // Spinning
+    float m_view_zoom = 1, m_view_zoom_to = 1;
+    float m_view_flip_to = 0;                 // Turning to (yaw)
+    float m_view_e = 0;            // How far out of the row (0..1)
+    float m_view_shown_yaw = 0, m_view_shown_pitch = 0; // As drawn
+    float m_view_close_yaw = 0, m_view_close_pitch = 0; // Closing from
+    float m_view_land_yaw = 0;     // Closing to: straight
+    bool m_view_flipping = false;
+    ImVec2 m_view_from0, m_view_from1;        // The cover in the row
+    float m_sys_ask = -1; // System: until when "again to confirm" holds
+    void OpenViewer();
+    void ViewerInput(bool accept, bool back, bool options, bool left,
+                     bool right);
+    void DrawViewer(float s, float a);
+    bool ViewerLoading();
+    void QuitApp(bool restart);
+    // Controller setup (Settings > Controller).
+    bool m_pad_page = false, m_pad_capture = false, m_pad_released = false;
+    int m_pad_sel = 0;
+    float m_pad_capture_t = 0, m_pad_done_t = -9;
+    void PadInput(bool accept, bool left, bool right, bool up, bool down,
+                  bool options);
+    void PadCapture();
+    void DrawPadPage(float s, float a);
+    // Home screen shortcuts: this game's (its folder, or ""), and the
+    // disc to start at once when XPSemu runs as one.
+    std::string m_gs_shortcut, m_autolaunch;
+    void ToggleShortcut(const Game &game);
+    // Renaming a game: the on-screen keyboard.
+    bool m_kb_open = false, m_kb_shift = false;
+    std::string m_kb_text;
+    int m_kb_row = 0, m_kb_col = 0;
+    void OpenNameEditor();
+    void KeyboardInput(bool accept, bool back, bool square, bool options,
+                       bool up, bool down, bool left, bool right);
+    void DrawKeyboard(float s, float a);
+    // The Patch Store (a game's patches) and Settings > Patches.
+    struct StoreItem {
+        int index;       // In kPatchCatalog
+        int state;       // StoreState
+        std::string why;
+    };
+    std::vector<StoreItem> m_store;
+    struct AllPatchRow {
+        std::string path, game_name, key;
+        const PatchFile *file;
+        int group;
+    };
+    std::vector<AllPatchRow> m_all_patches;
+    int m_all_row = 0;
+    bool m_all_page = false;
+    std::map<std::string, bool> m_patch_active; // The green dot, by path
+    int m_badge_next = -1;
+    void BuildPatchItems();
+    void StoreOpen();
+    void StorePoll();
+    void StoreGet(int row);
+    void StoreRemove(const PatchFile &file);
+    void RefreshPatchBadges();
+    void PatchBadgeStep();
+    void OpenAllPatches();
+    void AllPatchesInput(bool accept, bool left, bool right, bool up,
+                         bool down);
+    void DrawAllPatches(float s, float a);
+    float m_boot_t = 0;
+    void DrawBoot(float s);
+    bool m_covers_told_offline = false;
+    void RequestMissingCovers();
+    float m_eject_ask = -1;  // Until when "press again to eject" holds
 
     int m_setting = 0;
     bool m_advanced = false; // Settings shows its Advanced list
     int m_adv_setting = 0;
     bool m_restart_needed = false; // An advanced setting applies next start
+    bool m_np_focus = false;   // Now Playing has the focus (Up from Games)
+    float m_back_hold = 0;     // Circle held: quick resume at 0.6 s
+    bool m_setup = false;      // First run: Xbox files missing
+    // Attract mode: after two idle minutes, the games' covers, slowly.
+    float m_idle = 0;
+    bool m_attract = false;
+    float m_attract_alpha = 0;
+    float m_attract_t = 0;
+    std::vector<int> m_attract_games;
+    bool m_setup_ok = false;   // ...and now all there (restart to use them)
+    float m_setup_next = 0;    // When to look for the files again
+    std::string m_games_sig;   // The games folders as last scanned
+    float m_games_next = 0;    // When to look at them again
     int m_system_row = 0;
 
     // The emulated Xbox is paused while the dashboard shows.
@@ -102,6 +221,7 @@ protected:
     // return to it (at first there's only this dashboard).
     bool m_can_return = false;
     bool m_game_started = false; // Since the Xbox dashboard last started
+    std::string m_now_playing_path;
 
     uint32_t m_prev_buttons = 0;
     float m_time = 0;
@@ -111,13 +231,14 @@ protected:
     void HandleInputInner();
     void ChangeSetting(int step);
     void ChangeAdvanced(int step);
-    void Launch(const Game &game);
+    void Launch(const Game &game, bool quiet = false);
     void LoadRecent();
     void OpenGameSettings(const Game &game, bool from_shelf);
     void ChangeGameSetting(int step);
     void AddRecent(const std::string &path);
     std::vector<const Game *> RecentGames();
     void OpenXboxDashboard();
+    void StopGame(const char *why);
     void WatchLaunch(const Game &game, const std::vector<std::string> &applied,
                      const std::string &log);
     void WatchStop();
@@ -132,6 +253,8 @@ protected:
     void DrawBackground(float s);
     void DrawOrb(float cx, float cy, float r);
     void DrawMainMenu(float s, float a);
+    void DrawNowPlaying(float s, float a, float x, float w,
+                        float bottom);
     void DrawShelf(float s, float a, float x0, float y0);
     void DrawTitle(float s, float a, ImVec2 pos);
     void DrawGameSettings(float s, float a);
@@ -145,13 +268,24 @@ protected:
                      bool cover);
     void DrawSystem(float s, float a);
     void DrawHints(float s);
+    void DrawStatus(float s);
+    void DrawSetup(float s, float a);
+    void DrawAttract(float s, float a);
+    bool UpdateAttract(float dt); // True while it has the screen
 };
+
+// True when the Xbox files XPSemu needs aren't all there (first run).
+bool DashboardSetupNeeded();
 
 extern DashboardScene g_dashboard;
 
 // The performance overlay over the game (Settings > Performance overlay),
 // drawn every frame by the UI.
 void DrawPerfOverlay();
+// Over the Xbox's boot after a game is launched, until the game runs.
+void DrawLaunchCurtain();
+// Side art beside a 4:3 game whose picture is g0..g1 (vk-helpers.cc).
+void DrawBladeSides(ImDrawList *dl, ImVec2 g0, ImVec2 g1);
 
 // Every frame, dashboard shown or not: counts play time.
 void DashboardTick();

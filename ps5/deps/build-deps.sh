@@ -150,15 +150,31 @@ build_libpcap() {
     cd "$here"
 }
 
+build_mbedtls() {
+    # TLS for curl (XPSemu's cover downloads are HTTPS only).
+    local v=3.6.4
+    [[ -f $prefix/lib/libmbedtls.a ]] && return
+    [[ -d $src/mbedtls-$v ]] ||
+        curl -sL "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-$v/mbedtls-$v.tar.bz2" |
+        tar -xj -C "$src"
+    make -C "$src/mbedtls-$v/library" -j"$(nproc)" CC="$sdk/bin/prospero-clang" \
+        AR="$sdk/bin/prospero-ar" CFLAGS="-O2" static
+    mkdir -p "$prefix/include" "$prefix/lib"
+    cp -r "$src/mbedtls-$v/include/mbedtls" "$src/mbedtls-$v/include/psa" "$prefix/include/"
+    cp "$src/mbedtls-$v/library/"lib{mbedtls,mbedx509,mbedcrypto}.a "$prefix/lib/"
+}
+
 build_curl() {
-    # HTTP only for now (update checks, compat reports); TLS can come later.
+    # HTTP and HTTPS (mbedTLS: build_mbedtls first); certificates are given
+    # by the caller (CURLOPT_CAINFO_BLOB), there's no system store.
     local v=8.16.0
     [[ -f $prefix/lib/libcurl.a ]] && return
     fetch "https://curl.se/download/curl-$v.tar.xz" "curl-$v"
     mkdir -p "$src/build-curl" && cd "$src/build-curl"
     CC="$sdk/bin/prospero-clang" AR="$sdk/bin/prospero-ar" RANLIB="$sdk/bin/prospero-ranlib"     CPPFLAGS="-I$prefix/include" LDFLAGS="-L$prefix/lib" LIBS="-lps5compat" \
         "$src/curl-$v/configure" --host=x86_64-pc-freebsd --prefix="$prefix" \
-        --disable-shared --enable-static --without-ssl --without-libpsl --without-brotli \
+        --disable-shared --enable-static --with-mbedtls="$prefix" \
+        --without-ca-bundle --without-ca-path --without-libpsl --without-brotli \
         --without-zstd --without-nghttp2 --without-libidn2 --without-librtmp --disable-ldap \
         --disable-docs --disable-manual --disable-threaded-resolver --with-zlib="$prefix"
     make -j"$(nproc)" -C lib && make -C lib install && make -C include install && make install-pkgconfigDATA

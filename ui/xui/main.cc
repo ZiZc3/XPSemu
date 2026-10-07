@@ -317,9 +317,14 @@ void xemu_hud_update(void)
     bool guide_pressed = guide_down && !guide_was_down;
     guide_was_down = guide_down;
     if (!g_scene_mgr.IsDisplayingScene()) {
-        if (!g_dashboard.m_auto_shown && !booted_with_disc &&
-            ImGui::GetTime() - started > 0.5) { // The Xbox is off (-S)
+        // Xbox files missing: the first-run checklist, straight away.
+        static bool need_setup = DashboardSetupNeeded();
+        double startup_delay = need_setup ? 0.3 :
+                               g_config.general.skip_boot_anim ? 0.5 : 8.0;
+        if (!g_dashboard.m_auto_shown && (!booted_with_disc || need_setup) &&
+            ImGui::GetTime() - started > startup_delay) {
             g_dashboard.m_auto_shown = true;
+            g_dashboard.m_startup_show = true;
             g_scene_mgr.PushScene(g_dashboard);
         } else if (guide_pressed) {
             g_scene_mgr.PushScene(g_dashboard);
@@ -377,6 +382,7 @@ void xemu_hud_update(void)
     g_scene_mgr.Draw();
 #ifdef __PROSPERO__
     DashboardTick();
+    DrawLaunchCurtain();
     DrawPerfOverlay();
 #endif
     if (!first_boot_window.is_open) notification_manager.Draw();

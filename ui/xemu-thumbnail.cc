@@ -33,6 +33,12 @@ void xemu_snapshots_set_framebuffer_texture(XemuTexture tex, bool flip)
     display_flip = flip;
 }
 
+XemuTexture xemu_snapshots_get_framebuffer_texture(bool *flip)
+{
+    *flip = display_flip;
+    return display_tex;
+}
+
 XemuTexture xemu_snapshots_load_png_to_texture(void *buf, size_t size)
 {
     std::vector<uint8_t> pixels;

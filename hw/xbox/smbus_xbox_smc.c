@@ -347,6 +347,13 @@ void xbox_smc_eject_button(void)
     xbox_assert_extsmi();
 }
 
+void xbox_smc_set_short_animation(void)
+{
+    Object *obj = object_resolve_path_type("", TYPE_XBOX_SMC, NULL);
+    SMBusSMCDevice *smc = XBOX_SMC(obj);
+    smc->scratch_reg |= SMC_REG_SCRATCH_SHORT_ANIMATION;
+}
+
 // FIXME: Ideally this would be called on a tray state change callback (see
 // tray_moved event), for now it's called explicitly from UI upon user
 // interaction.

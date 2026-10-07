@@ -18,6 +18,7 @@ native=$vk/tooling/native
 tool=$vk/build/host/ps5-native-tool
 param=$here/sce_sys/param.json
 work=$build/title
+python3 "$here/embed-default-config.py"
 
 for file in "$build/qemu-system-i386.rsp" "$archive" "$tool" "$param" "$sdk_root/bin/prospero-lld"; do
     [[ -e $file ]] || { echo "missing $file" >&2; exit 2; }
@@ -67,6 +68,12 @@ for item in "${objects[@]}"; do
     fi
 done
 
+# TLS for curl (ps5/deps build_mbedtls): curl's static library needs it,
+# and meson's link line names only libcurl.a.
+for lib in mbedtls mbedx509 mbedcrypto; do
+    xemu_inputs+=("$here/deps/prefix/lib/lib$lib.a")
+done
+
 cc -std=c++20 -O2 -fno-exceptions -fno-rtti -c "$native/app_crt.cpp" -o "$work/obj/app_crt.o"
 cc -std=c++20 -O2 -fno-exceptions -fno-rtti -c "$native/app_cpp_runtime.cpp" -o "$work/obj/app_cpp_runtime.o"
 
@@ -94,7 +101,7 @@ radv_link_flags+=(--wrap=getcontext --wrap=makecontext --wrap=swapcontext)
 # 0: xemu's import report found these), bound to ps5/compat/libc_missing.c and
 # kept local so the title doesn't export libc's names (as radv-link.sh does).
 missing_libc=(mkstemp isatty umask pathconf fnmatch getnameinfo gai_strerror
-    gethostbyname fork vfork setsid chroot symlink link readlink)
+    gethostbyname fork vfork setsid chroot symlink link readlink setbuf)
 {
     printf '{\n    local:\n'
     for name in "${missing_libc[@]}"; do

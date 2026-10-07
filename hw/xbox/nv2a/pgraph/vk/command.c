@@ -58,6 +58,11 @@ static void create_command_buffers(PGRAPHState *pg)
 
     r->command_buffer = r->command_buffers[0];
     r->aux_command_buffer = r->command_buffers[1];
+
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+    };
+    VK_CHECK(vkCreateFence(r->device, &fence_info, NULL, &r->aux_fence));
 }
 
 static void destroy_command_buffers(PGRAPHState *pg)
@@ -66,9 +71,37 @@ static void destroy_command_buffers(PGRAPHState *pg)
 
     vkFreeCommandBuffers(r->device, r->command_pool,
                          ARRAY_SIZE(r->command_buffers), r->command_buffers);
+    vkDestroyFence(r->device, r->aux_fence, NULL);
+    r->aux_fence = VK_NULL_HANDLE;
 
     r->command_buffer = VK_NULL_HANDLE;
     r->aux_command_buffer = VK_NULL_HANDLE;
+}
+
+/*
+ * XPSemu: the PS5's Vulkan driver has no GPU-done interrupt: its waits poll
+ * for 1.5 ms, then sleep in 1 ms steps, so a wait for work that takes 2 ms
+ * can cost 3. The GPU thread has a core of its own (pinned), so it keeps
+ * polling here instead, up to 50 ms; the driver's wait after it then
+ * returns at once. Other threads (the UI) share cores: no polling there.
+ */
+void pgraph_vk_poll_fence(PGRAPHState *pg, VkFence fence)
+{
+#ifdef __PROSPERO__
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    NV2AState *d = container_of(pg, NV2AState, pgraph);
+
+    if (!qemu_thread_is_self(&d->pfifo.thread)) {
+        return;
+    }
+    int64_t until = get_clock() + 50 * SCALE_MS;
+    while (vkGetFenceStatus(r->device, fence) == VK_NOT_READY &&
+           get_clock() < until) {
+        for (int i = 0; i < 32; i++) {
+            __builtin_ia32_pause();
+        }
+    }
+#endif
 }
 
 VkCommandBuffer pgraph_vk_begin_single_time_commands(PGRAPHState *pg)
@@ -102,9 +135,11 @@ void pgraph_vk_end_single_time_commands(PGRAPHState *pg, VkCommandBuffer cmd)
     };
     uint64_t xt_aux = xemu_timing_now();
     qemu_mutex_lock(&r->queue_lock);
-    VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueSubmit(r->queue, 1, &submit_info, r->aux_fence));
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_AUX);
+    pgraph_vk_poll_fence(pg, r->aux_fence);
     VK_CHECK(vkQueueWaitIdle(r->queue));
+    VK_CHECK(vkResetFences(r->device, 1, &r->aux_fence));
     qemu_mutex_unlock(&r->queue_lock);
     xemu_timing_add(XT_AUX_WAIT, xt_aux);
 
