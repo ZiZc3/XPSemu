@@ -33,7 +33,6 @@
 - [Installation](#installation)
 - [Folder layout on the PS5](#folder-layout-on-the-ps5)
 - [Controls](#controls)
-- [Using the dashboard](#using-the-dashboard)
 - [Game patches](#game-patches)
 - [Performance notes](#performance-notes)
 - [Logs and reporting problems](#logs-and-reporting-problems)
