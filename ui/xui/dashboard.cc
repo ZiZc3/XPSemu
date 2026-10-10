@@ -51,6 +51,7 @@
 #include "../../xemu-xbe.h"
 #include "../xemu-snapshots.h"
 #include "../../hw/xbox/xemu-eeprom.h"
+#include "../../hw/xbox/xemu-save-repair.h"
 #include "../xemu-input.h"
 #include "../xemu-settings.h"
 #include "xemu-version.h"
@@ -1626,6 +1627,10 @@ bool DashboardScene::IsAnimating()
 
 void DashboardScene::Close()
 {
+    if (m_park.active) {
+        UiSoundPlay(UI_SOUND_ERROR); // The game is being stopped
+        return;
+    }
     if (m_can_return) {
         UiSoundPlay(UI_SOUND_BACK);
         Hide();
@@ -1640,6 +1645,12 @@ static void CurtainFrom(ImVec2 p0, ImVec2 p1);
 static void SetXboxVideoFor(bool patch_720p, bool widescreen); // Below
 
 void DashboardScene::Launch(const Game &game, bool quiet)
+{
+    Game copy = game; // The list may change meanwhile
+    ParkThen([this, copy, quiet]() { LaunchNow(copy, quiet); });
+}
+
+void DashboardScene::LaunchNow(const Game &game, bool quiet)
 {
     ActionLoadDiscFile(game.path.c_str());
     m_now_playing_path = game.path;
@@ -1688,6 +1699,15 @@ void DashboardScene::Launch(const Game &game, bool quiet)
                    game.title_id, game.full_disc, overrides, patches });
     if (!quiet) {
         UiSoundPlay(UI_SOUND_LAUNCH);
+    }
+    // Saves cut off while being made (by a crash, or by an older XPSemu
+    // resetting the Xbox) keep the game from saving at all; they go first,
+    // with the Xbox stopped.
+    if (runstate_is_running()) {
+        vm_stop(RUN_STATE_PAUSED);
+    }
+    if (game.title_id) {
+        xemu_repair_saves(game.title_id);
     }
     // Keep game boots quick after the Xbox starts the title.
     xbox_smc_set_short_animation();
@@ -1772,6 +1792,7 @@ static struct {
 //
 
 extern "C" float g_xemu_apu_ui_gain; // hw/xbox/mcpx/apu/monitor.c
+extern "C" bool g_xemu_ui_hold_frame; // ui/xemu.c
 
 // A card in 3D: the corners (tl, tr, br, bl) of a w x h card around c,
 // turned by ry about its upright axis and rx about its level one, then
@@ -2076,13 +2097,20 @@ void DashboardScene::OpenXboxDashboard()
     // that's what's running already (no game since XPSemu started), just
     // carry on with it.
     const char *dvd = g_config.sys.files.dvd_path;
+    auto open = [this]() {
+        UiSoundPlay(UI_SOUND_LAUNCH);
+        m_can_return = true;
+        m_paused_vm = true; // Hide starts it (it may never have run)
+        Hide();
+    };
     if (m_game_started || (dvd && dvd[0])) {
-        StopGame("back to the Xbox dashboard");
+        ParkThen([this, open]() {
+            StopGameNow("back to the Xbox dashboard");
+            open();
+        });
+    } else {
+        open();
     }
-    UiSoundPlay(UI_SOUND_LAUNCH);
-    m_can_return = true;
-    m_paused_vm = true; // Hide starts it (it may never have run)
-    Hide();
 }
 
 // Ends the running game: the disc comes out, the Xbox restarts into its
@@ -2095,7 +2123,274 @@ extern "C" int xemu_ps5_import_ok(const char *name);
 // opened again) or leaving it, as VLC-PS5 does: the system loads our eboot
 // again, or "exit". A running game ends properly first (its play time and
 // log saved).
+#if XPSEMU_DEV
+// ---------------------------------------------------------------------------
+// Dev builds (ui/xpsemu-dev.h): the stress test and the stability report.
+//
+// The stress test plays every game in turn, a few minutes each, with the
+// button bot (ui/xemu-dev-ps5.c) at the pad, going from one to the next the
+// way a player does: the dashboard comes up, the next game starts. It keeps
+// going after a crash (the crash handler starts XPSemu again) and when
+// XPSemu is opened again by hand. Opening the dashboard pauses it; System >
+// Stop ends it. Everything that happens goes into the journal.
+// ---------------------------------------------------------------------------
+#include "dev-report.hh"
+#include "../xemu-dev-ps5.h"
+#include <atomic>
+#include <thread>
+
+static const int kStressMinutes[] = { 3, 5, 10, 20, 30 };
+
+static struct {
+    bool on = false;
+    int minutes = 5;
+    int next = 0;             // The game to play next (index in the list)
+    float clock = 0;          // Seconds since XPSemu started
+    float game_time = 0;      // This game's play so far
+    float frames_at = 0;      // A new frame was last seen
+    unsigned int frames = 0;
+    float next_at = -1;       // The stress test opened the dashboard: next game then
+    bool resumed = false;     // The saved state was read at startup
+    std::string playing;      // The game it started
+    float hb = 0;             // The journal's minute heartbeat
+    unsigned int hb_frames = 0;
+    DevReport report;
+    float report_at = -100;
+} g_stress;
+
+static std::atomic<unsigned int> g_dev_alive{ 0 };
+
+static const char *StressFile()
+{
+    return XEMU_DEV_DIR "/stress.txt";
+}
+
+static void StressSave()
+{
+    FILE *f = fopen(StressFile(), "w");
+    if (f) {
+        fprintf(f, "%d %d %d\n", g_stress.on ? 1 : 0, g_stress.minutes,
+                g_stress.next);
+        fclose(f);
+    }
+}
+
+static void StressLoad()
+{
+    FILE *f = fopen(StressFile(), "r");
+    int on = 0, minutes = 5, next = 0;
+    if (f) {
+        if (fscanf(f, "%d %d %d", &on, &minutes, &next) != 3) {
+            on = 0;
+        }
+        fclose(f);
+    }
+    g_stress.on = on != 0;
+    g_stress.minutes = minutes > 0 ? minutes : 5;
+    g_stress.next = next >= 0 ? next : 0;
+}
+
+// The UI thread hangs (nothing draws for 45 s): journal it and start again.
+static void StressWatchdog()
+{
+    unsigned int seen = g_dev_alive.load();
+    int still = 0;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        unsigned int now = g_dev_alive.load();
+        still = now == seen ? still + 1 : 0;
+        seen = now;
+        if (still == 45 && xemu_dev_stress_on) {
+            xemu_dev_journal('W', "UI stopped for 45 s");
+            fprintf(stderr, "XPSemu: stress test: the UI stopped, starting again\n");
+            sceSystemServiceLoadExec("/app0/eboot.bin", NULL);
+            sceSystemServiceLoadExec("/data/homebrew/PPSA97358/eboot.bin", NULL);
+        }
+    }
+}
+
+static void DevStressButton(bool start_stop)
+{
+    if (start_stop) {
+        g_stress.on = !g_stress.on;
+        xemu_dev_stress_on = g_stress.on;
+        if (!g_stress.on) {
+            g_stress.next_at = -1;
+            xemu_dev_bot_on = 0;
+        }
+        UiSoundPlay(UI_SOUND_SELECT);
+    } else {
+        int n = sizeof(kStressMinutes) / sizeof(kStressMinutes[0]), i = 0;
+        while (i < n && kStressMinutes[i] != g_stress.minutes) {
+            i++;
+        }
+        g_stress.minutes = kStressMinutes[(i + 1) % n];
+        UiSoundPlay(UI_SOUND_CHANGE);
+    }
+    StressSave();
+}
+
+void DashboardScene::DevStressLaunchNext()
+{
+    if (m_games.empty()) {
+        xemu_queue_notification("Stress test: no games to play");
+        g_stress.on = false;
+        xemu_dev_stress_on = 0;
+        StressSave();
+        return;
+    }
+    int index = g_stress.next % (int)m_games.size();
+    g_stress.next = index + 1; // Saved first: a crash goes on with the next
+    StressSave();
+    g_stress.game_time = 0;
+    g_stress.frames_at = g_stress.clock;
+    g_stress.frames = g_nv2a_stats.frame_count;
+    g_stress.playing = m_games[index].name;
+    fprintf(stderr, "XPSemu: stress test: game %d of %d, %s\n", index + 1,
+            (int)m_games.size(), m_games[index].name.c_str());
+    Launch(m_games[index], true);
+}
+
+void DashboardScene::DevStressStep(float dt)
+{
+    g_stress.clock += dt;
+    g_dev_alive.fetch_add(1);
+
+    // Every dev build: a heartbeat a minute while a game plays.
+    bool running = m_game_started && runstate_is_running();
+    if (running) {
+        g_stress.hb += dt;
+        if (g_stress.hb >= 60) {
+            xemu_dev_journal('H', "%.0f",
+                             (g_nv2a_stats.frame_count - g_stress.hb_frames) /
+                                 g_stress.hb);
+            g_stress.hb = 0;
+            g_stress.hb_frames = g_nv2a_stats.frame_count;
+        }
+    } else {
+        g_stress.hb = 0;
+        g_stress.hb_frames = g_nv2a_stats.frame_count;
+    }
+
+    // At startup, once the dashboard is up: a stress test still on goes on.
+    if (!g_stress.resumed && m_visible && !m_boot && !m_setup &&
+        g_stress.clock > 3) {
+        g_stress.resumed = true;
+        StressLoad();
+        xemu_dev_stress_on = g_stress.on;
+        if (g_stress.on) {
+            xemu_queue_notification("Stress test goes on (System > Stop)");
+            g_stress.next_at = g_stress.clock + 4;
+        }
+    }
+    if (g_stress.on) {
+        static bool watchdog_started;
+        if (!watchdog_started) {
+            watchdog_started = true;
+            std::thread(StressWatchdog).detach();
+        }
+    }
+
+    bool playing = g_stress.on && m_game_started && !m_visible &&
+                   !g_curtain.active && runstate_is_running();
+    xemu_dev_bot_on = playing;
+    if (!g_stress.on) {
+        return;
+    }
+
+    if (playing) {
+        g_stress.game_time += dt;
+        if (g_nv2a_stats.frame_count != g_stress.frames) {
+            g_stress.frames = g_nv2a_stats.frame_count;
+            g_stress.frames_at = g_stress.clock;
+        } else if (g_stress.clock - g_stress.frames_at > 60) {
+            xemu_dev_journal('F', "60");
+            GameLogNote("stress test: no new frame for 60 s, next game");
+            g_stress.game_time = g_stress.minutes * 60.0f; // Next one
+        }
+        if (g_stress.game_time >= g_stress.minutes * 60.0f) {
+            Show(); // As a player does: the dashboard, then the next game
+            g_stress.next_at = g_stress.clock + 2;
+        }
+    } else {
+        g_stress.frames_at = g_stress.clock; // Paused, loading: not frozen
+    }
+
+    if (g_stress.next_at >= 0 && m_visible && !m_boot && !m_setup &&
+        g_stress.clock >= g_stress.next_at) {
+        g_stress.next_at = -1;
+        DevStressLaunchNext();
+    }
+}
+
+void DashboardScene::DrawDev(float s, float a, float x, float y, float ay2)
+{
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImFont *font = g_font_mgr.m_menu_font_medium;
+    ImFont *small = g_font_mgr.m_menu_font_small;
+
+    // The second row: the stress test, its minutes per game.
+    char minutes[48];
+    snprintf(minutes, sizeof(minutes), "%d minutes a game", g_stress.minutes);
+    const char *labels[] = { g_stress.on ? "Stop stress test" : "Stress test",
+                             minutes };
+    float w = 440 * s, h = 84 * s, gap = 470 * s;
+    for (int i = 0; i < 2; i++) {
+        float bx = x + i * gap;
+        bool selected = m_system_row == 2 + i;
+        Bar(dl, ImVec2(bx, ay2), ImVec2(bx + w, ay2 + h), s, selected, a);
+        ImVec2 ts = TextSize(font, 40 * s, labels[i]);
+        Text(dl, font, 40 * s, ImVec2(bx + (w - ts.x) / 2, ay2 + 20 * s),
+             selected ? Ink(a) : Label(a), labels[i]);
+    }
+
+    // The report, on the right, read again every 10 s.
+    if (g_stress.clock - g_stress.report_at > 10) {
+        g_stress.report_at = g_stress.clock;
+        g_stress.report = DevReportBuild();
+    }
+    std::vector<std::string> lines;
+    lines.push_back(std::string("DEV build ") +
+                    (xemu_dev_build()[0] ? xemu_dev_build() : "?"));
+    char status[160];
+    if (!g_stress.on) {
+        snprintf(status, sizeof(status), "Stress test off");
+    } else if (g_stress.next_at >= 0) {
+        snprintf(status, sizeof(status), "Stress test: next game...");
+    } else if (m_game_started) {
+        int left = std::max(0, (int)(g_stress.minutes * 60 - g_stress.game_time));
+        snprintf(status, sizeof(status), "Stress test paused here: %s, %d:%02d left",
+                 g_stress.playing.c_str(), left / 60, left % 60);
+    } else {
+        snprintf(status, sizeof(status), "Stress test on");
+    }
+    lines.push_back(status);
+    lines.push_back("");
+    for (const auto &l : g_stress.report.summary) {
+        lines.push_back(l);
+    }
+    lines.push_back("");
+    lines.push_back("Full report: /data/xemu/dev/report.txt");
+
+    float px = x + 960 * s, py = y, size = 28 * s, line = 40 * s;
+    float maxw = 1880 * s - px;
+    for (size_t i = 0; i < lines.size(); i++) {
+        std::string t = lines[i];
+        while (t.size() > 4 && TextSize(small, size, t.c_str()).x > maxw) {
+            t = t.substr(0, t.size() - 4) + "...";
+        }
+        Text(dl, small, size, ImVec2(px, py + i * line),
+             i == 0 ? Lime(a) : i == 3 ? White(a) : White(a * 0.8f), t.c_str());
+    }
+}
+#endif // XPSEMU_DEV
+
 void DashboardScene::QuitApp(bool restart)
+{
+    ParkThen([this, restart]() { QuitAppNow(restart); });
+}
+
+void DashboardScene::QuitAppNow(bool restart)
 {
     if (m_game_started) {
         GameStop();
@@ -2108,6 +2403,9 @@ void DashboardScene::QuitApp(bool restart)
         ShadowMountScan(); // Again, so nothing waits for its next round
     }
     fprintf(stderr, "XPSemu: %s\n", restart ? "restarting" : "exiting");
+#if XPSEMU_DEV
+    xemu_dev_journal('Q', "%s", restart ? "restart" : "exit");
+#endif
     fflush(NULL);
     if (!xemu_ps5_import_ok("sceSystemServiceLoadExec")) {
         fprintf(stderr, "XPSemu: no sceSystemServiceLoadExec\n");
@@ -2127,6 +2425,91 @@ void DashboardScene::QuitApp(bool restart)
 }
 
 void DashboardScene::StopGame(const char *why)
+{
+    std::string reason = why;
+    ParkThen([this, reason]() { StopGameNow(reason.c_str()); });
+}
+
+void DashboardScene::ParkThen(std::function<void()> next)
+{
+    if (m_park.active) {
+        // Each of these ends the game: the newest one is what's wanted
+        // (Eject and then a game: that game).
+        m_park.next = std::move(next);
+        return;
+    }
+    if (!m_game_started) {
+        next();
+        return;
+    }
+    m_park.active = true;
+    m_park.done = false;
+    m_np_focus = false;
+    __atomic_store_n(&g_xemu_ui_hold_frame, true, __ATOMIC_RELAXED);
+    m_park.next = std::move(next);
+    m_park.start = m_park.last_write = ImGui::GetTime();
+    m_park.writes = xemu_hdd_write_count();
+    m_park.gain = g_xemu_apu_ui_gain;
+    g_xemu_apu_ui_gain = 0; // Not heard: this dashboard stays on top
+    if (!runstate_is_running()) {
+        vm_start();
+    }
+}
+
+void DashboardScene::ParkTick()
+{
+    if (!m_park.active) {
+        return;
+    }
+    double now = ImGui::GetTime();
+    const double finish = 0.35; // The burn's last part, once written
+    if (!m_park.done) {
+        uint64_t writes = xemu_hdd_write_count();
+        if (writes != m_park.writes) {
+            m_park.writes = writes;
+            m_park.last_write = now;
+        }
+        // Quiet for a second (and at least 1.2 s in all), or 6 s at most.
+        double ran = now - m_park.start;
+        if (!(ran >= 1.2 && now - m_park.last_write >= 1.0) && ran < 6.0) {
+            return;
+        }
+        m_park.p_done = BurnAt(now);
+        m_park.done = true;
+        m_park.done_at = now;
+        if (runstate_is_running()) {
+            vm_stop(RUN_STATE_PAUSED);
+        }
+        g_xemu_apu_ui_gain = m_park.gain;
+        fprintf(stderr, "XPSemu: the Xbox finished writing (%.1f s)\n", ran);
+        return;
+    }
+    if (now - m_park.done_at < finish) {
+        return;
+    }
+    m_park.active = false;
+    m_park.ash_until = now + 1.3; // The embers still in the air
+    __atomic_store_n(&g_xemu_ui_hold_frame, false, __ATOMIC_RELAXED);
+    std::function<void()> next = std::move(m_park.next);
+    m_park.next = nullptr;
+    next();
+}
+
+// How far the Now Playing bar has burnt (0 to 1) at a moment of the wait:
+// most of the way while the Xbox writes, slowing at the edge as it
+// smoulders, then the rest once it's done.
+float DashboardScene::BurnAt(double when) const
+{
+    double t = when - m_park.start;
+    if (!m_park.done || when < m_park.done_at) {
+        return t <= 0 ? 0 : 0.82f * (1 - expf(-(float)t * 1.8f));
+    }
+    float k = std::min((float)((when - m_park.done_at) / 0.35), 1.0f);
+    k = k * k * (3 - 2 * k);
+    return m_park.p_done + (1 - m_park.p_done) * k;
+}
+
+void DashboardScene::StopGameNow(const char *why)
 {
     const char *dvd = g_config.sys.files.dvd_path;
     if (dvd && dvd[0]) {
@@ -2159,11 +2542,12 @@ enum SettingRow {
     SR_COVERS,
     SR_BOOT,
     SR_XBOX_BOOT,
+    SR_LANGUAGE,
     SR__COUNT
 };
 static const int kSettingOptions[SR__COUNT] = {
     GO_SCALE,  GO_ASPECT, GO_FIT, GO_FILTER, -1,
-    GO_VOLUME, -1,        -1,     GO_OVERLAY, -1, -1, -1,
+    GO_VOLUME, -1,        -1,     GO_OVERLAY, -1, -1, -1, -1,
 };
 
 // Settings comes in categories, each a page of its rows; Advanced is its
@@ -2178,9 +2562,9 @@ static const struct {
       { SR_SCALE, SR_ASPECT, SR_FIT, SR_FILTER, SR_SIDES }, 5 },
     { "Sound", "How loud the games are, the menu sounds and the music.",
       { SR_VOLUME, SR_SOUNDS, SR_MUSIC }, 3 },
-    { "Interface", "The performance overlay, cover downloads, and the XPSemu "
-                   "and original Xbox startups.",
-      { SR_OVERLAY, SR_COVERS, SR_BOOT, SR_XBOX_BOOT }, 4 },
+    { "Interface", "The performance overlay, cover downloads, the XPSemu "
+                   "and original Xbox startups, and the games' language.",
+      { SR_OVERLAY, SR_COVERS, SR_BOOT, SR_XBOX_BOOT, SR_LANGUAGE }, 5 },
     { "Controller", "Your own button layout.", {}, 0 },
     { "Patches", "Every patch in use that works for one of your games, to "
                  "turn on or off.", {}, 0 },
@@ -2188,8 +2572,38 @@ static const struct {
       {}, 0 },
 };
 
+// The Xbox's languages (XC_LANGUAGE_*), in the order the setting steps
+static const struct {
+    uint32_t id;
+    const char *name;
+} kLanguages[] = {
+    { 1, "English" }, { 5, "Spanish" },    { 4, "French" },
+    { 3, "German" },  { 6, "Italian" },    { 9, "Portuguese" },
+    { 2, "Japanese" }, { 7, "Korean" },    { 8, "Chinese" },
+};
+
+static int LanguageIndex()
+{
+    uint32_t id = 1;
+    xemu_eeprom_get_language(&id);
+    for (int i = 0; i < (int)std::size(kLanguages); i++) {
+        if (kLanguages[i].id == id) {
+            return i;
+        }
+    }
+    return 0;
+}
+
 void DashboardScene::ChangeSetting(int step)
 {
+    if (m_setting == SR_LANGUAGE) {
+        int n = (int)std::size(kLanguages);
+        int i = (LanguageIndex() + (step < 0 ? n - 1 : 1)) % n;
+        // The UI holds the machine lock here
+        bool ok = xemu_eeprom_set_language(kLanguages[i].id);
+        UiSoundPlay(ok ? UI_SOUND_CHANGE : UI_SOUND_ERROR);
+        return;
+    }
     if (m_setting == SR_SOUNDS) {
         g_config.display.ui.menu_sounds = !g_config.display.ui.menu_sounds;
         xemu_settings_save();
@@ -2964,7 +3378,7 @@ void DashboardScene::HandleInputInner()
 
     // Square ends the running game (asks once more first): the disc comes
     // out and the Xbox goes back to its dashboard, as System > Eject does.
-    if (!m_in_page && square && NowPlayingGame()) {
+    if (!m_in_page && square && NowPlayingGame() && !m_park.active) {
         if (m_time < m_eject_ask) {
             m_eject_ask = -1;
             StopGame("ejected from the dashboard");
@@ -2980,7 +3394,7 @@ void DashboardScene::HandleInputInner()
     }
 
     if (!m_in_page && m_np_focus) { // Now Playing, above the menu
-        if (!NowPlayingGame() || down) {
+        if (!NowPlayingGame() || down || m_park.active) {
             m_np_focus = false;
         } else if (accept || back) {
             Close();
@@ -3006,7 +3420,7 @@ void DashboardScene::HandleInputInner()
 
     if (!m_in_page) { // The main menu
         bool has_shelf = !RecentGames().empty();
-        if (up && m_page == 0 && NowPlayingGame()) {
+        if (up && m_page == 0 && NowPlayingGame() && !m_park.active) {
             m_np_focus = true; // Up from Games: the game that's running
             return;
         }
@@ -3224,11 +3638,31 @@ void DashboardScene::HandleInputInner()
     }
     case PAGE_SYSTEM:
         // Two buttons: Restart XPSemu, Eject the disc.
+#if XPSEMU_DEV
+        // Dev builds: a second row, the stress test and its minutes.
+        m_system_row = std::clamp(m_system_row, 0, 3);
+        if (left || right) {
+            m_system_row ^= 1;
+            m_sys_ask = -1;
+        }
+        if (up || down) {
+            m_system_row ^= 2;
+            m_sys_ask = -1;
+        }
+        if (accept && m_system_row >= 2) {
+            DevStressButton(m_system_row == 2);
+            if (m_system_row == 2 && g_stress.on) {
+                g_stress.next_at = g_stress.clock + 0.5f;
+            }
+            break;
+        }
+#else
         m_system_row = std::clamp(m_system_row, 0, 1);
         if (up || left || down || right) {
             m_system_row ^= 1;
             m_sys_ask = -1;
         }
+#endif
         if (accept && m_system_row == 0) { // Restart XPSemu
             // While a game runs, a second press: it ends the game.
             if (m_game_started && m_time >= m_sys_ask) {
@@ -3752,10 +4186,83 @@ const DashboardScene::Game *DashboardScene::NowPlayingGame()
     return nullptr;
 }
 
-// The game running behind the dashboard: a slim bar above the menu, in the
-// menu's shape and column, with a live light in a socket like the menu's.
+// Leaving the game, while the Xbox finishes writing (ParkThen): the bar
+// burns away from the left, its edge glowing green, embers rising off it
+// and cooling to ash; it's gone just as the next thing starts.
 void DashboardScene::DrawNowPlaying(float s, float a, float x, float w,
                                     float bottom)
+{
+    double now = ImGui::GetTime();
+    if (!NowPlayingGame()) {
+        if (now < m_park.ash_until) {
+            DrawAsh(now); // The last embers, once the game has stopped
+        }
+        return;
+    }
+    if (!m_park.active) {
+        DrawNowPlayingBar(s, a, x, w, bottom);
+        return;
+    }
+    m_park.gx = x, m_park.gw = w, m_park.gbottom = bottom, m_park.gs = s;
+    m_park.ga = a;
+    float p = BurnAt(now);
+    float h = 92 * s, top = bottom - h;
+    float left = x - 104 * s, right = x + w + 4 * s;
+    float edge = left + (right - left) * p;
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(ImVec2(edge, top - 60 * s),
+                     ImVec2(right + 60 * s, bottom + 60 * s), true);
+    DrawNowPlayingBar(s, a * (1 - 0.3f * p), x, w, bottom);
+    dl->PopClipRect();
+    if (p < 0.999f) { // The burning edge, flickering as it smoulders
+        float flicker = 0.75f + 0.25f * sinf((float)now * 23) *
+                                    sinf((float)now * 7.3f);
+        dl->AddLine(ImVec2(edge, top), ImVec2(edge, bottom),
+                    Rgba(120, 255, 60, a * 0.22f * flicker), 12 * s);
+        dl->AddLine(ImVec2(edge, top), ImVec2(edge, bottom),
+                    Rgba(200, 255, 150, a * 0.9f * flicker), 3 * s);
+    }
+    DrawAsh(now);
+}
+
+// The embers: one born at the burning edge every 15 ms while it burns,
+// each rising, swaying and cooling from bright green to grey ash.
+void DashboardScene::DrawAsh(double now)
+{
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float s = m_park.gs, a = m_park.ga;
+    float h = 92 * s, top = m_park.gbottom - h;
+    float left = m_park.gx - 104 * s, right = m_park.gx + m_park.gw + 4 * s;
+    const double step = 0.015, life = 1.25;
+    double last = m_park.done ? m_park.done_at + 0.35 : now; // Burnt out
+    int first = std::max(0, (int)((now - life - m_park.start) / step));
+    int end = (int)((std::min(now, last) - m_park.start) / step);
+    for (int i = first; i <= end; i++) {
+        double born = m_park.start + i * step;
+        uint32_t r = (uint32_t)(i + 1) * 2654435761u;
+        float r1 = (r & 0xFF) / 255.0f, r2 = ((r >> 8) & 0xFF) / 255.0f,
+              r3 = ((r >> 16) & 0xFF) / 255.0f, r4 = (r >> 24) / 255.0f;
+        float age = (float)((now - born) / (0.75 + 0.5 * r4));
+        if (age < 0 || age > 1) {
+            continue;
+        }
+        float bx = left + (right - left) * BurnAt(born) + (r1 - 0.5f) * 14 * s;
+        float by = top + h * r2;
+        ImVec2 c(bx + sinf(age * 5 + i) * 10 * s * age,
+                 by - age * (50 + 90 * r3) * s);
+        float size = (1.5f + 2.5f * r4) * s * (1 - 0.4f * age);
+        float k = std::min(age * 1.6f, 1.0f); // Hot green, cooling to ash
+        int cr = (int)(190 + (95 - 190) * k), cg = (int)(255 + (105 - 255) * k),
+            cb = (int)(120 + (95 - 120) * k);
+        dl->AddCircleFilled(c, size, Rgba(cr, cg, cb, a * (1 - age)), 8);
+    }
+}
+
+// The game running behind the dashboard: a slim bar above the menu, in the
+// menu's shape and column, with a live light in a socket like the menu's.
+void DashboardScene::DrawNowPlayingBar(float s, float a, float x, float w,
+                                       float bottom)
 {
     const Game *it = NowPlayingGame();
     if (!it) {
@@ -5636,6 +6143,7 @@ void DashboardScene::DrawSettings(float s, float a)
     values[SR_COVERS] = on_off(g_config.display.ui.download_covers);
     values[SR_BOOT] = on_off(g_config.display.ui.boot_logo);
     values[SR_XBOX_BOOT] = on_off(!g_config.general.skip_boot_anim);
+    values[SR_LANGUAGE] = kLanguages[LanguageIndex()].name;
     bool scale_locked = false; // Applies at the next start instead
     if (GameGlobal(GO_SCALE) != (int)nv2a_get_surface_scale_factor()) {
         values[SR_SCALE] += "  (next start)";
@@ -5669,6 +6177,9 @@ void DashboardScene::DrawSettings(float s, float a)
         { "Original Xbox startup",
           "The Xbox's own boot animation, after XPSemu's, from the next time "
           "XPSemu starts (games always start straight away)." },
+        { "Game language",
+          "The language games use when they have it (an Xbox setting). "
+          "From the next game started." },
     };
 
     float x = 280 * s + slide, w = 1400 * s;
@@ -5843,8 +6354,12 @@ void DashboardScene::DrawSystem(float s, float a)
              g_config.sys.mem_limit == CONFIG_SYS_MEM_LIMIT_128 ? "128" : "64");
     snprintf(games, sizeof(games), "%d in %s", (int)m_games.size(),
              g_config.general.games_dir ? g_config.general.games_dir : "");
-    snprintf(version, sizeof(version), "XPSemu Alpha 2, based on xemu %s",
+#if XPSEMU_DEV
+    snprintf(version, sizeof(version), "XPSemu Alpha 2.1 DEV");
+#else
+    snprintf(version, sizeof(version), "XPSemu Alpha 2.1, based on xemu %s",
              xemu_version);
+#endif
     const char *dvd = g_config.sys.files.dvd_path;
     const struct { const char *name, *value; } info[] = {
         { "Xbox RAM", ram },
@@ -5879,8 +6394,16 @@ void DashboardScene::DrawSystem(float s, float a)
         Text(dl, font, 40 * s, ImVec2(bx + (w - ts.x) / 2, ay + 20 * s),
              selected ? Ink(a) : Label(a), actions[i]);
     }
+#if XPSEMU_DEV
+    float ay2 = ay + h + 30 * s;
+    DrawDev(s, a, x, y, ay2);
+    float fy = m_system_row >= 2 ? ay2 : ay;
+    float fx = x + (m_system_row & 1) * gap;
+#else
+    float fy = ay;
     float fx = x + m_system_row * gap;
-    Focus(dl, ImVec2(fx, ay), ImVec2(fx + w, ay + h), s, m_time, a);
+#endif
+    Focus(dl, ImVec2(fx, fy), ImVec2(fx + w, fy + h), s, m_time, a);
 }
 
 void DashboardScene::DrawHints(float s)
@@ -5903,15 +6426,15 @@ void DashboardScene::DrawHints(float s)
         if (m_shelf) {
             hints.push_back({ GLYPH_TRIANGLE, "Game settings" });
         }
-        if (NowPlayingGame()) {
+        if (NowPlayingGame() && !m_park.active) {
             hints.push_back({ GLYPH_SQUARE, m_time < m_eject_ask ?
                                                 "Press again to eject" :
                                                 "Eject disc" });
         }
-        if (m_can_return) {
-            hints.push_back({ GLYPH_CIRCLE, m_game_started ?
-                                                "Back to the game" :
-                                                "Back to the Xbox" });
+        // Only while a game runs: Circle still returns to the Xbox's own
+        // dashboard, but that hint came and went with every game stopped.
+        if (m_can_return && m_game_started && !m_park.active) {
+            hints.push_back({ GLYPH_CIRCLE, "Back to the game" });
         }
     } else {
         if (m_gs_open && m_kb_open) {
@@ -5963,19 +6486,60 @@ void DashboardScene::DrawHints(float s)
                                             "Back" });
     }
 
-    float x = 90 * s, y = size.y - 80 * s;
+    // Each hint fades in or out and slides to its place, instead of the
+    // row jumping when one comes or goes.
+    struct Shown {
+        Glyph glyph;
+        std::string text;
+        float x, alpha;
+        bool live;
+    };
+    static std::vector<Shown> shown;
+    float dt = ImGui::GetIO().DeltaTime;
+    float y = size.y - 80 * s;
+    std::vector<Shown> next;
+    std::vector<bool> taken(shown.size(), false);
+    float tx = 90 * s;
     for (const auto &h : hints) {
-        DrawGlyph(dl, ImVec2(x + 22 * s, y), 22 * s, h.glyph, a);
-        if (h.glyph == GLYPH_CIRCLE && m_back_hold > 0.05f) {
+        Shown it = { h.glyph, h.text, tx, 0, true };
+        for (size_t j = 0; j < shown.size(); j++) {
+            const Shown &old = shown[j];
+            if (!taken[j] && old.live && old.glyph == h.glyph &&
+                old.text == h.text) {
+                it.x = old.x + (tx - old.x) * std::min(dt * 12, 1.0f);
+                it.alpha = old.alpha;
+                taken[j] = true;
+                break;
+            }
+        }
+        it.alpha = std::min(it.alpha + dt * 6, 1.0f);
+        next.push_back(it);
+        tx += 100 * s + TextSize(small, 32 * s, h.text).x;
+    }
+    for (size_t j = 0; j < shown.size(); j++) { // Gone: fading where it was
+        if (!taken[j]) {
+            Shown old = shown[j];
+            old.live = false;
+            old.alpha -= dt * 6;
+            if (old.alpha > 0) {
+                next.push_back(old);
+            }
+        }
+    }
+    shown = next;
+    for (const auto &h : shown) {
+        float ha = a * h.alpha * h.alpha * (3 - 2 * h.alpha);
+        float x = h.x;
+        DrawGlyph(dl, ImVec2(x + 22 * s, y), 22 * s, h.glyph, ha);
+        if (h.live && h.glyph == GLYPH_CIRCLE && m_back_hold > 0.05f) {
             // Quick resume filling up as Circle is held.
             float t = std::min(m_back_hold / 0.6f, 1.0f);
             dl->PathArcTo(ImVec2(x + 22 * s, y), 31 * s, -IM_PI / 2,
                           -IM_PI / 2 + 2 * IM_PI * t, 32);
-            dl->PathStroke(Lime(a), 0, 4 * s);
+            dl->PathStroke(Lime(ha), 0, 4 * s);
         }
         Text(dl, small, 32 * s, ImVec2(x + 56 * s, y - 18 * s),
-             White(a * 0.85f), h.text);
-        x += 100 * s + TextSize(small, 32 * s, h.text).x;
+             White(ha * 0.85f), h.text.c_str());
     }
 
 }
@@ -6494,6 +7058,10 @@ void DashboardTick()
     }
 
     GameLogTick();
+    g_dashboard.ParkTick();
+#if XPSEMU_DEV
+    g_dashboard.DevStressStep(dt);
+#endif
     g_dashboard.WatchTick();
     GamePlayTick(ImGui::GetIO().DeltaTime,
                  runstate_is_running() && !g_scene_mgr.IsDisplayingScene());

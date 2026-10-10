@@ -930,6 +930,12 @@ static void gl_render_frame(struct xemu_console *scon)
  * Renders the main interface with Vulkan (builds without OpenGL). Usually
  * called from the main thread, but may sometimes be called from another thread.
  */
+#ifdef __PROSPERO__
+/* The dashboard stopping a game: no new frames from the GPU thread (the
+ * menu stays smooth while the Xbox finishes writing) */
+bool g_xemu_ui_hold_frame;
+#endif
+
 static void vk_render_frame(struct xemu_console *scon)
 {
     static bool rendering;
@@ -955,12 +961,14 @@ static void vk_render_frame(struct xemu_console *scon)
      * only for a new game frame (or at least 20 times a second, for the
      * video overlay); otherwise show the image from the last time.
      */
+    extern bool g_xemu_ui_hold_frame;
     static unsigned int shown_frame = ~0u;
     static int64_t shown_at;
     static XemuTexture shown_tex;
     int64_t now = g_get_monotonic_time();
-    bool same = shown_tex && g_nv2a_stats.frame_count == shown_frame &&
-                now - shown_at < 50000;
+    bool same = shown_tex && (qatomic_read(&g_xemu_ui_hold_frame) ||
+                              (g_nv2a_stats.frame_count == shown_frame &&
+                               now - shown_at < 50000));
     if (same) {
         tex = shown_tex;
         flip = true;
@@ -972,6 +980,11 @@ static void vk_render_frame(struct xemu_console *scon)
         uint64_t xt_frame = xemu_timing_now();
         int have_surface = nv2a_get_framebuffer_surface();
         xemu_timing_add(XT_UI_FRAME, xt_frame);
+        if (xemu_timing_now() - xt_frame > 8000000) {
+            /* Longer than a TV refresh at 120 Hz: a frame shown late */
+            __atomic_fetch_add(&xemu_timing_count[XT_UI_STALL], 1,
+                               __ATOMIC_RELAXED);
+        }
         if (have_surface) {
             tex = xemu_vk_get_display_texture();
             /* The renderer's display image is bottom row first (for GL). */

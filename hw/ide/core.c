@@ -42,6 +42,7 @@
 #include "system/replay.h"
 #include "system/runstate.h"
 #include "ide-internal.h"
+#include "hw/xbox/xemu-save-repair.h"
 #include "trace.h"
 
 /* These values were based on a Seagate ST3500418AS but have been modified
@@ -972,6 +973,7 @@ static void ide_dma_cb(void *opaque, int ret)
                                           BDRV_SECTOR_SIZE, ide_dma_cb, s);
         break;
     case IDE_DMA_WRITE:
+        xemu_note_hdd_write(offset);
         s->bus->dma->aiocb = dma_blk_write(s->blk, &s->sg, offset,
                                            BDRV_SECTOR_SIZE, ide_dma_cb, s);
         break;
@@ -1105,6 +1107,7 @@ static void ide_sector_write(IDEState *s)
 
     block_acct_start(blk_get_stats(s->blk), &s->acct,
                      n * BDRV_SECTOR_SIZE, BLOCK_ACCT_WRITE);
+    xemu_note_hdd_write(sector_num << BDRV_SECTOR_BITS);
     s->pio_aiocb = blk_aio_pwritev(s->blk, sector_num << BDRV_SECTOR_BITS,
                                    &s->qiov, 0, ide_sector_write_cb, s);
 }

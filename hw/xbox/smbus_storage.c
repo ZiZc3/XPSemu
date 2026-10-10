@@ -182,6 +182,7 @@ static void smbus_storage_class_init(ObjectClass *klass, const void *data)
 #define EEPROM_USER_SECTION 0x64
 #define EEPROM_USER_CHECKED 0x5C
 #define EEPROM_VIDEO_FLAGS 0x94
+#define EEPROM_LANGUAGE 0x90
 
 static SMBusStorageDevice *xemu_eeprom(void)
 {
@@ -212,13 +213,14 @@ bool xemu_eeprom_get_video_flags(uint32_t *flags)
     return true;
 }
 
-bool xemu_eeprom_set_video_flags(uint32_t flags)
+/* A value in the user section, its checksum, and the file */
+static bool xemu_eeprom_set_user_value(int offset, uint32_t value)
 {
     SMBusStorageDevice *s = xemu_eeprom();
     if (!s) {
         return false;
     }
-    stl_le_p(s->data + EEPROM_VIDEO_FLAGS, flags);
+    stl_le_p(s->data + offset, value);
     stl_le_p(s->data + EEPROM_USER_CHECKSUM,
              xemu_eeprom_crc(s->data + EEPROM_USER_SECTION,
                              EEPROM_USER_CHECKED));
@@ -232,6 +234,26 @@ bool xemu_eeprom_set_video_flags(uint32_t flags)
         return ok;
     }
     return true;
+}
+
+bool xemu_eeprom_set_video_flags(uint32_t flags)
+{
+    return xemu_eeprom_set_user_value(EEPROM_VIDEO_FLAGS, flags);
+}
+
+bool xemu_eeprom_get_language(uint32_t *language)
+{
+    SMBusStorageDevice *s = xemu_eeprom();
+    if (!s) {
+        return false;
+    }
+    *language = ldl_le_p(s->data + EEPROM_LANGUAGE);
+    return true;
+}
+
+bool xemu_eeprom_set_language(uint32_t language)
+{
+    return xemu_eeprom_set_user_value(EEPROM_LANGUAGE, language);
 }
 
 static TypeInfo smbus_storage_info = {

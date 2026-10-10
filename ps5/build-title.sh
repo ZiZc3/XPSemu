@@ -55,7 +55,13 @@ for t in inputs + libs:
     print(t)
 PY
 )
-ninja -C "$build" "${objects[@]#W:}" > /dev/null
+# Quiet when it works; the compiler's errors when it doesn't (a failure here
+# used to end the script with no message at all).
+if ! ninja -C "$build" "${objects[@]#W:}" > "$work/ninja.log" 2>&1; then
+    grep -E "error:|FAILED" -A4 "$work/ninja.log" | head -60 >&2
+    echo "build-title.sh: compiling failed, the whole log is $work/ninja.log" >&2
+    exit 1
+fi
 
 xemu_inputs=()
 for item in "${objects[@]}"; do
@@ -101,7 +107,8 @@ radv_link_flags+=(--wrap=getcontext --wrap=makecontext --wrap=swapcontext)
 # 0: xemu's import report found these), bound to ps5/compat/libc_missing.c and
 # kept local so the title doesn't export libc's names (as radv-link.sh does).
 missing_libc=(mkstemp isatty umask pathconf fnmatch getnameinfo gai_strerror
-    gethostbyname fork vfork setsid chroot symlink link readlink setbuf)
+    gethostbyname fork vfork setsid chroot symlink link readlink setbuf
+    strdup strndup asprintf vasprintf)
 {
     printf '{\n    local:\n'
     for name in "${missing_libc[@]}"; do

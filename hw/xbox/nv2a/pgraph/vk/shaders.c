@@ -21,6 +21,7 @@
 #include "qemu/fast-hash.h"
 #include "qemu/mstring.h"
 #include "renderer.h"
+#include "hw/xbox/xemu-timing.h"
 
 #define VSH_UBO_BINDING 0
 #define PSH_UBO_BINDING 1
@@ -327,6 +328,7 @@ static void shader_module_cache_entry_init(Lru *lru, LruNode *node,
         container_of(node, ShaderModuleCacheEntry, node);
     memcpy(&module->key, key, sizeof(ShaderModuleCacheKey));
 
+    uint64_t xt_shader = xemu_timing_now();
     MString *code;
 
     switch (module->key.kind) {
@@ -351,6 +353,8 @@ static void shader_module_cache_entry_init(Lru *lru, LruNode *node,
         r, module->key.kind, mstring_get_str(code));
     pgraph_vk_ref_shader_module(module->module_info);
     mstring_unref(code);
+    g_nv2a_stats.frame_working.counters[NV2A_PROF_SHADER_US] +=
+        (int)(xemu_timing_add_max(XT_SHADER, xt_shader) / 1000);
 }
 
 static void shader_module_cache_entry_post_evict(Lru *lru, LruNode *node)

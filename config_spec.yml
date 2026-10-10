@@ -277,7 +277,7 @@ display:
       default: true
     blades_sides:
       type: bool
-      default: true
+      default: false
     blades_style:
       type: integer
       default: 0  # 0 green, 1 orange

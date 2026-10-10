@@ -30,7 +30,7 @@ else
 endif
 
 if host_os == 'freebsd' # The PS5's front end
-  xemu_ss.add(files('dashboard.cc', 'cover-download.cc', 'game-log.cc', 'game-patches.cc',
+  xemu_ss.add(files('dashboard.cc', 'dev-report.cc', 'cover-download.cc', 'game-log.cc', 'game-patches.cc',
                     'game-profile.cc',
                     'ui-sounds.cc',
                     'xiso.cc'))

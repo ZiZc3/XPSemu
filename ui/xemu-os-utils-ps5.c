@@ -140,6 +140,11 @@ const char *xemu_get_os_info(void)
 /* The game's own log gets the last of xemu.log (ui/xui/game-log.cc). */
 void xemu_ps5_game_log_copy(void);
 
+#include "xemu-dev-ps5.h"
+#if XPSEMU_DEV
+int sceSystemServiceLoadExec(const char *path, char *const argv[]);
+#endif
+
 static void write_str(const char *s)
 {
     (void)!write(STDERR_FILENO, s, strlen(s));
@@ -184,6 +189,18 @@ static void crash_handler(int sig, siginfo_t *info, void *context)
     /* Return addresses into the eboot on the crashed stack: a backtrace that
      * needs no frame pointers (with some stale entries). Look them up with
      * llvm-addr2line -e build-ps5/title/llvm-pie.elf. */
+#if XPSEMU_DEV
+    /* The journal: where, and the eboot's return addresses (offsets) */
+    char line[512];
+    int n = snprintf(line, sizeof(line), "C %lld %d %s %lx %lx",
+                     (long long)time(NULL), sig,
+                     rip >= EBOOT_BASE && rip < EBOOT_END ? "eboot" :
+                     rip >= 0x900000000ULL && rip < 0x908000000ULL ? "jit" :
+                                                             "system",
+                     (unsigned long)(rip >= EBOOT_BASE && rip < EBOOT_END ?
+                                     rip - EBOOT_BASE : rip),
+                     (unsigned long)info->si_addr);
+#endif
     if (rsp >= 0x100000 && (rsp & 7) == 0) {
         const uint64_t *sp = (const uint64_t *)rsp;
         for (int i = 0, found = 0; i < 256 && found < 24; i++) {
@@ -191,12 +208,28 @@ static void crash_handler(int sig, siginfo_t *info, void *context)
                 snprintf(buf, sizeof(buf), "***   stack[%d] %#lx\n", i,
                          (unsigned long)sp[i]);
                 write_str(buf);
+#if XPSEMU_DEV
+                if (found < 8 && n < (int)sizeof(line) - 24) {
+                    n += snprintf(line + n, sizeof(line) - n, " %lx",
+                                  (unsigned long)(sp[i] - EBOOT_BASE));
+                }
+#endif
                 found++;
             }
         }
     }
 
     xemu_ps5_game_log_copy();
+#if XPSEMU_DEV
+    snprintf(line + n, sizeof(line) - n, "\n");
+    xemu_dev_journal_raw(line);
+    /* The stress test goes on: XPSemu again (it picks the next game) */
+    if (xemu_dev_stress_on) {
+        write_str("*** stress test: starting XPSemu again\n");
+        sceSystemServiceLoadExec("/app0/eboot.bin", NULL);
+        sceSystemServiceLoadExec("/data/homebrew/PPSA97358/eboot.bin", NULL);
+    }
+#endif
     _exit(128 + sig);
 }
 
@@ -304,6 +337,9 @@ void xemu_ps5_early_init(void)
             jailbroken ? "ok" : "NOT CONFIRMED", jailbreak_msg);
 
     report_unresolved_imports();
+#if XPSEMU_DEV
+    xemu_dev_start(); /* The journal's S line */
+#endif
 
     /* The main thread's handler runs on its own stack, so a broken stack
      * can still be reported. */

@@ -29,6 +29,9 @@
 #include "qemu/config-file.h"
 
 #include "xemu-input.h"
+#ifdef __PROSPERO__
+#include "xemu-dev-ps5.h"
+#endif
 #include "xemu-notifications.h"
 #include "xemu-settings.h"
 #include <stdio.h>
@@ -323,11 +326,17 @@ void xemu_input_init(void)
     QTAILQ_INSERT_TAIL(&available_controllers, new_con, entry);
 
 #ifdef __PROSPERO__
-    /* The DualSense, on port 1 (in place of the keyboard if it was there) */
-    ControllerState *pad = xemu_input_ps5_pad_create();
+    /* The DualSense, on port 1 (in place of the keyboard if it was there);
+     * players 2-4 get plugged in as they sign in (xemu_input_ps5_pads_scan) */
+    ControllerState *pad = xemu_input_ps5_pad_create(0);
     QTAILQ_INSERT_TAIL(&available_controllers, pad, entry);
     xemu_input_bind(0, pad, 0);
     xemu_input_rebind_xmu(0);
+    for (int i = 1; i < 4; i++) {
+        QTAILQ_INSERT_TAIL(&available_controllers,
+                           xemu_input_ps5_pad_create(i), entry);
+    }
+    xemu_input_ps5_pads_scan();
 #endif
 }
 
@@ -529,6 +538,9 @@ void xemu_input_update_controller(ControllerState *state)
 #ifdef __PROSPERO__
     } else if (state->type == INPUT_DEVICE_PS5_PAD) {
         xemu_input_update_ps5_pad_state(state);
+#if XPSEMU_DEV
+        xemu_dev_bot(state); /* The stress test plays */
+#endif
 #endif
     }
 
@@ -538,6 +550,9 @@ void xemu_input_update_controller(ControllerState *state)
 void xemu_input_update_controllers(void)
 {
     ControllerState *iter;
+#ifdef __PROSPERO__
+    xemu_input_ps5_pads_scan();
+#endif
     QTAILQ_FOREACH(iter, &available_controllers, entry) {
         xemu_input_update_controller(iter);
     }

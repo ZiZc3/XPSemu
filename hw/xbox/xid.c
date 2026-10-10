@@ -62,6 +62,19 @@ void update_input(USBXIDGamepadState *s)
     ControllerState *state = xemu_input_get_bound(s->device_index);
     assert(state);
     xemu_input_update_controller(state);
+#ifdef __PROSPERO__
+    /* XPSemu: the dashboard is up (it may be letting the game finish
+     * writing): its presses are for the menu, not the game */
+    extern int g_xemu_ps5_pad_hold;
+    if (g_xemu_ps5_pad_hold) {
+        memset(&s->in_state.bAnalogButtons, 0,
+               sizeof(s->in_state.bAnalogButtons));
+        s->in_state.wButtons = 0;
+        s->in_state.sThumbLX = s->in_state.sThumbLY = 0;
+        s->in_state.sThumbRX = s->in_state.sThumbRY = 0;
+        return;
+    }
+#endif
 
     const int button_map_analog[6][2] = {
         { GAMEPAD_A,     CONTROLLER_BUTTON_A     },

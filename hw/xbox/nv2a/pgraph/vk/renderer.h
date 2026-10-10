@@ -377,6 +377,8 @@ typedef struct PGRAPHVkState {
     PipelineBinding *pipeline_cache_entries;
     PipelineBinding *pipeline_binding;
     bool pipeline_binding_changed;
+    bool blend_color_valid;   /* XPSemu: blend_color_set is in the command buffer */
+    uint32_t blend_color_set; /* XPSemu: last NV_PGRAPH_BLENDCOLOR set */
 
     VkDescriptorPool descriptor_pool;
     VkDescriptorSetLayout descriptor_set_layout;

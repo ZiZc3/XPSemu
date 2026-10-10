@@ -1058,9 +1058,16 @@ bdrv_driver_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
         return -ENOMEDIUM;
     }
 
+#if !defined(__PROSPERO__) && !defined(XPS_RIG)
     if (bs->open_flags & BDRV_O_NO_FLUSH) {
         flags &= ~BDRV_REQ_FUA;
     }
+#endif
+    /*
+     * XPSemu: on PS5 a write-through write keeps its flush with no-flush
+     * too. bdrv_co_flush still hands the qcow2 tables to the system and
+     * only skips the sync to the SSD (system/vl.c, the HDD's options).
+     */
 
     if ((flags & BDRV_REQ_FUA) &&
         (~bs->supported_write_flags & BDRV_REQ_FUA)) {

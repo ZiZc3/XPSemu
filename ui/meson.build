@@ -54,7 +54,7 @@ elif host_os == 'windows'
 elif host_os == 'darwin'
   xemu_ss.add(files('xemu-os-utils-macos.m'))
 elif host_os == 'freebsd' # The PS5, the only FreeBSD-like target xemu builds for
-  xemu_ss.add(files('xemu-os-utils-ps5.c', 'xemu-input-ps5.c'))
+  xemu_ss.add(files('xemu-os-utils-ps5.c', 'xemu-input-ps5.c', 'xemu-dev-ps5.c'))
 endif
 xemu_ss.add(imgui, implot, stb_image, sdl, opengl, fa, fpng, json, fatx, tomlplusplus, genconfig)
 system_ss.add_all(xemu_ss)

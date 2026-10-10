@@ -970,6 +970,11 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     qatomic_set(&tb_ctx.tb_phys_invalidate_count,
                 tb_ctx.tb_phys_invalidate_count + 1);
     __atomic_fetch_add(&xemu_timing_count[XT_TB_INVAL], 1, __ATOMIC_RELAXED);
+    if (!current_cpu) {
+        __atomic_fetch_add(&xemu_timing_count[XT_TB_INVAL_DMA], 1,
+                           __ATOMIC_RELAXED);
+    }
+    xemu_note_inval_page(phys_pc);
 }
 
 static void tb_phys_invalidate__locked(TranslationBlock *tb)
@@ -1184,6 +1189,8 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
     }
 
     if (unlikely(current_tb_modified)) {
+        __atomic_fetch_add(&xemu_timing_count[XT_SMC_EXIT], 1,
+                           __ATOMIC_RELAXED);
         page_collection_unlock(pages);
         /* Force execution of one insn next time.  */
         cpu->cflags_next_tb = 1 | CF_NOIRQ | curr_cflags(cpu);

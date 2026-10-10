@@ -3086,9 +3086,28 @@ void qemu_init(int argc, char **argv)
         } else {
             fake_argv[fake_argc++] = strdup("-drive");
             char *escaped_hdd_path = strdup_double_commas(hdd_path);
+#ifdef __PROSPERO__
+            /*
+             * XPSemu: the qcow2 image keeps its tables (which part of the
+             * file holds which part of the disk) in memory and wrote them
+             * only when the Xbox flushed or the app closed cleanly. A crash,
+             * or closing the app from the PS5 home screen, lost the new
+             * ones and left the Xbox's cache partitions as garbage: games
+             * then hung while loading until the HDD image was deleted.
+             * writeback=off hands the tables to the system after every
+             * write; no-flush skips the slow sync to the SSD (only needed
+             * for a power cut, not for an app crash). block/io.c keeps the
+             * first part working with no-flush on PS5.
+             */
+            fake_argv[fake_argc++] = g_strdup_printf("index=0,media=disk,file=%s%s%s",
+                escaped_hdd_path,
+                strlen(escaped_hdd_path) > 0 ? ",locked=on" : "",
+                ",cache.writeback=off,cache.no-flush=on");
+#else
             fake_argv[fake_argc++] = g_strdup_printf("index=0,media=disk,file=%s%s",
                 escaped_hdd_path,
                 strlen(escaped_hdd_path) > 0 ? ",locked=on" : "");
+#endif
             free(escaped_hdd_path);
         }
     }

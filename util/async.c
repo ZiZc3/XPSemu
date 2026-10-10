@@ -610,8 +610,21 @@ AioContext *aio_context_new(Error **errp)
 
     ctx->aio_max_batch = 0;
 
+#ifdef __PROSPERO__
+    /*
+     * XPSemu: disc and HDD reads run on worker threads. QEMU makes them on
+     * demand and lets each one end after 10 s without work, so a game that
+     * streams (Ninja Gaiden Black) made and ended threads all session long,
+     * and the PS5's pool for thread objects ran out ("[ScePthread/System]
+     * Internal Memory is running out", then a crash inside the system).
+     * Here the same 8 threads are made once and kept.
+     */
+    ctx->thread_pool_min = 8;
+    ctx->thread_pool_max = 8;
+#else
     ctx->thread_pool_min = 0;
     ctx->thread_pool_max = THREAD_POOL_MAX_THREADS_DEFAULT;
+#endif
 
     register_aiocontext(ctx);
 

@@ -307,6 +307,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
             }
         }
         recycled = true;
+        __atomic_fetch_add(&xemu_timing_count[XT_TB_REVIVE], 1,
+                           __ATOMIC_RELAXED);
         goto recycle_tb;
     }
 

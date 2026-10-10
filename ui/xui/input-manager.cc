@@ -26,6 +26,13 @@ void InputManager::Update()
             if (iter->type != INPUT_DEVICE_SDL_GAMEPAD &&
                 iter->type != INPUT_DEVICE_PS5_PAD)
                 continue;
+#ifdef __PROSPERO__
+            // XPSemu: only player 1 works the menus; players 2-4 are for
+            // the games
+            if (iter->type == INPUT_DEVICE_PS5_PAD &&
+                xemu_ps5_pad_player(iter) > 0)
+                continue;
+#endif
             m_buttons |= iter->buttons; // (The DualSense as remapped)
             // We simply take any axis that is >10 % activation
             for (int i = 0; i < CONTROLLER_AXIS__COUNT; i++) {

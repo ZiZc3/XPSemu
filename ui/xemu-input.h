@@ -133,7 +133,9 @@ void xemu_input_update_sdl_kbd_controller_state(ControllerState *state);
 void xemu_input_update_sdl_controller_state(ControllerState *state);
 #ifdef __PROSPERO__
 // Implemented in xemu-input-ps5.c
-ControllerState *xemu_input_ps5_pad_create(void);
+ControllerState *xemu_input_ps5_pad_create(int player); // 0-3
+void xemu_input_ps5_pads_scan(void); // Players signing in or out
+int xemu_ps5_pad_player(const ControllerState *state); // 0-3, -1: other
 void xemu_input_update_ps5_pad_state(ControllerState *state);
 #endif
 void xemu_input_update_rumble(ControllerState *state);

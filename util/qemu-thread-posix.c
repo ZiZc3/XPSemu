@@ -398,6 +398,11 @@ static void *qemu_thread_start(void *args)
     return r;
 }
 
+#ifdef __PROSPERO__
+/* XPSemu: threads made since the start (game log "threads made") */
+int xemu_ps5_threads_made;
+#endif
+
 void qemu_thread_create(QemuThread *thread, const char *name,
                        void *(*start_routine)(void*),
                        void *arg, int mode)
@@ -406,6 +411,10 @@ void qemu_thread_create(QemuThread *thread, const char *name,
     int err;
     pthread_attr_t attr;
     QemuThreadArgs *qemu_thread_args;
+
+#ifdef __PROSPERO__
+    qatomic_inc(&xemu_ps5_threads_made);
+#endif
 
     err = pthread_attr_init(&attr);
     if (err) {

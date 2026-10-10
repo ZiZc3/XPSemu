@@ -47,6 +47,7 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "hw/xbox/xemu-timing.h"
 
 /* -icount align implementation. */
 
@@ -596,7 +597,9 @@ void cpu_exec_step_atomic(CPUState *cpu)
         tb = tb_lookup(cpu, s);
         if (tb == NULL) {
             mmap_lock();
+            uint64_t xt_gen = xemu_timing_now();
             tb = tb_gen_code(cpu, s);
+            xemu_timing_add(XT_TB_GEN, xt_gen);
             mmap_unlock();
         }
 
@@ -1000,7 +1003,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 uint32_t h;
 
                 mmap_lock();
+                uint64_t xt_gen = xemu_timing_now();
                 tb = tb_gen_code(cpu, s);
+                xemu_timing_add(XT_TB_GEN, xt_gen);
                 mmap_unlock();
 
                 /*

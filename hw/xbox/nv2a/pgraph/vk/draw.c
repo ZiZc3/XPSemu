@@ -138,6 +138,15 @@ void pgraph_vk_save_pipeline_cache(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     size_t size = 0;
+    /* XPSemu: nothing new since the last save (or since the cache was
+     * loaded): skip writing the same ~8 MB again as the next game starts */
+    static uint32_t saved_at;
+    uint32_t built = __atomic_load_n(&xemu_timing_count[XT_PIPELINE],
+                                     __ATOMIC_RELAXED);
+    if (built == saved_at) {
+        return;
+    }
+    saved_at = built;
     if (!r || r->vk_pipeline_cache == VK_NULL_HANDLE ||
         vkGetPipelineCacheData(r->device, r->vk_pipeline_cache, &size,
                                NULL) != VK_SUCCESS ||
@@ -661,8 +670,11 @@ static void create_clear_pipeline(PGRAPHState *pg)
     };
 
     VkPipeline pipeline;
+    uint64_t xt_pipeline = xemu_timing_now();
     VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_cache, 1,
                                        &pipeline_info, NULL, &pipeline));
+    g_nv2a_stats.frame_working.counters[NV2A_PROF_PIPELINE_US] +=
+        (int)(xemu_timing_add_max(XT_PIPELINE, xt_pipeline) / 1000);
 
     snode->pipeline = pipeline;
     snode->layout = layout;
@@ -751,6 +763,17 @@ static void init_pipeline_key(PGRAPHState *pg, PipelineKey *key)
     for (int i = 0; i < ARRAY_SIZE(regs); i++) {
         key->regs[i] = pgraph_reg_r(pg, regs[i]);
     }
+
+    /*
+     * XPSemu: the blend colour is set per draw (dynamic state, begin_draw)
+     * and the depth bias is applied in the pixel shader (psh.c), so neither
+     * changes the pipeline. In the key, every new value of them made a new,
+     * identical pipeline: up to ~1000 a second in Ninja Gaiden Black, each
+     * a vkCreateGraphicsPipelines on the GPU thread plus one thrown away.
+     */
+    key->regs[1] = 0; /* NV_PGRAPH_BLENDCOLOR */
+    key->regs[7] = 0; /* NV_PGRAPH_ZOFFSETBIAS */
+    key->regs[8] = 0; /* NV_PGRAPH_ZOFFSETFACTOR */
 }
 
 static void create_pipeline(PGRAPHState *pg)
@@ -987,9 +1010,10 @@ static void create_pipeline(PGRAPHState *pg)
         .blendConstants[3] = blend_constant[3],
     };
 
-    VkDynamicState dynamic_states[3] = { VK_DYNAMIC_STATE_VIEWPORT,
-                                         VK_DYNAMIC_STATE_SCISSOR };
-    int num_dynamic_states = 2;
+    VkDynamicState dynamic_states[4] = { VK_DYNAMIC_STATE_VIEWPORT,
+                                         VK_DYNAMIC_STATE_SCISSOR,
+                                         VK_DYNAMIC_STATE_BLEND_CONSTANTS };
+    int num_dynamic_states = 3;
 
     snode->has_dynamic_line_width =
         (r->enabled_physical_device_features.wideLines == VK_TRUE) &&
@@ -1069,8 +1093,11 @@ static void create_pipeline(PGRAPHState *pg)
         .basePipelineHandle = VK_NULL_HANDLE,
     };
     VkPipeline pipeline;
+    uint64_t xt_pipeline = xemu_timing_now();
     VK_CHECK(vkCreateGraphicsPipelines(r->device, r->vk_pipeline_cache, 1,
                                        &pipeline_create_info, NULL, &pipeline));
+    g_nv2a_stats.frame_working.counters[NV2A_PROF_PIPELINE_US] +=
+        (int)(xemu_timing_add_max(XT_PIPELINE, xt_pipeline) / 1000);
 
     snode->pipeline = pipeline;
     snode->layout = layout;
@@ -1379,6 +1406,7 @@ void pgraph_vk_begin_command_buffer(PGRAPHState *pg)
                                   &command_buffer_begin_info));
     r->command_buffer_start_time = pg->draw_time;
     r->in_command_buffer = true;
+    r->blend_color_valid = false; /* XPSemu: new command buffer */
 }
 
 // FIXME: Refactor below
@@ -1554,6 +1582,17 @@ static void begin_draw(PGRAPHState *pg)
     }
 
     if (!pg->clearing) {
+        /* XPSemu: the blend colour, only when it changed */
+        uint32_t blend_color = pgraph_reg_r(pg, NV_PGRAPH_BLENDCOLOR);
+        if (must_bind_pipeline || !r->blend_color_valid ||
+            r->blend_color_set != blend_color) {
+            float blend_constants[4];
+            pgraph_argb_pack32_to_rgba_float(blend_color, blend_constants);
+            vkCmdSetBlendConstants(r->command_buffer, blend_constants);
+            r->blend_color_set = blend_color;
+            r->blend_color_valid = true;
+        }
+
         bind_descriptor_sets(pg);
         push_vertex_attr_values(pg);
     }
@@ -1801,6 +1840,7 @@ void pgraph_vk_clear_surface(NV2AState *d, uint32_t parameter)
             pgraph_get_clear_color(pg, blend_constants);
             vkCmdSetScissor(r->command_buffer, 0, 1, &clear_rect.rect);
             vkCmdSetBlendConstants(r->command_buffer, blend_constants);
+            r->blend_color_valid = false; /* XPSemu: clear colour, not ours */
             vkCmdDraw(r->command_buffer, 3, 1, 0, 0);
         }
     }

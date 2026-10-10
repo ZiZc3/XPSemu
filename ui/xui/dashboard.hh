@@ -15,7 +15,9 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 #pragma once
+#include "../xpsemu-dev.h"
 #include <map>
+#include <functional>
 #include <string>
 #include <vector>
 #include "scene.hh"
@@ -41,6 +43,7 @@ public:
     bool m_startup_show = false;
 
     bool Visible() const { return m_visible; }
+    void ParkTick(); // Each frame (DashboardTick)
     // The game running behind the dashboard, if any.
     const Game *NowPlayingGame();
 
@@ -142,6 +145,10 @@ protected:
     void DrawViewer(float s, float a);
     bool ViewerLoading();
     void QuitApp(bool restart);
+#if XPSEMU_DEV
+    void DevStressLaunchNext();
+    void DrawDev(float s, float a, float x, float y, float ay2);
+#endif
     // Controller setup (Settings > Controller).
     bool m_pad_page = false, m_pad_capture = false, m_pad_released = false;
     int m_pad_sel = 0;
@@ -239,6 +246,27 @@ protected:
     std::vector<const Game *> RecentGames();
     void OpenXboxDashboard();
     void StopGame(const char *why);
+    void StopGameNow(const char *why);
+    void LaunchNow(const Game &game, bool quiet);
+    void QuitAppNow(bool restart);
+    void ParkThen(std::function<void()> next);
+    // Before a game is stopped, the Xbox runs on (muted, behind this
+    // dashboard) until its hard disk is quiet, so a save just made gets
+    // written instead of lost in the reset.
+    struct {
+        bool active = false;
+        double start = 0, last_write = 0;
+        uint64_t writes = 0;
+        float gain = 1;
+        std::function<void()> next; // The last one asked for
+        bool done = false;   // The Xbox has finished writing
+        double done_at = 0;  // ...then the burn ends, then next() runs
+        float p_done = 0;    // How far it had burnt by then
+        double ash_until = 0; // The last embers, after the bar is gone
+        float gx = 0, gw = 0, gbottom = 0, gs = 1, ga = 1; // Where it was
+    } m_park;
+    float BurnAt(double when) const;
+    void DrawAsh(double now);
     void WatchLaunch(const Game &game, const std::vector<std::string> &applied,
                      const std::string &log);
     void WatchStop();
@@ -246,6 +274,10 @@ protected:
 public:
     // Every frame (DashboardTick): the watch on a game just launched.
     void WatchTick();
+#if XPSEMU_DEV
+    // Dev builds: the stress test (every frame, from DashboardTick)
+    void DevStressStep(float dt);
+#endif
 
 protected:
     void Close();
@@ -253,6 +285,8 @@ protected:
     void DrawBackground(float s);
     void DrawOrb(float cx, float cy, float r);
     void DrawMainMenu(float s, float a);
+    void DrawNowPlayingBar(float s, float a, float x, float w,
+                           float bottom);
     void DrawNowPlaying(float s, float a, float x, float w,
                         float bottom);
     void DrawShelf(float s, float a, float x0, float y0);

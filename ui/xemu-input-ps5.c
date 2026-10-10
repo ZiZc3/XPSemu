@@ -22,14 +22,17 @@
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
 #include "xemu-input.h"
+#include "xemu-notifications.h"
 #include "xemu-settings.h"
 
 int sceUserServiceInitialize(const void *params);
 int sceUserServiceGetInitialUser(int32_t *user_id);
+int sceUserServiceGetLoginUserIdList(void *list);
 int scePadInit(void);
 int scePadOpen(int32_t user_id, int32_t type, int32_t index, const void *param);
 int scePadGetHandle(int32_t user_id, int32_t type, int32_t index);
 int scePadReadState(int32_t handle, void *data);
+int scePadClose(int32_t handle);
 
 /* The start of ScePadData; the rest (motion, touch, ...) isn't used. */
 typedef struct PadData {
@@ -58,18 +61,81 @@ enum {
     PAD_CREATE = 0x00000001, /* PS5SX2 maps it with the touchpad, to Select */
 };
 
-static int32_t pad_user = -1;
-static int32_t pad_handle = -1;
-static int64_t pad_next_open_ms;
+/*
+ * XPSemu: up to four players. On the PS5 each controller belongs to a
+ * signed-in user (or a guest), so player 1 is the user who started
+ * XPSemu and players 2-4 are the other signed-in users, in the order the
+ * PS5 lists them. Every two seconds the list is checked: a new user's
+ * controller is opened and plugged into the Xbox's next free port (its own
+ * first), and a user who signed out is unplugged, as on a real Xbox.
+ */
+#define PS5_PLAYERS 4
+typedef struct Ps5Player {
+    ControllerState *state;
+    int32_t user, handle;
+    uint32_t ui; /* Its buttons in the standard layout (the dashboard) */
+} Ps5Player;
+static Ps5Player g_players[PS5_PLAYERS] = {
+    { NULL, -1, -1, 0 }, { NULL, -1, -1, 0 },
+    { NULL, -1, -1, 0 }, { NULL, -1, -1, 0 },
+};
+static int64_t g_next_scan_ms;
 
-/* Opens the first user's controller; again every two seconds until it's there. */
-static void pad_open(void)
+typedef struct LoginList {
+    int32_t user[4]; /* -1: none */
+} LoginList;
+
+static void player_open(int i)
+{
+    Ps5Player *p = &g_players[i];
+    p->handle = scePadOpen(p->user, 0, 0, NULL);
+    if (p->handle < 0) {
+        p->handle = scePadGetHandle(p->user, 0, 0);
+    }
+    fprintf(stderr, "xemu PS5 pad: player %d: user %d, handle %d\n", i + 1,
+            p->user, p->handle);
+}
+
+/* Players 2-4 on the Xbox: plugged into a free port, or unplugged */
+static void player_plug(int i, bool on)
+{
+    ControllerState *state = g_players[i].state;
+    char msg[64];
+    if (!state || i == 0) {
+        return; /* Player 1 stays on port 1 (xemu_input_init) */
+    }
+    if (on && state->bound < 0) {
+        for (int k = 0; k < 4; k++) {
+            int port = (i + k) % 4;
+            if (!bound_controllers[port]) {
+                xemu_input_bind(port, state, 0);
+                xemu_input_rebind_xmu(port);
+                snprintf(msg, sizeof(msg), "Player %d's controller is on port %d",
+                         i + 1, port + 1);
+                xemu_queue_notification(msg);
+                fprintf(stderr, "xemu PS5 pad: %s\n", msg);
+                return;
+            }
+        }
+    } else if (!on && state->bound >= 0) {
+        int port = state->bound;
+        xemu_input_bind(port, NULL, 0);
+        snprintf(msg, sizeof(msg), "Player %d's controller is off (port %d)",
+                 i + 1, port + 1);
+        xemu_queue_notification(msg);
+        fprintf(stderr, "xemu PS5 pad: %s\n", msg);
+    }
+}
+
+/* From the UI thread with the BQL (xemu_input_update_controllers): plugging
+ * a port adds USB devices, so never from inside the Xbox's USB polling. */
+void xemu_input_ps5_pads_scan(void)
 {
     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-    if (pad_handle >= 0 || now < pad_next_open_ms) {
+    if (now < g_next_scan_ms) {
         return;
     }
-    pad_next_open_ms = now + 2000;
+    g_next_scan_ms = now + 2000;
 
     static bool initialized;
     if (!initialized) {
@@ -79,28 +145,75 @@ static void pad_open(void)
                 rc_pad);
         initialized = true;
     }
-    if (pad_user < 0 && sceUserServiceGetInitialUser(&pad_user) != 0) {
-        pad_user = -1;
+    Ps5Player *one = &g_players[0];
+    if (one->user < 0 && sceUserServiceGetInitialUser(&one->user) != 0) {
+        one->user = -1;
+    }
+    if (one->user >= 0 && one->handle < 0) {
+        player_open(0);
+    }
+
+    LoginList list;
+    memset(&list, 0xFF, sizeof(list));
+    if (sceUserServiceGetLoginUserIdList(&list) != 0) {
         return;
     }
-
-    pad_handle = scePadOpen(pad_user, 0, 0, NULL);
-    if (pad_handle < 0) {
-        pad_handle = scePadGetHandle(pad_user, 0, 0);
+    /* Signed out: unplugged */
+    for (int i = 1; i < PS5_PLAYERS; i++) {
+        Ps5Player *p = &g_players[i];
+        bool in = false;
+        for (int k = 0; k < 4; k++) {
+            in |= p->user >= 0 && list.user[k] == p->user;
+        }
+        if (p->user >= 0 && !in) {
+            if (p->handle >= 0) {
+                scePadClose(p->handle);
+            }
+            fprintf(stderr, "xemu PS5 pad: player %d (user %d) signed out\n",
+                    i + 1, p->user);
+            p->user = p->handle = -1;
+            p->ui = 0;
+            player_plug(i, false);
+        }
     }
-    fprintf(stderr, "xemu PS5 pad: user %d, handle %d\n", pad_user,
-            pad_handle);
+    /* Signed in: the next free player */
+    for (int k = 0; k < 4; k++) {
+        int32_t user = list.user[k];
+        bool known = user == -1;
+        for (int i = 0; i < PS5_PLAYERS && !known; i++) {
+            known = g_players[i].user == user;
+        }
+        for (int i = 1; i < PS5_PLAYERS && !known; i++) {
+            if (g_players[i].user < 0) {
+                g_players[i].user = user;
+                known = true;
+            }
+        }
+    }
+    for (int i = 1; i < PS5_PLAYERS; i++) {
+        Ps5Player *p = &g_players[i];
+        if (p->user >= 0 && p->handle < 0) {
+            player_open(i);
+        }
+        if (p->handle >= 0) {
+            player_plug(i, true);
+        }
+    }
 }
 
-ControllerState *xemu_input_ps5_pad_create(void)
+ControllerState *xemu_input_ps5_pad_create(int player)
 {
+    static const char *const names[PS5_PLAYERS] = {
+        "DualSense", "DualSense (player 2)", "DualSense (player 3)",
+        "DualSense (player 4)",
+    };
     ControllerState *state = g_new0(ControllerState, 1);
     state->type = INPUT_DEVICE_PS5_PAD;
-    state->name = "DualSense";
+    state->name = names[player & 3];
     state->bound = -1;
     state->peripheral_types[0] = PERIPHERAL_NONE;
     state->peripheral_types[1] = PERIPHERAL_NONE;
-    pad_open();
+    g_players[player & 3].state = state;
     return state;
 }
 
@@ -297,17 +410,23 @@ void xemu_input_update_ps5_pad_state(ControllerState *state)
     state->buttons = 0;
     memset(state->axis, 0, sizeof(state->axis));
 
-    pad_open();
+    int player = 0;
+    while (player < PS5_PLAYERS && g_players[player].state != state) {
+        player++;
+    }
     PadData d;
-    if (pad_handle < 0 || scePadReadState(pad_handle, &d) != 0) {
+    if (player == PS5_PLAYERS || g_players[player].handle < 0 ||
+        scePadReadState(g_players[player].handle, &d) != 0) {
         return;
     }
     if (!g_map_loaded) {
         map_load();
     }
-    g_raw_buttons = d.buttons;
-    g_raw_l2 = d.l2;
-    g_raw_r2 = d.r2;
+    if (player == 0) { /* The button tester follows player 1 */
+        g_raw_buttons = d.buttons;
+        g_raw_l2 = d.l2;
+        g_raw_r2 = d.r2;
+    }
 
     /* The games: the buttons as mapped. */
     static uint32_t told; /* Remapped controls already logged */
@@ -345,13 +464,25 @@ void xemu_input_update_ps5_pad_state(ControllerState *state)
     if (d.buttons & PAD_TOUCHPAD) {
         ui |= CONTROLLER_BUTTON_GUIDE;
     }
-    g_ui_buttons = ui;
+    g_players[player].ui = ui;
+    g_ui_buttons = g_players[0].ui; /* Only player 1 works the dashboard */
     (void)trigger;
+}
+
+/* Which player a DualSense is (0-3), or -1 if it isn't one */
+int xemu_ps5_pad_player(const ControllerState *state)
+{
+    for (int i = 0; i < PS5_PLAYERS; i++) {
+        if (g_players[i].state == state) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 /* XPSemu: the dashboard's controller icon (top right): the pad is open. */
 int xemu_ps5_pad_connected(void);
 int xemu_ps5_pad_connected(void)
 {
-    return pad_handle >= 0;
+    return g_players[0].handle >= 0;
 }

@@ -15,9 +15,11 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -228,4 +230,50 @@ ssize_t xemu_ps5_readlink(const char *path, char *buf, size_t size)
 void xemu_ps5_setbuf(FILE *stream, char *buf)
 {
     setvbuf(stream, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
+}
+
+/*
+ * Strings libc allocates itself. The title's malloc goes to the SDK
+ * platform's heap in direct memory (radv-link.sh --wrap=malloc), but libc's
+ * own strdup and asprintf still take its small private heap, and the Vulkan
+ * renderer keeps every shader's GLSL and uniform names that way: Ninja
+ * Gaiden Black ran it out in minutes (strdup gave NULL, strcmp crashed in
+ * shader_cache_entry_init). These allocate with the title's malloc.
+ */
+char *xemu_ps5_strndup(const char *s, size_t n)
+{
+    size_t len = strnlen(s, n);
+    char *copy = malloc(len + 1);
+    if (copy) {
+        memcpy(copy, s, len);
+        copy[len] = 0;
+    }
+    return copy;
+}
+
+char *xemu_ps5_strdup(const char *s)
+{
+    return xemu_ps5_strndup(s, SIZE_MAX);
+}
+
+int xemu_ps5_vasprintf(char **out, const char *format, va_list ap)
+{
+    va_list copy;
+    va_copy(copy, ap);
+    int len = vsnprintf(NULL, 0, format, copy);
+    va_end(copy);
+    *out = len < 0 ? NULL : malloc((size_t)len + 1);
+    if (!*out) {
+        return -1;
+    }
+    return vsnprintf(*out, (size_t)len + 1, format, ap);
+}
+
+int xemu_ps5_asprintf(char **out, const char *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    int len = xemu_ps5_vasprintf(out, format, ap);
+    va_end(ap);
+    return len;
 }

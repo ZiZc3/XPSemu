@@ -25,6 +25,7 @@
 #include "accel/tcg/probe.h"
 #include "exec/page-protection.h"
 #include "system/memory.h"
+#include "hw/xbox/xemu-timing.h"
 #include "system/physmem.h"
 #include "accel/tcg/cpu-ldst-common.h"
 #include "accel/tcg/cpu-mmu-index.h"
@@ -1345,6 +1346,8 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
 
     if (!physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
+        __atomic_fetch_add(&xemu_timing_count[XT_SMC_WRITE], 1,
+                           __ATOMIC_RELAXED);
         tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);
     }
 

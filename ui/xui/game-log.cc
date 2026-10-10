@@ -34,9 +34,11 @@
 #include "../xemu-os-utils.h"
 #include "../../hw/xbox/xemu-timing.h"
 #include "xemu-version.h"
+#include "../xemu-dev-ps5.h"
 
 #ifdef __PROSPERO__
 extern "C" int sceKernelAvailableFlexibleMemorySize(size_t *available);
+extern "C" int xemu_ps5_threads_made;
 #endif
 
 static int g_fd = -1;     // The game's log
@@ -161,6 +163,9 @@ static std::string Elapsed(double seconds)
 void GameLogStart(const GameLogInfo &info)
 {
     GameLogStop("another game started");
+#if XPSEMU_DEV
+    xemu_dev_journal('G', "%08X %s", info.title_id, info.name.c_str());
+#endif
 
     std::string path = std::string(xemu_settings_get_base_path()) +
                        "xemu-game.log";
@@ -183,12 +188,12 @@ void GameLogStart(const GameLogInfo &info)
     std::string h = "== XPSemu game log ==\n";
     snprintf(buf, sizeof(buf),
              "Started      %s\n"
-             "XPSemu       Alpha 2, based on xemu %s\n"
+             "XPSemu       Alpha 2.1%s, based on xemu %s\n"
              "Game         %s\n"
              "File         %s (%lld MB, %s)\n"
              "Title ID     %08X   key %s\n"
              "XBE title    %s\n",
-             now, xemu_version, info.name.c_str(), info.path.c_str(), size_mb,
+             now, XPSEMU_DEV ? " DEV" : "", xemu_version, info.name.c_str(), info.path.c_str(), size_mb,
              info.full_disc ? "full disc image - xemu needs XISO" : "XISO",
              info.title_id, info.key.c_str(),
              info.xbe_title.empty() ? "(none)" : info.xbe_title.c_str());
@@ -226,7 +231,7 @@ void GameLogStart(const GameLogInfo &info)
     h += buf;
     h += "Patches      ";
     h += info.patches.empty() ? "none\n" : "\n" + info.patches;
-    h += "\nEvery 5 s, two lines:\n"
+    h += "\nEvery 5 s, these lines:\n"
          "  time, frames the game drew (FPS), last frame time (the slowest, "
          "and frames over 50 ms), whole CPU (% of one core), the Xbox's CPU "
          "and GPU threads and the UI (% of their core), free memory\n"
@@ -238,6 +243,18 @@ void GameLogStart(const GameLogInfo &info)
          "and waiting for it, waiting for one-off jobs, copying surfaces "
          "back, and idle; the CPU thread running the game and idle; the UI "
          "getting the game's frame and presenting\n"
+         "  and a fourth: the frames by how long they took (60, 30, 20 FPS "
+         "and hitches of 55 ms or more), the times the UI got the frame "
+         "late, and whole-TLB wipes by cause; then the worst hitches, with "
+         "what the GPU emulation did in them (shaders and pipelines with "
+         "the ms they took)\n"
+         "  and shaders and pipelines made: ms per second, how many, and "
+         "the slowest one\n"
+         "  and the Xbox CPU's translated code: blocks translated (and the "
+         "ms per second it took), thrown-away blocks reused as they were, "
+         "what threw blocks away (CPU stores into pages with code, code "
+         "rewriting itself, device writes), and the guest pages that lost "
+         "the most\n"
          "Other lines are the emulator's messages meanwhile (from "
          "xemu.log).\n\n";
     Write(h);
@@ -270,6 +287,9 @@ void GameLogStop(const char *why)
     if (g_fd < 0) {
         return;
     }
+#if XPSEMU_DEV
+    xemu_dev_journal('E', "%s", why);
+#endif
     pgraph_vk_request_cache_save(); // Keep what this game built
     xemu_ps5_game_log_copy();
     WriteProfile("Whole game:");
@@ -350,6 +370,13 @@ void GameLogTick()
     unsigned int n = std::min(frames, (unsigned int)NV2A_PROF_NUM_FRAMES);
     int worst = 0, slow = 0;
     long c[NV2A_PROF__COUNT] = { 0 };
+    // Frame times by what they look like on a 60 Hz game: 60, 30, 20 FPS
+    // frames and hitches (55 ms and more); the worst hitches are listed.
+    int spread[4] = { 0 };
+    struct Hitch {
+        int ms, shaders, pipelines, down, up, tex, shader_us, pipeline_us;
+    };
+    Hitch hitch[3] = {};
     for (unsigned int j = 0; j < n; j++) {
         const auto &f = g_nv2a_stats.frame_history
             [(g_nv2a_stats.frame_ptr + NV2A_PROF_NUM_FRAMES - 1 - j) %
@@ -359,6 +386,21 @@ void GameLogTick()
         }
         worst = std::max(worst, f.mspf);
         slow += f.mspf > 50;
+        spread[f.mspf <= 20 ? 0 : f.mspf <= 37 ? 1 : f.mspf < 55 ? 2 : 3]++;
+        if (f.mspf >= 55) {
+            Hitch h = { f.mspf, f.counters[NV2A_PROF_SHADER_GEN],
+                        f.counters[NV2A_PROF_PIPELINE_GEN],
+                        f.counters[NV2A_PROF_SURF_DOWNLOAD],
+                        f.counters[NV2A_PROF_SURF_UPLOAD],
+                        f.counters[NV2A_PROF_TEX_UPLOAD],
+                        f.counters[NV2A_PROF_SHADER_US],
+                        f.counters[NV2A_PROF_PIPELINE_US] };
+            for (int k = 0; k < 3; k++) {
+                if (h.ms > hitch[k].ms) {
+                    std::swap(h, hitch[k]);
+                }
+            }
+        }
         for (int k = 0; k < NV2A_PROF__COUNT; k++) {
             c[k] += f.counters[k];
         }
@@ -390,7 +432,7 @@ void GameLogTick()
              "Xbox CPU %3d%%  Xbox GPU %3d%%  UI %3d%%  free %4ld MB%s\n"
              "           draws %ld  shaders +%u (%u from cache)  "
              "pipelines +%ld  surfaces down %ld up %ld  textures %ld  "
-             "GPU waits %ld\n",
+             "GPU waits %ld  threads made %d\n",
              Elapsed(now - g_started).c_str(), frames / interval, mspf, worst,
              slow, cpu_percent, thread[XEMU_PS5_THREAD_CPU],
              thread[XEMU_PS5_THREAD_GPU], thread[XEMU_PS5_THREAD_UI],
@@ -398,7 +440,8 @@ void GameLogTick()
              !running ? "  (paused)" : in_menu ? "  (in the dashboard)" : "",
              c[NV2A_PROF_BEGIN_ENDS], misses, hits, c[NV2A_PROF_PIPELINE_GEN],
              c[NV2A_PROF_SURF_DOWNLOAD], c[NV2A_PROF_SURF_UPLOAD],
-             c[NV2A_PROF_TEX_UPLOAD], waits);
+             c[NV2A_PROF_TEX_UPLOAD], waits,
+             __atomic_load_n(&xemu_ps5_threads_made, __ATOMIC_RELAXED));
     Write(buf);
 
     // The stopwatches (hw/xbox/xemu-timing.h): ms per second, and times.
@@ -424,6 +467,63 @@ void GameLogTick()
              ms[XT_CPU_IDLE], ms[XT_UI_FRAME], times[XT_UI_FRAME],
              ms[XT_UI_PRESENT], times[XT_TB_INVAL], times[XT_JC_FLUSH]);
     Write(buf);
+
+    // Steadiness: how the frames were spread, the UI waiting for a frame,
+    // and what wiped the CPU's caches (each wipe costs re-lookups).
+    snprintf(buf, sizeof(buf),
+             "           frames: 60fps %d, 30fps %d, 20fps %d, hitches %d | "
+             "UI late %u | TLB wipes: CR3 %u, CR4 %u, CR0 %u\n",
+             spread[0], spread[1], spread[2], spread[3], times[XT_UI_STALL],
+             times[XT_FLUSH_CR3], times[XT_FLUSH_CR4], times[XT_FLUSH_CR0]);
+    Write(buf);
+
+    // Shader modules and pipelines: time per second, how many, the slowest.
+    double slowest[XT__COUNT];
+    for (int i : { XT_SHADER, XT_PIPELINE }) {
+        slowest[i] = __atomic_exchange_n(&xemu_timing_max_ns[i], 0,
+                                         __ATOMIC_RELAXED) / 1e6;
+    }
+    snprintf(buf, sizeof(buf),
+             "           shaders: %.0f ms/s (%u made), slowest %.1f ms | "
+             "pipelines: %.0f ms/s (%u built), slowest %.1f ms\n",
+             ms[XT_SHADER], times[XT_SHADER], slowest[XT_SHADER],
+             ms[XT_PIPELINE], times[XT_PIPELINE], slowest[XT_PIPELINE]);
+    Write(buf);
+
+    // The Xbox CPU's translated code: made and reused, what threw it away,
+    // and the guest pages that lost the most blocks.
+    unsigned int top_page[3] = { 0 }, top_hits[3] = { 0 };
+    for (int i = 0; i < XEMU_INVAL_PAGES; i++) {
+        unsigned int hits =
+            __atomic_exchange_n(&xemu_inval_hits[i], 0, __ATOMIC_RELAXED);
+        unsigned int page =
+            __atomic_load_n(&xemu_inval_page[i], __ATOMIC_RELAXED);
+        for (int k = 0; k < 3; k++) {
+            if (hits > top_hits[k]) {
+                std::swap(hits, top_hits[k]);
+                std::swap(page, top_page[k]);
+            }
+        }
+    }
+    snprintf(buf, sizeof(buf),
+             "           CPU code: translated %u (%.0f ms/s), reused %u | "
+             "thrown away %u: CPU stores into code %u, rewrote itself %u, by "
+             "devices %u | most: %08x %u, %08x %u, %08x %u\n",
+             times[XT_TB_GEN] - times[XT_TB_REVIVE], ms[XT_TB_GEN],
+             times[XT_TB_REVIVE], times[XT_TB_INVAL], times[XT_SMC_WRITE],
+             times[XT_SMC_EXIT], times[XT_TB_INVAL_DMA], top_page[0] << 12,
+             top_hits[0], top_page[1] << 12, top_hits[1], top_page[2] << 12,
+             top_hits[2]);
+    Write(buf);
+    for (int k = 0; k < 3 && hitch[k].ms; k++) {
+        snprintf(buf, sizeof(buf),
+                 "           hitch %d ms: shaders made %d (%.1f ms), pipelines "
+                 "%d (%.1f ms), surfaces down %d up %d, textures %d\n",
+                 hitch[k].ms, hitch[k].shaders, hitch[k].shader_us / 1000.0,
+                 hitch[k].pipelines, hitch[k].pipeline_us / 1000.0,
+                 hitch[k].down, hitch[k].up, hitch[k].tex);
+        Write(buf);
+    }
 
     // A game that runs but draws nothing is the black screen case.
     if (running && !in_menu && frames == 0) {

@@ -24,6 +24,9 @@ NV2AStats g_nv2a_stats;
 
 /* XPSemu's stopwatches (hw/xbox/xemu-timing.h). */
 uint64_t xemu_timing_ns[XT__COUNT];
+uint64_t xemu_timing_max_ns[XT__COUNT];
+uint32_t xemu_inval_page[XEMU_INVAL_PAGES];
+uint32_t xemu_inval_hits[XEMU_INVAL_PAGES];
 uint32_t xemu_timing_count[XT__COUNT];
 
 void nv2a_profile_increment(void)

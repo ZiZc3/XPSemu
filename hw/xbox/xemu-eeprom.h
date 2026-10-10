@@ -31,6 +31,13 @@ extern "C" {
 bool xemu_eeprom_get_video_flags(uint32_t *flags);
 bool xemu_eeprom_set_video_flags(uint32_t flags);
 
+/* The language games use when they have it (the Xbox's XC_LANGUAGE_*):
+ * 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian,
+ * 7 Korean, 8 Chinese, 9 Portuguese. Like the video flags, from the next
+ * game started. */
+bool xemu_eeprom_get_language(uint32_t *language);
+bool xemu_eeprom_set_language(uint32_t language);
+
 #ifdef __cplusplus
 }
 #endif
