@@ -46,6 +46,8 @@ Around that sits the rest of an Xbox, from the [hakuX](https://github.com/rfanda
 - Built-in 60 FPS patches (Doom 3, Half-Life 2, and much more)
 - FPS cap and PAL 60 Hz per game
 
+</details>
+
 <details open>
 <summary><strong>&nbsp; Dashboard</strong></summary>
 <br>
