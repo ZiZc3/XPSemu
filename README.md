@@ -43,7 +43,7 @@ Around that sits the rest of an Xbox, from the [hakuX](https://github.com/rfanda
 
 - **Frame Generation**: Off, Auto, x2, x3, x4. Auto takes 30 FPS games to 60 and 60 to 120
 - **120 Hz** for games that run at 120 with patches.
-- Built-in 60 FPS patches with unlocks (Doom 3, Half-Life 2, and much more)
+- Built-in 60 FPS patches (Doom 3, Half-Life 2, and much more)
 - FPS cap and PAL 60 Hz per game
 
 <details open>
