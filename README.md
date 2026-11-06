@@ -19,7 +19,7 @@
 
 XPSemu is an original Xbox emulator for the PlayStation 5, running as a native app.
 
-The PS5 and the original Xbox both have **x86 CPUs**. So instead of translating every Xbox instruction (slow), XPSemu **lets the game's code run directly on the PS5's CPU**. Only the few instructions that need the Xbox's hardware are caught and handled.
+The PS5 and the original Xbox both have **x86 CPUs**. So instead of translating every Xbox instruction (slow, Pre-Alpha 3.0), XPSemu **lets the game's code run directly on the PS5's CPU**. Only the few instructions that need the Xbox's hardware are caught and handled.
 
 Around that sits the rest of an Xbox, from the [hakuX](https://github.com/rfandango/hakuX) core: its own Xbox kernel, the NV2A graphics drawn through Vulkan on an open-source driver (RADV, from [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan)), and the MCPX sound.
 
