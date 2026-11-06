@@ -1,0 +1,3 @@
+section APU
+record NcApuState
+  version_id I32 x1 since 1

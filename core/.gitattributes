@@ -1,0 +1,13 @@
+# hakuX: text files are LF in the repository and in every checkout (with
+# core.autocrlf a Windows checkout had them CRLF, gradlew among them, and
+# files were committed with mixed endings); batch files keep CRLF
+*               text=auto eol=lf
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+
+*.c.inc         diff=c
+*.h.inc         diff=c
+*.py            diff=python
+
+# hakuX: shell scripts must keep LF (bash fails on CR), also on Windows checkouts
+*.sh            text eol=lf

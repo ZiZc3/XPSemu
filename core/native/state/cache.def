@@ -1,0 +1,28 @@
+/* The title's cache drives (native/state/cache.c): per partition, its raw
+ * head (raw-partition<n>.bin: the FATX superblock; partition 0's holds the
+ * cache table) of raw_len bytes, its folders, and its files as content
+ * hashes into the game's blob store (blobs/ next to the state). Partition 0
+ * stores its head only. */
+NC_SECTION(CACHE)
+
+NC_REC(NcCacheState, 4)
+NC_F(NcCacheState, nparts, U32, 1, 1, 0)
+NC_END(NcCacheState)
+
+NC_REC(NcCachePart, 16)
+NC_F(NcCachePart, part, U32, 1, 1, 0)
+NC_F(NcCachePart, raw_len, U32, 1, 1, 0)
+NC_F(NcCachePart, ndirs, U32, 1, 1, 0)
+NC_F(NcCachePart, nfiles, U32, 1, 1, 0)
+NC_END(NcCachePart)
+
+NC_REC(NcCacheDir, 256)
+NC_F(NcCacheDir, path, U8, 256, 1, 0)
+NC_END(NcCacheDir)
+
+NC_REC(NcCacheFile, 288)
+NC_F(NcCacheFile, path, U8, 256, 1, 0)
+NC_F(NcCacheFile, size, U64, 1, 1, 0)
+NC_F(NcCacheFile, mtime_ns, U64, 1, 1, 0)
+NC_F(NcCacheFile, hash, U8, 16, 1, 0)
+NC_END(NcCacheFile)

@@ -1,0 +1,42 @@
+section USB
+record Ohci
+  ctl U32 x1 since 1
+  status U32 x1 since 1
+  intr_status U32 x1 since 1
+  intr U32 x1 since 1
+  hcca U32 x1 since 1
+  ctrl_head U32 x1 since 1
+  ctrl_cur U32 x1 since 1
+  bulk_head U32 x1 since 1
+  bulk_cur U32 x1 since 1
+  per_cur U32 x1 since 1
+  done U32 x1 since 1
+  done_count I32 x1 since 1
+  fi U32 x1 since 1
+  fsmps U32 x1 since 1
+  fit U32 x1 since 1
+  pstart U32 x1 since 1
+  lst U32 x1 since 1
+  frame_number U16 x1 since 1
+  rhdesc_a U32 x1 since 1
+  rhdesc_b U32 x1 since 1
+  rhstatus U32 x1 since 1
+  port U32 x4 since 1
+  irq BOOL x1 since 1
+  frames U64 x1 since 1
+  tds U64 x1 since 1
+record NcUsbDev
+  addr U8 x1 since 1
+  config U8 x1 since 1
+  setup U8 x8 since 1
+  buf U8 x512 since 1
+  len I32 x1 since 1
+  pos I32 x1 since 1
+  in BOOL x1 since 1
+  data_stage BOOL x1 since 1
+  stalled BOOL x1 since 1
+  pending_addr I32 x1 since 1
+record NcUsbHubState
+  nports U32 x1 since 1
+  status U16 x5 since 1
+  change U16 x5 since 1

@@ -1,0 +1,3 @@
+section MISC
+record NcMiscState
+  npages U32 x1 since 1

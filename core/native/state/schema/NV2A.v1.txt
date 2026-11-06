@@ -1,0 +1,5 @@
+section NV2A
+record NcNv2aState
+  vblanks U64 x1 since 1
+  frame_ns U64 x1 since 1
+  npages U32 x1 since 1

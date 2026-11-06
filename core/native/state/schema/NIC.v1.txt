@@ -1,0 +1,6 @@
+section NIC
+record Nvnet
+  regs U8 x1024 since 1
+  phy U32 x6 since 1
+  tx_off U32 x1 since 1
+  tx_buf U8 x1628 since 1

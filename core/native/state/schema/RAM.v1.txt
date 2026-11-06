@@ -1,0 +1,4 @@
+section RAM
+record NcRamState
+  ram_size U32 x1 since 1
+  block U32 x1 since 1

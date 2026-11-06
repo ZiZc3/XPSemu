@@ -1,0 +1,8 @@
+section VM
+record NcVmState
+  ram_size U32 x1 since 1
+  nruns U32 x1 since 1
+record NcVmRun
+  va U32 x1 since 1
+  pa U32 x1 since 1
+  pages U32 x1 since 1

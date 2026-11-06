@@ -1,0 +1,8 @@
+/* The device windows without a device of their own (native/dev/nv2a.c's
+ * misc: NIC, flash, ...): their pages that aren't all zero (each: its
+ * index, then its bytes). */
+NC_SECTION(MISC)
+
+NC_REC(NcMiscState, 4)
+NC_F(NcMiscState, npages, U32, 1, 1, 0)
+NC_END(NcMiscState)

@@ -1,0 +1,8 @@
+section PAGE
+record NcPagingState
+  pd_pa U32 x1 since 1
+  pd_applied U32 x1024 since 1
+  ntables U32 x1 since 1
+record NcPagingTable
+  pde U32 x1 since 1
+  pte U32 x1024 since 1

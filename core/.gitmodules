@@ -1,0 +1,4 @@
+[submodule "external/fex"]
+	path = external/fex
+	url = https://github.com/rfandango/FEX.git
+	branch = hakuX

@@ -1,0 +1,20 @@
+section ACI
+record Channel
+  bdbar U32 x1 since 1
+  civ U8 x1 since 1
+  lvi U8 x1 since 1
+  piv U8 x1 since 1
+  cr U8 x1 since 1
+  sr U16 x1 since 1
+  picb U16 x1 since 1
+  bd_valid BOOL x1 since 1
+  bd_addr U32 x1 since 1
+  bd_ctl U32 x1 since 1
+record Aci
+  glob_cnt U32 x1 since 1
+  glob_sta U32 x1 since 1
+  cas U32 x1 since 1
+  ch rec Channel x8 since 1
+  mixer U8 x256 since 1
+  irq BOOL x1 since 1
+  po_bytes U64 x1 since 1

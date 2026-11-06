@@ -1,0 +1,15 @@
+section CACHE
+record NcCacheState
+  nparts U32 x1 since 1
+record NcCachePart
+  part U32 x1 since 1
+  raw_len U32 x1 since 1
+  ndirs U32 x1 since 1
+  nfiles U32 x1 since 1
+record NcCacheDir
+  path U8 x256 since 1
+record NcCacheFile
+  path U8 x256 since 1
+  size U64 x1 since 1
+  mtime_ns U64 x1 since 1
+  hash U8 x16 since 1

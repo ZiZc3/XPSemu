@@ -1,0 +1,14 @@
+/* A title's own page tables (native/kernel/paging.c): the directory and the
+ * entries applied so far (the mappings are the VM section's). */
+NC_SECTION(PAGE)
+
+NC_REC(NcPagingState, 4104)
+NC_F(NcPagingState, pd_pa, U32, 1, 1, 0)
+NC_F(NcPagingState, pd_applied, U32, 1024, 1, 0)
+NC_F(NcPagingState, ntables, U32, 1, 1, 0)
+NC_END(NcPagingState)
+
+NC_REC(NcPagingTable, 4100)
+NC_F(NcPagingTable, pde, U32, 1, 1, 0)
+NC_F(NcPagingTable, pte, U32, 1024, 1, 0)
+NC_END(NcPagingTable)

@@ -1,0 +1,15 @@
+/* The mods' XBE patches in the state's memory (native/core/mods.c): the
+ * patches of the mods on when it was saved, each its XBE's name, VA and
+ * length, then n bytes of the disc's there and n of the mod's. A load with
+ * other mods on takes these back before it writes the run's. */
+NC_SECTION(MODS)
+
+NC_REC(NcModsState, 4)
+NC_F(NcModsState, npatches, U32, 1, 1, 0)
+NC_END(NcModsState)
+
+NC_REC(NcModsPatch, 136)
+NC_F(NcModsPatch, xbe, U8, 128, 1, 0)
+NC_F(NcModsPatch, va, U32, 1, 1, 0)
+NC_F(NcModsPatch, n, U32, 1, 1, 0)
+NC_END(NcModsPatch)

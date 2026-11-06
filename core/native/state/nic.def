@@ -1,0 +1,19 @@
+/* The MCPX Ethernet controller (native/dev/nvnet.c): its registers and
+ * PHY, and a frame gathered over TX descriptors. The network behind it
+ * isn't kept: a loaded state's link negotiates again. */
+NC_SECTION(NIC)
+
+NC_REC(Nvnet, 2744)
+NC_SKIP(Nvnet, vm)
+NC_SKIP(Nvnet, lock)
+NC_SKIP(Nvnet, kick)
+NC_F(Nvnet, regs, U8, 1024, 1, 0)
+NC_F(Nvnet, phy, U32, 6, 1, 0)
+NC_F(Nvnet, tx_off, U32, 1, 1, 0)
+NC_F(Nvnet, tx_buf, U8, 1628, 1, 0)
+NC_SKIP(Nvnet, autoneg_at)
+NC_SKIP(Nvnet, irq)
+NC_SKIP(Nvnet, tx_frames)
+NC_SKIP(Nvnet, rx_frames)
+NC_SKIP(Nvnet, rx_dropped)
+NC_END(Nvnet)

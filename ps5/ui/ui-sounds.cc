@@ -1,0 +1,471 @@
+//
+// XPSemu: the dashboard's sounds
+//
+// XPSemu's own sounds: recordings embedded in the app (ps5/sounds, made
+// into ui-sounds-data.h by ps5/sounds/embed-sounds.py), and the rest
+// synthesized here (glassy ticks and chimes, airy whooshes). A WAV in
+// /data/xemu/sounds replaces either. They're mixed into the console audio
+// output by the audio thread (hw/xbox/mcpx/apu/monitor.c), which keeps
+// running, playing silence, while the emulated Xbox is paused behind the
+// dashboard.
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+#include <algorithm>
+#include <math.h>
+#include <mutex>
+#include <stdint.h>
+#include <string>
+#include <vector>
+
+#include <SDL3/SDL.h>
+
+#include "ui-sounds.hh"
+#include "ui-sounds-data.h"
+#include "xog_ui.h"
+
+static const int kRate = 48000;
+
+// Interleaved stereo, -1 .. 1.
+typedef std::vector<float> Samples;
+
+//
+// Synthesis
+//
+
+struct Synth {
+    Samples out;
+    explicit Synth(float seconds) : out((size_t)(seconds * kRate) * 2, 0) {}
+    size_t frames() const { return out.size() / 2; }
+
+    // A tone from start (s) with an attack, then an exponential decay (tau,
+    // s), its pitch gliding from f0 to f1, a little louder on one side.
+    void Tone(float start, float length, float f0, float f1, float amp,
+              float attack, float tau, float pan = 0, float harmonic = 0)
+    {
+        double phase = 0;
+        size_t first = (size_t)(start * kRate);
+        size_t n = (size_t)(length * kRate);
+        for (size_t i = 0; i < n && first + i < frames(); i++) {
+            float t = (float)i / kRate;
+            float f = f0 + (f1 - f0) * (t / length);
+            phase += 2 * M_PI * f / kRate;
+            float env = (t < attack ? t / attack : 1) * expf(-t / tau);
+            float v = sinf(phase) + harmonic * sinf(2 * phase) +
+                      harmonic * 0.5f * sinf(3 * phase);
+            v *= amp * env;
+            out[(first + i) * 2] += v * (1 - pan) * 0.5f * 2;
+            out[(first + i) * 2 + 1] += v * (1 + pan) * 0.5f * 2;
+        }
+    }
+
+    // Filtered noise (a whoosh): a one-pole low-pass whose cutoff glides
+    // from c0 to c1 Hz, shaped by a rise then fall envelope.
+    void Whoosh(float start, float length, float c0, float c1, float amp,
+                float peak)
+    {
+        uint32_t seed = 12345;
+        float lp = 0, lp2 = 0;
+        size_t first = (size_t)(start * kRate);
+        size_t n = (size_t)(length * kRate);
+        for (size_t i = 0; i < n && first + i < frames(); i++) {
+            float t = (float)i / n;
+            seed = seed * 1664525u + 1013904223u;
+            float white = ((seed >> 9) / 8388608.0f) - 1;
+            float cutoff = c0 + (c1 - c0) * t;
+            float k = 1 - expf(-2 * M_PI * cutoff / kRate);
+            lp += k * (white - lp);
+            lp2 += k * (lp - lp2);
+            float band = lp - lp2 * 0.6f; // Less rumble
+            float env = t < peak ? t / peak : (1 - t) / (1 - peak);
+            env = env * env;
+            float v = band * amp * env * 2.5f;
+            // Sweep across the stereo field as it goes.
+            out[(first + i) * 2] += v * (1.2f - t);
+            out[(first + i) * 2 + 1] += v * (0.2f + t);
+        }
+    }
+
+    // A simple echo, for space.
+    void Echo(float delay, float feedback)
+    {
+        size_t d = (size_t)(delay * kRate) * 2;
+        for (size_t i = d; i < out.size(); i++) {
+            out[i] += out[i - d] * feedback;
+        }
+    }
+};
+
+static Samples Make(UiSound sound)
+{
+    switch (sound) {
+    case UI_SOUND_MOVE: { // A short glassy tick
+        Synth s(0.09f);
+        s.Tone(0, 0.08f, 2090, 2000, 0.30f, 0.001f, 0.018f, 0, 0.25f);
+        s.Tone(0, 0.06f, 3140, 3100, 0.10f, 0.001f, 0.010f);
+        return s.out;
+    }
+    case UI_SOUND_CHANGE: { // A lower, softer tick
+        Synth s(0.09f);
+        s.Tone(0, 0.08f, 1480, 1400, 0.28f, 0.001f, 0.020f, 0, 0.3f);
+        return s.out;
+    }
+    case UI_SOUND_SELECT: { // Two rising chime notes
+        Synth s(0.45f);
+        s.Tone(0.000f, 0.25f, 988, 988, 0.26f, 0.002f, 0.06f, -0.3f, 0.2f);
+        s.Tone(0.055f, 0.35f, 1480, 1480, 0.26f, 0.002f, 0.09f, 0.3f, 0.2f);
+        s.Tone(0.055f, 0.35f, 2960, 2960, 0.05f, 0.002f, 0.05f, 0.3f);
+        s.Echo(0.085f, 0.22f);
+        return s.out;
+    }
+    case UI_SOUND_BACK: { // A falling blip with a puff of air
+        Synth s(0.25f);
+        s.Tone(0, 0.14f, 1250, 560, 0.26f, 0.002f, 0.05f, 0, 0.2f);
+        s.Whoosh(0, 0.18f, 2500, 600, 0.10f, 0.15f);
+        return s.out;
+    }
+    case UI_SOUND_OPEN: { // A soft rising whoosh and a low chord
+        Synth s(0.9f);
+        s.Whoosh(0, 0.55f, 300, 3500, 0.22f, 0.7f);
+        s.Tone(0.25f, 0.6f, 330, 330, 0.12f, 0.12f, 0.25f, -0.4f);
+        s.Tone(0.25f, 0.6f, 494, 494, 0.10f, 0.12f, 0.25f, 0.4f);
+        s.Tone(0.30f, 0.5f, 1976, 1976, 0.04f, 0.05f, 0.12f);
+        s.Echo(0.12f, 0.25f);
+        return s.out;
+    }
+    case UI_SOUND_LAUNCH: { // A big swell into a shimmering chord
+        Synth s(1.6f);
+        s.Whoosh(0, 0.9f, 200, 6000, 0.30f, 0.85f);
+        const float chord[] = { 329.6f, 415.3f, 493.9f, 659.3f, 987.8f };
+        for (int i = 0; i < 5; i++) {
+            s.Tone(0.7f + i * 0.03f, 0.8f, chord[i], chord[i] * 1.003f,
+                   0.10f, 0.01f, 0.30f, i % 2 ? 0.4f : -0.4f, 0.15f);
+        }
+        s.Tone(0.7f, 0.6f, 1975.5f, 1975.5f, 0.05f, 0.005f, 0.12f);
+        s.Echo(0.14f, 0.3f);
+        return s.out;
+    }
+    case UI_SOUND_NOTIFY: { // Two soft bright notes
+        Synth s(0.5f);
+        s.Tone(0.00f, 0.3f, 1319, 1319, 0.20f, 0.003f, 0.08f, -0.2f, 0.2f);
+        s.Tone(0.09f, 0.4f, 1760, 1760, 0.20f, 0.003f, 0.10f, 0.2f, 0.2f);
+        s.Echo(0.1f, 0.2f);
+        return s.out;
+    }
+    case UI_SOUND_FLASH: { // A bright burst: a low hit, a crack of air,
+                           // a shimmering chord ringing out
+        Synth s(2.2f);
+        s.Tone(0, 0.5f, 110, 55, 0.30f, 0.002f, 0.12f, 0, 0.5f);
+        s.Whoosh(0, 0.35f, 9000, 1500, 0.22f, 0.04f);
+        const float chord[] = { 659.3f, 987.8f, 1318.5f, 1975.5f, 2637.0f };
+        for (int i = 0; i < 5; i++) {
+            s.Tone(0.01f + i * 0.012f, 1.6f, chord[i], chord[i] * 1.004f,
+                   0.07f, 0.004f, 0.45f, i % 2 ? 0.5f : -0.5f, 0.1f);
+        }
+        s.Tone(0.02f, 1.2f, 3951, 3960, 0.025f, 0.01f, 0.25f);
+        s.Echo(0.16f, 0.32f);
+        return s.out;
+    }
+    case UI_SOUND_ERROR: { // Two dull low bumps
+        Synth s(0.3f);
+        s.Tone(0.00f, 0.09f, 220, 200, 0.28f, 0.003f, 0.04f, 0, 0.6f);
+        s.Tone(0.12f, 0.09f, 200, 180, 0.28f, 0.003f, 0.04f, 0, 0.6f);
+        return s.out;
+    }
+    default:
+        return {};
+    }
+}
+
+// A WAV in memory, 16-bit PCM or IMA ADPCM at any rate, to 48 kHz stereo floats.
+static bool DecodeWav(const uint8_t *d, size_t n, const char *what, Samples *out)
+{
+    if (n < 44 || memcmp(d, "RIFF", 4) || memcmp(d + 8, "WAVE", 4)) {
+        return false;
+    }
+    int format = 0, channels = 0, rate = 0, block = 0, bits = 0;
+    const uint8_t *data = NULL;
+    size_t size = 0;
+    for (size_t p = 12; p + 8 <= n;) {
+        uint32_t len;
+        memcpy(&len, d + p + 4, 4);
+        if (!memcmp(d + p, "fmt ", 4) && p + 24 <= n) {
+            format = d[p + 8] | d[p + 9] << 8;
+            channels = d[p + 10] | d[p + 11] << 8;
+            memcpy(&rate, d + p + 12, 4);
+            block = d[p + 20] | d[p + 21] << 8;
+            bits = d[p + 22] | d[p + 23] << 8;
+        } else if (!memcmp(d + p, "data", 4)) {
+            data = d + p + 8;
+            size = std::min((size_t)len, n - p - 8);
+        }
+        p += 8 + (size_t)len + (len & 1);
+    }
+    if (!data || channels < 1 || channels > 2 || rate <= 0) {
+        fprintf(stderr, "XOG: sound %s: not a WAV I read\n", what);
+        return false;
+    }
+    std::vector<int16_t> pcm;
+    if (format == 1 && bits == 16) {
+        pcm.resize(size / 2);
+        memcpy(pcm.data(), data, pcm.size() * 2);
+    } else if (format == 0x11 && block > 4 * channels) {
+        static const int16_t kStep[89] = {
+            7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97,
+            107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+            876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428,
+            4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350,
+            22385, 24623, 27086, 29794, 32767 };
+        static const int8_t kIndex[16] = { -1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8 };
+        for (size_t b = 0; b + block <= size; b += block) {
+            const uint8_t *q = data + b;
+            int pred[2], idx[2];
+            for (int c = 0; c < channels; c++) {
+                pred[c] = (int16_t)(q[0] | q[1] << 8);
+                idx[c] = std::clamp((int)q[2], 0, 88);
+                pcm.push_back((int16_t)pred[c]);
+                q += 4;
+            }
+            int c = 0;
+            for (const uint8_t *end = data + b + block; q < end; q++) {
+                for (int half = 0; half < 2; half++) {
+                    const int code = half ? *q >> 4 : *q & 15;
+                    const int step = kStep[idx[c]];
+                    int diff = step >> 3;
+                    if (code & 4) diff += step;
+                    if (code & 2) diff += step >> 1;
+                    if (code & 1) diff += step >> 2;
+                    pred[c] = std::clamp(pred[c] + (code & 8 ? -diff : diff), -32768, 32767);
+                    idx[c] = std::clamp(idx[c] + kIndex[code], 0, 88);
+                    pcm.push_back((int16_t)pred[c]);
+                    c = (c + 1) % channels;
+                }
+            }
+        }
+    } else {
+        fprintf(stderr, "XOG: sound %s: format %d, %d bits, not read\n", what, format, bits);
+        return false;
+    }
+    const size_t frames = pcm.size() / channels;
+    const size_t want = (size_t)((uint64_t)frames * kRate / rate);
+    out->resize(want * 2);
+    for (size_t i = 0; i < want; i++) {
+        const double at = (double)i * rate / kRate;
+        const size_t a = (size_t)at, b = std::min(a + 1, frames ? frames - 1 : 0);
+        const float t = (float)(at - a);
+        for (int c = 0; c < 2; c++) {
+            const int ch = channels == 2 ? c : 0;
+            (*out)[i * 2 + c] = (pcm[a * channels + ch] * (1 - t) + pcm[b * channels + ch] * t) / 32768.0f;
+        }
+    }
+    return true;
+}
+
+static bool LoadWavFile(const std::string &file, Samples *out)
+{
+    FILE *f = fopen(file.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    std::vector<uint8_t> all;
+    fseeko(f, 0, SEEK_END);
+    all.resize((size_t)ftello(f));
+    fseeko(f, 0, SEEK_SET);
+    const bool ok = !all.empty() && fread(all.data(), 1, all.size(), f) == all.size();
+    fclose(f);
+    return ok && DecodeWav(all.data(), all.size(), file.c_str(), out);
+}
+
+//
+// Playing
+//
+
+static const char *const kNames[UI_SOUND__COUNT] = {
+    "move", "change", "select", "back", "open", "launch", "error",
+    "notify", "startup", "flash",
+};
+
+static std::mutex g_lock;
+static Samples g_sounds[UI_SOUND__COUNT];
+static bool g_made[UI_SOUND__COUNT];
+
+struct Voice {
+    const Samples *samples;
+    size_t pos; // In samples (both channels)
+};
+static Voice g_voices[6];
+
+bool g_ui_sound_played;
+
+void UiSoundPlay(UiSound sound)
+{
+    if (sound == UI_SOUND_OPEN || sound == UI_SOUND_LAUNCH || sound == UI_SOUND_STARTUP) {
+        return;     // the user: no opening or start sounds
+    }
+    g_ui_sound_played = true;
+    if (!g_cfg.sounds || sound >= UI_SOUND__COUNT) {
+        return;
+    }
+    if (!g_made[sound]) { // On the UI thread; the mixer only reads voices
+        // The user's own, else the recording in the app, else synthesized.
+        std::string file = std::string(xemu_settings_get_base_path()) +
+                           "sounds/" + kNames[sound] + ".wav";
+        const size_t embedded_count =
+            sizeof(kEmbeddedSounds) / sizeof(kEmbeddedSounds[0]);
+        const auto &embedded = (size_t)sound < embedded_count ?
+                                   kEmbeddedSounds[sound] :
+                                   kEmbeddedSounds[0]; // { NULL, 0 }
+        Samples s;
+        if (LoadWavFile(file, &s)) {
+        } else if (embedded.data &&
+                   DecodeWav((const uint8_t *)embedded.data, embedded.size, kNames[sound], &s)) {
+            // Recordings are made to be as loud as they sound at full
+            // scale; the mixer's gain is for the synthesized ones.
+            for (float &v : s) {
+                v *= 1.25f;
+            }
+        } else {
+            s = Make(sound);
+        }
+        std::lock_guard<std::mutex> guard(g_lock);
+        g_sounds[sound] = std::move(s);
+        g_made[sound] = true;
+    }
+
+    std::lock_guard<std::mutex> guard(g_lock);
+    // A free voice, else the one nearest its end.
+    Voice *best = &g_voices[0];
+    for (Voice &v : g_voices) {
+        if (!v.samples) {
+            best = &v;
+            break;
+        }
+        if (v.pos > best->pos) {
+            best = &v;
+        }
+    }
+    // The same sound again (fast scrolling) replaces its last voice.
+    for (Voice &v : g_voices) {
+        if (v.samples == &g_sounds[sound] && v.pos < 2 * kRate / 50) {
+            best = &v;
+        }
+    }
+    best->samples = &g_sounds[sound];
+    best->pos = 0;
+}
+
+//
+// Music
+//
+
+static Samples g_music;         // The loop
+static bool g_music_tried;
+static size_t g_music_pos;      // In frames
+static float g_music_gain;      // 0 .. 1, eased towards the target
+static float g_music_target;
+static float g_music_step;      // Gain change per frame
+
+void UiMusicPrepare(void)
+{
+    return;     // no music: the user's ears
+    if (g_music_tried) {
+        return;
+    }
+    g_music_tried = true;
+    std::string file = std::string(xemu_settings_get_base_path()) +
+                       "sounds/music.wav";
+    Samples s;
+    if (!LoadWavFile(file, &s)) {
+#ifdef XPS_EMBEDDED_MUSIC
+        DecodeWav((const uint8_t *)kSound_music, sizeof(kSound_music), "music", &s);
+#endif
+    }
+    size_t frames = s.size() / 2;
+    size_t blend = std::min((size_t)(3 * kRate), frames / 4);
+    if (frames < (size_t)kRate) {
+        return; // Nothing (or too short to loop)
+    }
+    // The last seconds faded out over the first ones faded in (equal
+    // power), then dropped from the end: the loop runs on without a seam.
+    for (size_t i = 0; i < blend; i++) {
+        float k = (float)i / blend * (float)M_PI / 2;
+        for (int ch = 0; ch < 2; ch++) {
+            float head = s[i * 2 + ch], tail = s[(frames - blend + i) * 2 + ch];
+            s[i * 2 + ch] = head * sinf(k) + tail * cosf(k);
+        }
+    }
+    s.resize((frames - blend) * 2);
+    std::lock_guard<std::mutex> guard(g_lock);
+    g_music = std::move(s);
+    g_music_pos = 0;
+}
+
+void UiMusicPlay(bool on)
+{
+    return;     // no music
+    on = on && g_cfg.music;
+    if (on) {
+        UiMusicPrepare();
+    }
+    std::lock_guard<std::mutex> guard(g_lock);
+    g_music_target = on ? 1 : 0;
+    g_music_step = 1.0f / (kRate * (on ? 2.5f : 0.9f)); // Slow in, quicker out
+}
+
+// Called by the audio thread for each block it's about to output.
+extern "C" void xemu_ps5_ui_sound_mix(int16_t *buf, int frames)
+{
+    std::lock_guard<std::mutex> guard(g_lock);
+    // The music, under everything.
+    size_t music_frames = g_music.size() / 2;
+    if (music_frames && (g_music_gain > 0 || g_music_target > 0)) {
+        const float music_gain = 0.2f;
+        for (int f = 0; f < frames; f++) {
+            if (g_music_gain < g_music_target) {
+                g_music_gain = std::min(g_music_gain + g_music_step,
+                                        g_music_target);
+            } else if (g_music_gain > g_music_target) {
+                g_music_gain = std::max(g_music_gain - g_music_step,
+                                        g_music_target);
+            }
+            float k = g_music_gain * g_music_gain * music_gain; // Eased
+            for (int ch = 0; ch < 2; ch++) {
+                int mixed = buf[f * 2 + ch] +
+                            (int)(g_music[g_music_pos * 2 + ch] * k * 32767);
+                buf[f * 2 + ch] = (int16_t)(mixed > 32767 ? 32767 :
+                                            mixed < -32768 ? -32768 : mixed);
+            }
+            if (++g_music_pos >= music_frames) {
+                g_music_pos = 0;
+            }
+        }
+    }
+    const float gain = 0.32f; // Under the games: 60% down from 0.8
+    for (Voice &v : g_voices) {
+        if (!v.samples) {
+            continue;
+        }
+        size_t n = std::min((size_t)frames * 2, v.samples->size() - v.pos);
+        const float *src = v.samples->data() + v.pos;
+        for (size_t i = 0; i < n; i++) {
+            int mixed = buf[i] + (int)(src[i] * gain * 32767);
+            buf[i] = (int16_t)(mixed > 32767 ? 32767 :
+                               mixed < -32768 ? -32768 : mixed);
+        }
+        v.pos += n;
+        if (v.pos >= v.samples->size()) {
+            v.samples = NULL;
+        }
+    }
+}

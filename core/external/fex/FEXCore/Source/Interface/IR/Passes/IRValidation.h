@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: MIT
+#pragma once
+
+#include "Common/BitSet.h"
+#include <FEXCore/IR/IR.h>
+#include <FEXCore/fextl/unordered_map.h>
+#include <FEXCore/fextl/vector.h>
+
+namespace FEXCore::IR::Validation {
+
+class IRValidation final : public FEXCore::IR::Pass {
+public:
+  ~IRValidation();
+  void Run(IREmitter* IREmit) override;
+
+private:
+  struct BlockInfo {
+    fextl::vector<OrderedNode*> Predecessors;
+    fextl::vector<OrderedNode*> Successors;
+  };
+
+  BitSet<uint64_t> NodeIsLive {};
+  OrderedNode* EntryBlock {};
+  fextl::unordered_map<IR::NodeID, BlockInfo> OffsetToBlockMap;
+  size_t MaxNodes {};
+};
+} // namespace FEXCore::IR::Validation

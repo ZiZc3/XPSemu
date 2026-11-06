@@ -1,0 +1,31 @@
+/* The memory manager's allocations (native/kernel/mm.c): virtual regions,
+ * contiguous blocks, ranges kept for a quick reboot. The pages themselves
+ * are the VM section's. */
+NC_SECTION(MM)
+
+NC_REC(Region, 16)
+NC_F(Region, base, U32, 1, 1, 0)
+NC_F(Region, size, U32, 1, 1, 0)
+NC_F(Region, protect, U32, 1, 1, 0)
+NC_F(Region, image, BOOL, 1, 1, 0)
+NC_END(Region)
+
+NC_REC(Contig, 20)
+NC_F(Contig, va, U32, 1, 1, 0)
+NC_F(Contig, size, U32, 1, 1, 0)
+NC_F(Contig, ra, U32, 1, 1, 0)
+NC_F(Contig, slack, U32, 1, 1, 0)
+NC_F(Contig, protect, U32, 1, 2, 0)
+NC_END(Contig)
+
+NC_REC(KeptRange, 8)
+NC_F(KeptRange, va, U32, 1, 1, 0)
+NC_F(KeptRange, len, U32, 1, 1, 0)
+NC_END(KeptRange)
+
+NC_REC(NcMmState, 16)
+NC_F(NcMmState, nregions, U32, 1, 1, 0)
+NC_F(NcMmState, ncontig, U32, 1, 1, 0)
+NC_F(NcMmState, nkept, U32, 1, 1, 0)
+NC_F(NcMmState, gpu_instance_end, U32, 1, 1, 0)
+NC_END(NcMmState)

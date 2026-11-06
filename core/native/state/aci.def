@@ -1,0 +1,28 @@
+/* The AC97 controller (native/dev/aci.c): its channels, global registers
+ * and mixer. */
+NC_SECTION(ACI)
+
+NC_REC(Channel, 24)
+NC_F(Channel, bdbar, U32, 1, 1, 0)
+NC_F(Channel, civ, U8, 1, 1, 0)
+NC_F(Channel, lvi, U8, 1, 1, 0)
+NC_F(Channel, piv, U8, 1, 1, 0)
+NC_F(Channel, cr, U8, 1, 1, 0)
+NC_F(Channel, sr, U16, 1, 1, 0)
+NC_F(Channel, picb, U16, 1, 1, 0)
+NC_F(Channel, bd_valid, BOOL, 1, 1, 0)
+NC_F(Channel, bd_addr, U32, 1, 1, 0)
+NC_F(Channel, bd_ctl, U32, 1, 1, 0)
+NC_END(Channel)
+
+NC_REC(Aci, 488)
+NC_SKIP(Aci, vm)
+NC_SKIP(Aci, lock)
+NC_F(Aci, glob_cnt, U32, 1, 1, 0)
+NC_F(Aci, glob_sta, U32, 1, 1, 0)
+NC_F(Aci, cas, U32, 1, 1, 0)
+NC_R(Aci, ch, Channel, 8, 1, 0)
+NC_F(Aci, mixer, U8, 256, 1, 0)
+NC_F(Aci, irq, BOOL, 1, 1, 0)
+NC_F(Aci, po_bytes, U64, 1, 1, 0)
+NC_END(Aci)

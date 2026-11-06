@@ -1,0 +1,11 @@
+section TIMR
+record NcTimerEntry
+  timer U32 x1 since 1
+  due_ns U64 x1 since 1
+  period_ns U64 x1 since 1
+record NcDpcEntry
+  dpc U32 x1 since 1
+  queued_ns U64 x1 since 1
+record NcTimerState
+  ntimers U32 x1 since 1
+  ndpcs U32 x1 since 1

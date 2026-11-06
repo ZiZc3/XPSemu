@@ -1,0 +1,8 @@
+/* Guest RAM (native/state/vm_state.c): its size, then per 64 KiB block a
+ * kind (0 zero, 1 deflated: its length and the zlib stream, 2 stored). */
+NC_SECTION(RAM)
+
+NC_REC(NcRamState, 8)
+NC_F(NcRamState, ram_size, U32, 1, 1, 0)
+NC_F(NcRamState, block, U32, 1, 1, 0)
+NC_END(NcRamState)

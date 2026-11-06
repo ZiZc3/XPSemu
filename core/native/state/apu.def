@@ -1,0 +1,8 @@
+/* The MCPX APU (native/dev/apu/state.c): its field tables' fields,
+ * each stored by name, kind and size (the walker refuses a state whose
+ * fields don't match this core's by name), after this record. */
+NC_SECTION(APU)
+
+NC_REC(NcApuState, 4)
+NC_F(NcApuState, version_id, I32, 1, 1, 0)
+NC_END(NcApuState)

@@ -1,0 +1,52 @@
+/build/
+/.cache/
+/.vscode/
+/.idea/
+/.claude/
+*.pyc
+__pycache__/
+*~
+*.swp
+
+# Common local junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local logs and crash dumps
+*.log
+logcat_*.txt
+hs_err_pid*.log
+replay_pid*.log
+*.aab
+# text dumps at the top (reports, symbol lists); deeper ones are sources
+# (CMakeLists.txt, licenses, the mods' and cheats' files, state schemas)
+/*.txt
+/out/
+
+# Profiling output captures (simpleperf runs, any depth)
+profile-out/
+profile-out-*/
+
+# RenderDoc Android Vulkan capture layer (debug builds, ~21 MB): not tracked,
+# a manual drop-in (android/app/src/debug/jniLibs/arm64-v8a/README.md).
+/android/app/src/debug/jniLibs/arm64-v8a/libVkLayer_GLES_RenderDoc.so
+# The native core's app libraries: build outputs (tools/native/app-libs.sh).
+/android/app/src/main/jniLibs/arm64-v8a/libhakuxcore.so
+/android/app/src/main/jniLibs/arm64-v8a/libSDL3.so
+/android/app/src/main/jniLibs/arm64-v8a/libmain_hook.so
+/android/app/src/main/jniLibs/arm64-v8a/libfile_redirect_hook.so
+/android/app/src/main/jniLibs/arm64-v8a/libgsl_alloc_hook.so
+/android/app/src/main/jniLibs/arm64-v8a/libhook_impl.so
+
+# local agent instructions (not versioned)
+/CLAUDE.md
+
+# Local dev tools (not versioned), but for the core's (its app libraries,
+# the savestate lock, device runs) and the mods' generators (mods/README.md)
+/tools/*
+!/tools/native/
+!/tools/mods/
+
+# Shared build/device lock between sessions (not versioned)
+/.device.lock

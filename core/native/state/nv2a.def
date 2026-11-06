@@ -1,0 +1,10 @@
+/* The NV2A (native/dev/nv2a.c): its register file and instance memory as
+ * the 4 KiB pages that aren't all zero (each: its index, then its bytes),
+ * the vblank count and frame period. */
+NC_SECTION(NV2A)
+
+NC_REC(NcNv2aState, 24)
+NC_F(NcNv2aState, vblanks, U64, 1, 1, 0)
+NC_F(NcNv2aState, frame_ns, U64, 1, 1, 0)
+NC_F(NcNv2aState, npages, U32, 1, 1, 0)
+NC_END(NcNv2aState)

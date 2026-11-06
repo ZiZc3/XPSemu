@@ -1,0 +1,16 @@
+/* Guest memory's page tables (native/state/vm_state.c): each guest page
+ * mapped outside the two RAM windows, as runs; then, one entry per physical
+ * page, the allocator's use byte, the reverse map (the user VA mapping it)
+ * and the pin byte. */
+NC_SECTION(VM)
+
+NC_REC(NcVmState, 8)
+NC_F(NcVmState, ram_size, U32, 1, 1, 0)
+NC_F(NcVmState, nruns, U32, 1, 1, 0)
+NC_END(NcVmState)
+
+NC_REC(NcVmRun, 12)
+NC_F(NcVmRun, va, U32, 1, 1, 0)
+NC_F(NcVmRun, pa, U32, 1, 1, 0)
+NC_F(NcVmRun, pages, U32, 1, 1, 0)
+NC_END(NcVmRun)
