@@ -90,11 +90,6 @@ On the dashboard: **△** on a game opens its settings, **OPTIONS** searches you
 
 **Toolchain:** PS5 payload SDK and RADV from [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan) (built first), on Linux or WSL. curl and mbedTLS built for the PS5.
 
-```sh
-bash tools/deps.sh                                  # downloads glslang, volk, VMA, SPIRV-Reflect, libslirp, nv2a_vsh_cpu
-XOG_PREFIX=<curl+mbedTLS> RELEASE=1 bash tools/build.sh   # the app, in dist/PPSA97358
-```
-
 ---
 
 ## Credits
