@@ -34,7 +34,6 @@ Around that sits the rest of an Xbox, from the [hakuX](https://github.com/rfanda
 - Resolution x1 to x6 (up to 3840x2880, shown at 4K)
 - Anti-aliasing: FXAA, SMAA, SSAA
 - Sharp (SGSR) or Smooth upscaling
-- Widescreen, set up by itself for games that have it
 
 </details>
 
