@@ -70,8 +70,6 @@ You need a PS5 with **kstuff** running, and **[ShadowMountPlus](https://github.c
 2. Put your games in `/data/xpsemu/games/`, or in `xpsemu/games/` on a USB drive. (`xemu/games` folders from Alpha 2 still work too.)
 3. Launch **XPSemu** from the home screen.
 
-**Updating from Alpha 2.1?** Replace the `PPSA97358` folder. Your games stay where they are. Alpha 3 starts with a fresh Xbox hard disk in `/data/xpsemu/`.
-
 ---
 
 ## Controls
@@ -96,8 +94,6 @@ On the dashboard: **△** on a game opens its settings, **OPTIONS** searches you
 bash tools/deps.sh                                  # downloads glslang, volk, VMA, SPIRV-Reflect, libslirp, nv2a_vsh_cpu
 XOG_PREFIX=<curl+mbedTLS> RELEASE=1 bash tools/build.sh   # the app, in dist/PPSA97358
 ```
-
-Without `RELEASE=1` it builds a test app (PPSA97360) that sits beside the real one.
 
 ---
 
