@@ -56,7 +56,7 @@ Around that sits the rest of an Xbox, from the [hakuX](https://github.com/rfanda
 - Games search, play time, recently played
 - Per-game settings for every option
 - Home-screen shortcuts: any game as its own PS5 tile
-- XISO, Redump, CCI and game folders, from the PS5 or a USB drive
+- XISO/Split XISOs, Redump, CCI, CHD, CSO and game folders, from the PS5 or a USB drive
 - Widescreen and 60 FPS patches applied by themselves
 - Up to 4 players
 
