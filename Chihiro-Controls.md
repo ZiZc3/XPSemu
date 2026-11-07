@@ -86,14 +86,4 @@ The steering wheel's force feedback comes through as rumble (Vibration on).
 | **Cross** | Start |
 | **Circle** | Ghost Squad only: insert or take back your card |
 
-A **USB mouse** works too:
-
-| Mouse | Does |
-|---|---|
-| **Move** | Crosshair |
-| **Left button** | Shoot |
-| **Right button** | The gun's side button |
-| **Middle button** | Change / pedal |
-| **Side buttons** | Reload |
-
 </details>
