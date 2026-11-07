@@ -96,15 +96,21 @@ On the dashboard: **△** on a game opens its settings, **OPTIONS** searches you
 
 ## Credits
 
-- **[hakuX](https://github.com/rfandango/hakuX)** by rfandango: the Xbox core XPSemu 3 is built on (kernel, graphics, sound) and its frame rate mods
+- **[hakuX](https://github.com/rfandango/hakuX)** by rfandango: the Xbox core XPSemu 3 is built on (kernel, graphics, sound), its frame rate mods and its controller rumble path
 - **[xemu](https://github.com/xemu-project/xemu)**: the MCPX sound emulation inside hakuX, XPSemu's roots, and the cover database
+- **[XPSemu-Chihiro](https://github.com/tattoohanz/XPSemu-Chihiro)** by tattoohanz: the Sega Chihiro base boards (8051 / AN2131, JVS), drive boards, card readers, game controls and force feedback (LGPL-2.1)
+- **[Cxbx-Reloaded](https://github.com/Cxbx-Reloaded/Cxbx-Reloaded)**: how Chihiro games start without a BIOS
+- **[MAME](https://github.com/mamedev/mame)** (Olivier Galibert, Réda Chérif-Touil): the Chihiro GD-ROM DES decryption (BSD-3-Clause)
 - **[Mihawk-99](https://github.com/mihawk-99)**: [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan) / [PS5_Mesa](https://github.com/mihawk-99/PS5_Mesa) (RADV on the PS5) and [MihawkGen](https://github.com/mihawk-99/PS5_MihawkGen) frame generation
 - **[ps5-payload-dev SDK](https://github.com/ps5-payload-dev/sdk)**, **[kstuff](https://github.com/EchoStretch/kstuff)**, **[etaHEN](https://github.com/etaHEN/etaHEN)**, **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)** and the PS5 scene
 - **[PS5SX2](https://github.com/Swordpdf/PS5SX2)** by Swordpdf: frame pacing ideas
 - **Jay's Magic Patches / [JayXbox PatchHub](https://www.jayxbox.com/Retail-Game-Modification/PatchHub.php)**: widescreen and 60 FPS patches
+- **[MakeMHz](https://github.com/MakeMHz)**: the CSO image layout (ciso.py)
 - **[SMAA](https://github.com/iryoku/smaa)** (MIT), **[Snapdragon GSR](https://github.com/SnapdragonGameStudios/snapdragon-gsr)**, **[Dear ImGui](https://github.com/ocornut/imgui)**, **[glslang](https://github.com/KhronosGroup/glslang)**, **[volk](https://github.com/zeux/volk)**, **[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)**, **[SPIRV-Reflect](https://github.com/KhronosGroup/SPIRV-Reflect)**, **[xxHash](https://github.com/Cyan4973/xxHash)**, **[nv2a_vsh_cpu](https://github.com/abaire/nv2a_vsh_cpu)**, **[stb_image](https://github.com/nothings/stb)**, **[fpng](https://github.com/richgel999/fpng)**, **[curl](https://github.com/curl/curl)**, **[mbedTLS](https://github.com/Mbed-TLS/mbedtls)**, **[zlib](https://github.com/madler/zlib)**
+- CHD support: **[libchdr](https://github.com/rtissera/libchdr)** (BSD-3-Clause), with **[zstd](https://github.com/facebook/zstd)**, **[miniz](https://github.com/richgel999/miniz)**, **[LZMA SDK](https://www.7-zip.org/sdk.html)** and **[dr_flac](https://github.com/mackron/dr_libs)**
 - Icons: **[Fluent UI System Icons](https://github.com/microsoft/fluentui-system-icons)** (MIT), **[Hugeicons](https://hugeicons.com)** (MIT), **[Kenney Input Prompts](https://kenney.nl/assets/input-prompts)** (CC0)
 - Covers and art: **[xemu's xdb](https://github.com/xemu-project/xdb)**, **[libretro thumbnails](https://github.com/libretro/libretro-thumbnails)**, **[LaunchBox Games Database](https://gamesdb.launchbox-app.com)**
+- Disc regions and languages: the Redump list from **[libretro-database](https://github.com/libretro/libretro-database)** (CC BY-SA 4.0)
 
 XPSemu's icon and art are original (a green "X"), not the Xbox logo.
 
