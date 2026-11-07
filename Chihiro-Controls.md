@@ -97,8 +97,3 @@ A **USB mouse** works too:
 | **Side buttons** | Reload |
 
 </details>
-
----
-
-> [!TIP]
-> Push the stick all the way for the crosshair's top speed; it stops where you let go.
