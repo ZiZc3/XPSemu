@@ -86,7 +86,7 @@ The steering wheel's force feedback comes through as rumble (Vibration on).
 | **Cross** | Start |
 | **Circle** | Ghost Squad only: insert or take back your card |
 
-A **USB or Bluetooth mouse** works too:
+A **USB mouse** works too:
 
 | Mouse | Does |
 |---|---|
