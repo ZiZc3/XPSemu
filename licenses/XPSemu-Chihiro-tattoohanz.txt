@@ -1,0 +1,22 @@
+XPSemu-Chihiro (tattoohanz) — study / reference credit
+https://github.com/tattoohanz/XPSemu-Chihiro
+
+XPSemu's Sega Chihiro support was written by the XPSemu authors. The
+XPSemu-Chihiro fork by tattoohanz was studied as a reference for the Chihiro
+hardware model, and its approach informed our own implementation of:
+
+  - the Namco V257 drive board,
+  - the CRP-1231 card reader,
+  - the media-board network firmware answer used for Wangan Midnight
+    Maximum Tune (the network board's firmware-version reply), and
+  - the base boards (8051 / AN2131, JVS), game controls and steering-wheel
+    force feedback.
+
+Our Chihiro code is our own and is licensed under GPL-3.0 with the rest of
+XPSemu. Where XPSemu-Chihiro's approach is adapted, the relevant XPSemu-Chihiro
+code is distributed by tattoohanz under the GNU Lesser General Public License,
+version 2.1 or later; the full text is in LGPL-2.1.txt in this folder.
+
+The Chihiro GD-ROM DES decryption is a separate port from MAME (BSD-3-Clause);
+see MAME-DES.txt. Starting Chihiro games without a BIOS follows the method used
+by Cxbx-Reloaded.
