@@ -87,3 +87,40 @@ The steering wheel's force feedback comes through as rumble (Vibration on).
 | **Circle** | Ghost Squad only: insert or take back your card |
 
 </details>
+
+<details open>
+<summary><strong>&nbsp; The House of the Dead III</strong> (gun game)</summary>
+<br>
+
+| DualSense | Does |
+|---|---|
+| **Left stick** | Aim |
+| **R2** | Fire |
+| **L2** | Reload (points the gun off the screen) |
+| **R1** | The gun's side button |
+| **Cross** or **Options** | Start |
+| **D-pad Up** or **Create** | Insert a coin |
+
+</details>
+
+<details open>
+<summary><strong>&nbsp; Wangan Midnight Maximum Tune</strong> and <strong>Maximum Tune 2</strong></summary>
+<br>
+
+| DualSense | Does |
+|---|---|
+| **Left stick** | Steer |
+| **R2** | Gas |
+| **L2** | Brake |
+| **R1** | Gear up |
+| **L1** | Gear down |
+| **Triangle** | Change view |
+| **Square** | Intrude (challenge a rival) |
+| **Circle** | Insert or take back your card |
+
+</details>
+
+---
+
+> [!TIP]
+> On the gun games, push the stick all the way for the crosshair's top speed; it stops where you let go.
