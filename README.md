@@ -64,6 +64,49 @@ Around that sits the rest of an Xbox, from the [hakuX](https://github.com/rfanda
 
 ---
 
+## Sega Chihiro
+
+The Sega Chihiro is an arcade board built on the original Xbox, so its games run on the same native core, at 60 FPS, each with controls made for its cabinet. **No Chihiro BIOS and no media board flash are needed** — only your game and three small base board files.
+
+**Playable now (all 8):**
+
+| Game | Best format |
+|---|---|
+| **OutRun 2** | GD-ROM |
+| **Crazy Taxi: High Roller** | CHD |
+| **Ollie King** | CHD |
+| **Virtua Cop 3** | Netboot `.bin` |
+| **Ghost Squad** | Netboot `.bin` |
+| **The House of the Dead III** | Netboot `.bin` |
+| **Wangan Midnight Maximum Tune** | CHD |
+| **Wangan Midnight Maximum Tune 2** | CHD |
+
+See **[Chihiro controls](Chihiro-Controls.md)** for each game's layout.
+
+### Adding Chihiro games
+
+Put your games in `/data/xpsemu/chihiro/games/`, or in `xpsemu/chihiro/games/` on a USB drive.
+
+| Format | Keys needed? | |
+|---|---|---|
+| **Netboot image** (`.bin`) | No | Already unlocked and opens fastest. 512 MB and 1 GB images both work. |
+| **CHD** (`.chd`, MAME GD-ROM) | Yes | Compressed, the smallest on disk. |
+| **GD-ROM dump** (`.gdi` or `.cue` with its tracks) | Yes | |
+
+**Keys** (CHD and GD-ROM only): the game's security key as a `.pic` or `.data` file, beside the game or in `/data/xpsemu/chihiro/`. A MAME key `.zip` works too, with no need to extract it.
+
+> [!IMPORTANT]
+> **Three base board files are always needed**, in `/data/xpsemu/chihiro/`:
+> - `ic10_g24lc64.bin`
+> - `pc20_g24lc64.bin`
+> - `ic11_24lc024.bin`
+>
+> The Chihiro tab shows **"Base board files: OK"** when they're found. **No Chihiro BIOS and no media board flash are needed.**
+
+Each game keeps its own backup RAM (high scores, settings) in `/data/xpsemu/chihiro/run/`, so your records are per game as in a real cabinet. After the first start, games skip the SEGA boot screen and start directly.
+
+---
+
 ## Install
 
 You need a PS5 with **kstuff** running, and **[ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)**.
