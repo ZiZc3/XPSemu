@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <code>Alpha 3.0</code> &nbsp;&middot;&nbsp;
+  <code>Alpha 3.3</code> &nbsp;&middot;&nbsp;
   <code>GPL-3.0</code>
 </p>
 
