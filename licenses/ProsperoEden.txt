@@ -1,0 +1,21 @@
+ProsperoEden
+https://github.com/Swordpdf/ProsperoEden
+
+ProsperoEden is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. The full text is in GPL-3.0.txt.
+
+XPSemu adapts from it (our own C code, under the same GPL-3.0-or-later):
+
+- The write helper (ps5/wbwriter/wbwriter.c, ps5/src/wbwriter_client.c,
+  ps5/include/wbwriter_proto.h): streaming a helper ELF to the console's
+  payload loader and keeping that socket as the channel to it, so file writes
+  run in a process the PS5 does not throttle. From ProsperoEden's
+  headless/self_update_helper/ (main.cpp, updater.cpp) and
+  headless/update_check/ (self_update_protocol.h, self_update_ps5.c).
+
+- DualSense HD haptics (ps5/src/haptics_ps5.c): driving the controller's
+  voice-coil actuators through its vibration audio port, and the haptic
+  signal design (low and high sine bands with low-passed noise, enveloped).
+  From ProsperoEden's headless/pad_haptics.cpp and pad_haptics.h.

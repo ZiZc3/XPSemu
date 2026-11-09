@@ -14,6 +14,7 @@ keeps its own license; all are compatible with GPL-3.0.
 | `LGPL-2.1.txt` | The MCPX APU devices (from xemu), and the **XPSemu-Chihiro** fork code whose approach the Chihiro work adapts (see below) |
 | `hakuX.txt` | hakuX and the per-file licenses of the parts it bundles |
 | `MihawkGen.txt` | MihawkGen frame generation |
+| `ProsperoEden.txt` | ProsperoEden (GPL-3.0+): the write helper and the DualSense HD haptics design, adapted in our own code — new in 3.3 |
 
 ## Sega Chihiro
 
