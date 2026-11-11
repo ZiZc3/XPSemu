@@ -63,6 +63,11 @@ rx_gate_entry:
     cld
     ldmxcsr rx_host_mxcsr(%rip)
     fninit
+    movw %fs, %ax                   // patch 323: the guest loaded fs? the host's back first
+    cmpw rx_host_fs_sel(%rip), %ax
+    je 1f
+    call rx_fs_repair
+1:
     call rx_gate_c
     jmp rx_gate_decide
 

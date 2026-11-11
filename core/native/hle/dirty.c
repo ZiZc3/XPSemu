@@ -32,6 +32,51 @@ static NcVm *g_vm;
  * otherwise: protected <=> clean) */
 static uint8_t *g_hdirty;
 
+/* patch 352 (xogfix=hotpages, per game: Crimson Sea): a 16 KiB block the guest faults on again and again (it
+ * rewrites the same buffers every frame) stops being protected: always reported written instead. Each first-write
+ * fault cost ~0.4 ms on the PS5, and Crimson Sea took ~1100 a second in places, its frames 60 -> 30 and its play
+ * (one step a frame) in slow motion. Over-reporting is safe: the HLE layer copies what it would have copied anyway. */
+static uint8_t *g_hot;              /* per page: 1 = never protected again */
+static uint16_t *g_hot_n;           /* per page: faults in the second g_hot_t */
+static uint32_t *g_hot_t;
+static int g_hot_on = -1;
+
+static bool hot_on(void)
+{
+    if (g_hot_on < 0) {
+        const char *e = getenv("XOG_FIX");
+        g_hot_on = e && strstr(e, "hotpages") ? 1 : 0;
+    }
+    return g_hot_on == 1;
+}
+
+static void hot_note(uint32_t pa)
+{
+    if (!g_hot || !hot_on()) {
+        return;
+    }
+    const uint32_t p = pa / NC_PAGE;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint32_t now = (uint32_t)ts.tv_sec;
+    if (g_hot_t[p] != now) {
+        g_hot_t[p] = now;
+        g_hot_n[p] = 0;
+    }
+    if (++g_hot_n[p] >= 6 && !g_hot[p]) {
+        const uint32_t first = pa & ~(16384u - 1);
+        for (uint32_t o = 0; o < 16384u; o += NC_PAGE) {
+            if ((uint64_t)first + o < g_vm->ram_size) {
+                g_hot[(first + o) / NC_PAGE] = 1;
+            }
+        }
+        static unsigned told;
+        if (told++ < 32) {
+            nc_log("hakuX-native", "dirty: block %08x rewritten every frame: no longer protected (hotpages)", first);
+        }
+    }
+}
+
 
 /* A page without access, given it back the way a guest access's fault does
  * (hle_mem_stale_access_rw: the image newer than its memory goes in first;
@@ -100,6 +145,7 @@ static void rx_open_block(uint32_t pa, bool write)
             const uint8_t w = was[o / NC_PAGE];
             if (w == NC_WP_CLEAN) {
                 dirty_sample(first + o);
+                hot_note(first + o);
                 first_write(first + o, 4);
             } else if (w == NC_WP_WRITTEN) {
                 nc_vm_protect_page(g_vm, first + o, false);
@@ -182,6 +228,17 @@ void nc_hle_dirty_init(NcVm *vm)
 {
     g_vm = vm; /* every page starts dirty (unprotected) */
     g_hdirty = calloc(vm->ram_size / NC_PAGE, 1);
+    if (hot_on()) {                     /* patch 352 */
+        g_hot = calloc(vm->ram_size / NC_PAGE, 1);
+        g_hot_n = calloc(vm->ram_size / NC_PAGE, sizeof(*g_hot_n));
+        g_hot_t = calloc(vm->ram_size / NC_PAGE, sizeof(*g_hot_t));
+        if (!g_hot || !g_hot_n || !g_hot_t) {
+            free(g_hot);
+            free(g_hot_n);
+            free(g_hot_t);
+            g_hot = NULL;
+        }
+    }
 #if defined(__PROSPERO__)
     nc_vm_write_hook = rx_va_store;
 #else
@@ -234,6 +291,13 @@ static bool protect_runs(uint32_t pa, uint32_t len, bool ro)
     const uint64_t end = ram_end(pa, len);
     uint32_t run_pa = 0, run_n = 0;
     for (uint64_t a = pa & ~(uint64_t)(NC_PAGE - 1); a < end; a += NC_PAGE) {
+        if (ro && g_hot && g_hot[a / NC_PAGE]) {
+            /* patch 352: a hot block stays open, and counts as written */
+            nc_vm_protect_pages(g_vm, run_pa, run_n, ro);
+            run_n = 0;
+            any = true;
+            continue;
+        }
         if (g_vm->wp[a / NC_PAGE] == ro) {
             nc_vm_protect_pages(g_vm, run_pa, run_n, ro);
             run_n = 0;

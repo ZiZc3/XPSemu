@@ -36,6 +36,115 @@ const HleFmtInfo *hle_fmt_info(uint32_t code)
     return NULL;
 }
 
+/* patch 334: per format and sign bit (A, R, G, B): the texel bits flipped,
+ * and the view channels (rgba bits) that byte reaches. G8B8 views as
+ * (B, G, B, G), R8B8 as (R, B, B, R) (vk/draw.c tex_format). L8, AL8, A8 and
+ * A8L8 are read as stored (no bits flipped: one byte reaches channels whose
+ * signs may differ): the channels their bytes reach. */
+static const struct {
+    uint8_t code[2];        /* swizzled, linear */
+    uint32_t xor[4];
+    uint8_t rgba[4];
+} k_sign[] = {
+    { { HLE_XFMT_A8R8G8B8, HLE_XFMT_LIN_A8R8G8B8 },     /* bytes B G R A */
+      { 0x80000000u, 0x00800000u, 0x00008000u, 0x00000080u }, { 8, 1, 2, 4 } },
+    { { HLE_XFMT_X8R8G8B8, HLE_XFMT_LIN_X8R8G8B8 },
+      { 0, 0x00800000u, 0x00008000u, 0x00000080u }, { 0, 1, 2, 4 } },
+    { { HLE_XFMT_A8B8G8R8, HLE_XFMT_LIN_A8B8G8R8 },     /* bytes R G B A */
+      { 0x80000000u, 0x00000080u, 0x00008000u, 0x00800000u }, { 8, 1, 2, 4 } },
+    { { HLE_XFMT_B8G8R8A8, HLE_XFMT_LIN_B8G8R8A8 },     /* bytes A R G B */
+      { 0x00000080u, 0x00008000u, 0x00800000u, 0x80000000u }, { 8, 1, 2, 4 } },
+    { { HLE_XFMT_R8G8B8A8, HLE_XFMT_LIN_R8G8B8A8 },     /* bytes A B G R */
+      { 0x00000080u, 0x80000000u, 0x00800000u, 0x00008000u }, { 8, 1, 2, 4 } },
+    { { HLE_XFMT_G8B8, HLE_XFMT_LIN_G8B8 },             /* bytes B G */
+      { 0, 0, 0x8000u, 0x0080u }, { 0, 0, 2 | 8, 1 | 4 } },
+    { { HLE_XFMT_R8B8, HLE_XFMT_LIN_R8B8 },             /* bytes B R */
+      { 0, 0x8000u, 0, 0x0080u }, { 0, 1 | 8, 0, 2 | 4 } },
+    { { HLE_XFMT_L8, HLE_XFMT_LIN_L8 }, { 0 }, { 0, 1, 2, 4 } },        /* (L, L, L, 1) */
+    { { HLE_XFMT_AL8, HLE_XFMT_LIN_AL8 }, { 0 }, { 8, 1, 2, 4 } },      /* (L, L, L, L) */
+    { { HLE_XFMT_A8, HLE_XFMT_LIN_A8 }, { 0 }, { 8, 0, 0, 0 } },        /* (1, 1, 1, A) */
+    { { HLE_XFMT_A8L8, HLE_XFMT_LIN_A8L8 }, { 0 }, { 8, 1, 2, 4 } },    /* (L, L, L, A) */
+};
+
+static int sign_row(uint32_t code)
+{
+    for (size_t i = 0; i < sizeof(k_sign) / sizeof(k_sign[0]); i++) {
+        if (k_sign[i].code[0] == code || k_sign[i].code[1] == code) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+uint32_t hle_fmt_sign_xor(uint32_t code, uint32_t sign)
+{
+    const int r = sign ? sign_row(code) : -1;
+    uint32_t x = 0;
+    for (unsigned i = 0; r >= 0 && i < 4; i++) {
+        x |= (sign >> i & 1) ? k_sign[r].xor[i] : 0;
+    }
+    return x;
+}
+
+uint32_t hle_fmt_sign_rgba(uint32_t code, uint32_t sign)
+{
+    const int r = sign ? sign_row(code) : -1;
+    uint32_t m = 0;
+    for (unsigned i = 0; r >= 0 && i < 4; i++) {
+        m |= (sign >> i & 1) ? k_sign[r].rgba[i] : 0;
+    }
+    return m;
+}
+
+/* patch 335: depth texels as floats (hle_tex_depth_convert) */
+static uint32_t ld16(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8;
+}
+
+static void put_depth(uint8_t *o, uint32_t i, float z)
+{
+    z = z < 1.0f ? z : 1.0f;            /* and NaN */
+    memcpy(o + 4 * i, &z, 4);
+}
+
+bool hle_tex_depth_convert(uint32_t code, const void *src, uint32_t n, void *dst)
+{
+    const uint8_t *s = src;
+    uint8_t *o = dst;
+    switch (code) {
+    case HLE_XFMT_D16: case HLE_XFMT_LIN_D16:
+        for (uint32_t i = 0; i < n; i++) {
+            put_depth(o, i, ld16(s + 2 * i) / 65535.0f);
+        }
+        return true;
+    case HLE_XFMT_D24S8: case HLE_XFMT_LIN_D24S8:
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t v = ld16(s + 4 * i) | ld16(s + 4 * i + 2) << 16;
+            put_depth(o, i, (v >> 8) / 16777215.0f);
+        }
+        return true;
+    case HLE_XFMT_F16: case HLE_XFMT_LIN_F16:
+        for (uint32_t i = 0; i < n; i++) {
+            /* unsigned, a 4-bit exponent biased by 7, a 12-bit mantissa */
+            const uint32_t v = ld16(s + 2 * i), b = (v << 11) + 0x3C000000u;
+            float f;
+            memcpy(&f, &b, 4);
+            put_depth(o, i, v ? f / 511.9375f : 0.0f);
+        }
+        return true;
+    case HLE_XFMT_F24S8: case HLE_XFMT_LIN_F24S8:
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t v = ld16(s + 4 * i) | ld16(s + 4 * i + 2) << 16;
+            const uint32_t f = v >> 8 << 7;
+            memcpy(o + 4 * i, &f, 4);
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
 static int log2_exact(uint32_t v)
 {
     if (!v || (v & (v - 1))) {

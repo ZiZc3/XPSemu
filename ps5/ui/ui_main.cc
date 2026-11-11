@@ -75,11 +75,11 @@ void xemu_settings_save(void)
 {
     std::ofstream f(SettingsFile());
     const XogConfig &c = g_cfg;
-    f << "scale=" << c.scale << "\naspect=" << c.aspect << "\nfit=" << c.fit << "\nupscale=" << c.upscale << "\naa=" << c.aa << "\nfps_cap=" << c.fps_cap
+    f << "scale=" << c.scale << "\naspect=" << c.aspect << "\nfit=" << c.fit << "\nupscale=" << c.upscale << "\naa=" << c.aa << "\naf=" << c.af << "\ncas=" << c.cas << "\ntexsharp=" << c.texsharp << "\ncrt=" << c.crt << "\nssao=" << c.ssao << "\nfps_cap=" << c.fps_cap
       << "\nvolume=" << c.volume << "\nfps=" << c.fps << "\navpack=" << c.avpack << "\nlanguage=" << c.language
       << "\npal60=" << c.pal60 << "\nnotifications=" << c.notifications << "\nwidescreen_patches=" << c.autopatch_widescreen
       << "\nfps_patches=" << c.autopatch_60fps << "\nsounds=" << c.sounds << "\nmusic=" << c.music << "\ncovers=" << c.covers
-      << "\nscale_chosen=1\nboot_logo=" << c.boot_logo << "\nsides=" << c.sides << "\nsides_style=" << c.sides_style << "\n";
+      << "\nscale_chosen=1\nlanguage_auto_offered=1\naa_default_offered=1\nboot_logo=" << c.boot_logo << "\nsides=" << c.sides << "\nsides_style=" << c.sides_style << "\nvibration=" << c.vibration << "\ntriggers=" << c.triggers << "\nfastforward=" << c.fastforward << "\n";
 }
 
 void xemu_settings_load(void)
@@ -88,6 +88,8 @@ void xemu_settings_load(void)
     std::string line;
     XogConfig &c = g_cfg;
     bool scale_chosen = false;   // settings from before x2 was the default take it, once
+    bool auto_offered = false;   // settings from before Auto take it, once (patch 178)
+    bool aa_offered = false;     // settings from before SSAA + SMAA was the default take it, once (patch 313)
     while (std::getline(f, line)) {
         const size_t eq = line.find('=');
         if (eq == std::string::npos) {
@@ -95,12 +97,19 @@ void xemu_settings_load(void)
         }
         const std::string k = line.substr(0, eq);
         const int v = atoi(line.c_str() + eq + 1);
-        if (k == "scale") c.scale = std::clamp(v, 1, 6);
+        if (k == "scale") c.scale = std::clamp(v, 1, 10);   // patch 328: up to x10
         else if (k == "scale_chosen") scale_chosen = true;
+        else if (k == "language_auto_offered") auto_offered = true;
+        else if (k == "aa_default_offered") aa_offered = true;
         else if (k == "aspect") c.aspect = v;
         else if (k == "fit") c.fit = v;
-        else if (k == "upscale") c.upscale = v;
-        else if (k == "aa") c.aa = std::clamp(v, 0, 3);
+        else if (k == "upscale") c.upscale = std::clamp(v, 0, 2);
+        else if (k == "cas") c.cas = std::clamp(v, 0, 4);              // patch 247
+        else if (k == "texsharp") c.texsharp = std::clamp(v, 0, 3);
+        else if (k == "crt") c.crt = std::clamp(v, 0, 2);
+        else if (k == "ssao") c.ssao = std::clamp(v, 0, 2);     // patch 367
+        else if (k == "aa") c.aa = std::clamp(v, 0, 4);
+        else if (k == "af") c.af = v >= 16 ? 16 : v >= 8 ? 8 : v >= 4 ? 4 : v >= 2 ? 2 : 0;
         else if (k == "fps_cap") c.fps_cap = std::clamp(v, 0, 1000);
         else if (k == "volume") c.volume = std::clamp(v, 0, 10);
         else if (k == "fps") c.fps = v;
@@ -116,9 +125,18 @@ void xemu_settings_load(void)
         else if (k == "boot_logo") c.boot_logo = v;
         else if (k == "sides") c.sides = v;
         else if (k == "sides_style") c.sides_style = v;
+        else if (k == "vibration") c.vibration = v;
+        else if (k == "triggers") c.triggers = v;           // patch 266
+        else if (k == "fastforward") c.fastforward = v;     // patch 253
     }
     if (!scale_chosen) {
         c.scale = 4;
+    }
+    if (!auto_offered) {
+        c.language = 0;
+    }
+    if (!aa_offered) {
+        c.aa = 4;
     }
 }
 

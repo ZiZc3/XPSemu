@@ -30,6 +30,8 @@
 #define NC_STATE_V_MODS 1
 #define NC_STATE_MIN_MODS 1
 #define NC_STATE_H_MODS 0x0742f082u
+#define NC_STATE_V_CHIH 1
+#define NC_STATE_MIN_CHIH 1
 #define NC_STATE_V_NIC 1
 #define NC_STATE_MIN_NIC 1
 #define NC_STATE_H_NIC 0x72d2898eu

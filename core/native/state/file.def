@@ -14,7 +14,7 @@ NC_F(DirEntry, size, U64, 1, 1, 0)
 NC_F(DirEntry, dir, BOOL, 1, 1, 0)
 NC_END(DirEntry)
 
-NC_REC(NcFile, 1552)
+NC_REC(NcFile, 1560)
 NC_F(NcFile, used, BOOL, 1, 1, 0)
 NC_F(NcFile, kind, U32, 1, 1, 0)
 NC_F(NcFile, path, U8, 512, 1, 0)
@@ -35,6 +35,7 @@ NC_F(NcFile, async, BOOL, 1, 1, 0)
 NC_F(NcFile, can_write, BOOL, 1, 1, 0)
 NC_F(NcFile, del, BOOL, 1, 2, 0)
 NC_F(NcFile, no_buffering, BOOL, 1, 3, 0)
+NC_SKIP(NcFile, wb_handle)      /* patch 307: the write-helper handle; reopened lazily after a load, never saved */
 NC_END(NcFile)
 
 NC_REC(NcLink, 320)

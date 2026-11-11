@@ -527,6 +527,8 @@ void nc_intr_isr_line_set(uint8_t line);
 /* io.c: before a save, paused: the disc reads in flight complete (NULL), or
  * why the state can't be taken now. */
 const char *nc_io_state_drain(NcKernel *k, uint64_t timeout_ns);
+/* XOG patch 261: the cache drives' written-behind writes (xogfix=cachewrite) on the disk; false on timeout */
+bool nc_io_writes_drain(uint64_t timeout_ms, const char *why);
 /* io.c: the cache partitions (3-5, bit n) the title uses: its utility
  * drive's and any it has a file open on. */
 unsigned nc_io_cache_partitions(void);
@@ -576,6 +578,8 @@ const char *nc_io_part_root(int part);
 /* NT's dynamic boost: 1 over a priority below 16 once a wait is satisfied, until its quantum ends. */
 int nc_eff_priority(const NcKernel *k, const NcThread *t);
 void nc_ps_boost(const NcKernel *k, const NcThread *t, int increment);
+/* patch 320: a boosted thread that has polled for a millisecond loses its boost (ke.c poll_spin) */
+void nc_ps_unboost(const NcKernel *k, const NcThread *t);
 void nc_ps_charge_wait(NcKernel *k);
 bool nc_seh_exception(NcKernel *k, NcFrame *f, uint32_t code, uint32_t eip, unsigned nparams, uint32_t p0, uint32_t p1);
 /* A file on a hard disk partition ("\Device\Harddisk0\Partition2\xboxdash.xbe",

@@ -7,6 +7,7 @@
  */
 #include "hw/xbox/hle/base.h"
 #include <math.h>
+#include <time.h>
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
@@ -108,7 +109,84 @@ typedef struct HleVkTex {
     VkImageView cube_view;      /* cubes: the six faces as a cube (binding 2) */
     uint32_t slot;              /* sampled_images[] index */
     bool linear;                /* Xbox linear format: texel coordinates */
+    uint8_t sgn;                /* patch 334: view channels (bit 0 r .. 3 a) uploaded
+                                   offset binary (tex/xdk_res.h hle_fmt_sign_rgba) */
+    uint8_t gfmt;               /* patch 334/335: the guest's format (HleCmdTex.gfmt) */
+    /* patch 355: the movie upscaler (movie_up). Its texels' changes: */
+    uint64_t mv_last;           /* the frame they last changed (swaps + 1), 0 never */
+    uint32_t mv_hash;           /* a sample of them, as last uploaded */
+    uint32_t mv_streak;         /* changes in a row, each within MV_GAP frames */
+    /* its enlarged copy (up_img, up_s times its size; none: 0): */
+    uint32_t up_s, up_slot;     /* the scale, its own sampled slot */
+    bool up_ok;                 /* it holds the latest upload */
+    VkImage up_img;
+    VkDeviceMemory up_mem;
+    VkImageView up_view;        /* sampled: the texture's swizzle */
+    VkImageView up_rtv;         /* rendered (the pass's attachment) */
+    VkImageView src_view;       /* img's own channels, the pass's source */
+    VkDescriptorSet up_set;
 } HleVkTex;
+
+/* patch 334: signed textures (TSS_COLORSIGN) decoded in the pixel shaders; off
+ * with XOG_FIX containing "nosign" */
+static bool sign_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XOG_FIX");
+        on = !(e && strstr(e, "nosign"));
+    }
+    return on;
+}
+
+/* patch 354: MSAA smooth cut-outs (alpha-to-coverage), on unless the game's
+ * settings turn it off (a2c=0 start line, or the quick menu's row, at once:
+ * the draws' keys change); XOG_FIX noa2c: never. Only in MSAA passes. */
+static volatile int g_hle_a2c = 1;
+
+void hle_vk_set_a2c(int on)
+{
+    g_hle_a2c = on != 0;
+}
+
+static bool hle_a2c_on(void)
+{
+    static int s_fix = -1;
+    if (s_fix < 0) {
+        s_fix = !hle_xog_fix_word("noa2c");
+    }
+    return s_fix && g_hle_a2c;
+}
+
+/* patch 355: the movie upscaler ("Movie upscaler", movieup= start line), on
+ * unless the game's settings turn it off; XOG_FIX nomovieup: never */
+static volatile int g_hle_movieup = 0;    /* patch 377: off - no visible difference (user test, Prince of Persia) */
+
+void hle_vk_set_movieup(int on)
+{
+    g_hle_movieup = on != 0;
+}
+
+bool hle_movieup_on(void)
+{
+    static int s_fix = -1;
+    if (s_fix < 0) {
+        s_fix = !hle_xog_fix_word("nomovieup");
+    }
+    return s_fix && g_hle_movieup;
+}
+
+/* patch 335: uploaded depth-format textures compared as shadow buffers; off
+ * with XOG_FIX containing "noshadowtex" */
+static bool shadow_tex_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XOG_FIX");
+        on = !(e && strstr(e, "noshadowtex"));
+    }
+    return on;
+}
 
 /* A pipeline table entry's state: made (VK_NULL_HANDLE: it failed, not tried
  * again), being built by the workers (its draws skipped), or made by the
@@ -291,6 +369,10 @@ static bool tex_format(uint32_t x, TexFmt *o)
         VkComponentMapping m = SW(G, R, R, G);
         o->fmt = VK_FORMAT_R8G8_UNORM; o->sw = m; return true;
     }
+    /* patch 335: depth textures, sent as floats (pb/pbres.c, tex/xdk_res.h
+     * hle_tex_depth_convert), compared as shadow buffers (shadow_fmt) */
+    case HLE_XFMT_F24S8: case HLE_XFMT_LIN_F24S8:
+        o->fmt = VK_FORMAT_R32_SFLOAT; return true;
     case HLE_XFMT_DXT1: o->fmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK; return true;
     case HLE_XFMT_DXT3: o->fmt = VK_FORMAT_BC2_UNORM_BLOCK; return true;
     case HLE_XFMT_DXT5: o->fmt = VK_FORMAT_BC3_UNORM_BLOCK; return true;
@@ -891,6 +973,8 @@ static HleVkTex *tex_find(uint32_t id)
 static struct {
     VkImage img;
     VkImageView view, cube_view;
+    VkImageView view2;                  /* patch 355: the upscaler's source view */
+    VkDescriptorSet set;                /* patch 355: the upscaler's set */
     VkDeviceMemory mem;
     uint32_t slot;
     uint64_t after;
@@ -912,6 +996,12 @@ void hle_draw_tex_reap(uint64_t completed)
             T.vkDestroyImageView(g_hvk.dev, g_retire[i].cube_view, NULL);
         }
         T.vkDestroyImageView(g_hvk.dev, g_retire[i].view, NULL);
+        if (g_retire[i].view2) {
+            T.vkDestroyImageView(g_hvk.dev, g_retire[i].view2, NULL);
+        }
+        if (g_retire[i].set) {
+            hle_movieup_set_free(g_retire[i].set);
+        }
         T.vkDestroyImage(g_hvk.dev, g_retire[i].img, NULL);
         T.vkFreeMemory(g_hvk.dev, g_retire[i].mem, NULL);
         if (g_retire[i].slot && g_nfree_slot < ARRAY_SIZE(g_free_slot)) {
@@ -931,8 +1021,37 @@ void hle_draw_tex_stamp(uint64_t value)
     }
 }
 
+/* patch 355: the movie upscaler's enlarged copies live, and their bytes */
+static unsigned g_mv_live;
+static uint64_t g_mv_bytes;
+
+/* t's enlarged copy (patch 355) retired as its image is (its own entry; the
+ * source view stays with the image's) */
+static void movie_up_drop(HleVkTex *t)
+{
+    if (t->up_img) {
+        if (g_nretire == TEX_RETIRE_MAX) {
+            hle_tl_wait(hle_tl_submitted());    /* full: everything before is done */
+            hle_draw_tex_reap(hle_tl_completed());
+        }
+        g_retire[g_nretire++] = (typeof(g_retire[0])){
+            .img = t->up_img, .view = t->up_view, .cube_view = t->up_rtv, .mem = t->up_mem,
+            .set = t->up_set, .slot = t->up_slot, .after = HLE_SURF_PARKED };
+        g_mv_live -= g_mv_live > 0;
+        const uint64_t b = (uint64_t)t->w * t->up_s * t->h * t->up_s * 4;
+        g_mv_bytes -= MIN(g_mv_bytes, b);
+    }
+    t->up_img = VK_NULL_HANDLE;
+    t->up_mem = VK_NULL_HANDLE;
+    t->up_view = t->up_rtv = VK_NULL_HANDLE;
+    t->up_set = VK_NULL_HANDLE;
+    t->up_slot = t->up_s = 0;
+    t->up_ok = false;
+}
+
 static void tex_free(HleVkTex *t)
 {
+    movie_up_drop(t);                   /* patch 355 */
     if (t->img) {
         if (g_nretire == TEX_RETIRE_MAX) {
             hle_tl_wait(hle_tl_submitted());    /* full: everything before is done */
@@ -940,7 +1059,7 @@ static void tex_free(HleVkTex *t)
         }
         g_retire[g_nretire++] = (typeof(g_retire[0])){
             .img = t->img, .view = t->view, .cube_view = t->cube_view, .mem = t->mem,
-            .slot = t->slot, .after = HLE_SURF_PARKED };
+            .view2 = t->src_view, .slot = t->slot, .after = HLE_SURF_PARKED };
     }
     memset(t, 0, sizeof(*t));
 }
@@ -962,6 +1081,182 @@ static uint32_t level_bytes(uint32_t xfmt, uint32_t w, uint32_t h, uint32_t *row
     }
     *row = w * fi->bpp / 8;
     return *row * h;
+}
+
+/* ---- patch 355: the movie upscaler ---------------------------------------------
+ *
+ * A movie's frames are decoded by the CPU and uploaded as a texture again and
+ * again; at a resolution scale above 1 every draw stretched them bilinearly,
+ * soft. A movie texture gets an enlarged copy at the resolution scale, made
+ * by gamma.c's pass (Catmull-Rom, deringed) once per upload, and the draws
+ * sample that copy (its own slot) instead: no pipeline key changes, nothing
+ * else drawn differently.
+ *
+ * A movie texture: a YUY2 / UYVY one (always a movie; pb/pbres.c converts
+ * them), or an RGB one (8888, 565, 1555, 4444; 2D, one level, at least
+ * 256 x 128) whose texels changed in MV_STREAK uploads in a row, each within
+ * MV_GAP frames of the one before (a 15-60 fps movie: a frame every 1 to 4
+ * display frames). A change is a sample of the uploaded bytes (MV_SAMPLES of
+ * 8) that differs, so a texture uploaded again unchanged doesn't count.
+ * Once it has a copy, each of its uploads makes it again (it never shows an
+ * older frame); off (setting, nomovieup) the draws sample the texture itself.
+ *
+ * Bounded: up to MV_LIVE copies and MV_BYTES in all, each side at most
+ * MV_MAX_DIM; a linear texture (texel coordinates, divided by its image's
+ * size / the resolution scale in the shaders: the 256 << stage flag) only at
+ * exactly the resolution scale, else as before. */
+#define MV_STREAK 10
+#define MV_GAP 4
+#define MV_SAMPLES 64
+#define MV_LIVE 4
+#define MV_BYTES (160ull << 20)
+#define MV_MAX_DIM 4096u
+
+static uint32_t mv_sample(const HleCmdTex *c)
+{
+    const uint8_t *p = g_harena.map ? g_harena.map + c->arena_off : NULL;
+    const uint32_t n = c->arena_len;
+    uint32_t h = 2166136261u;
+    if (!p || n < 8) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < MV_SAMPLES; i++) {
+        uint64_t w;
+        memcpy(&w, p + (uint64_t)(n - 8) * i / (MV_SAMPLES - 1), 8);
+        h = (h ^ (uint32_t)w ^ (uint32_t)(w >> 32)) * 16777619u;
+    }
+    return h ? h : 1;
+}
+
+static bool mv_format(VkFormat f)
+{
+    return f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM ||
+           f == VK_FORMAT_R5G6B5_UNORM_PACK16 || f == VK_FORMAT_A1R5G5B5_UNORM_PACK16 ||
+           f == VK_FORMAT_A4R4G4B4_UNORM_PACK16_EXT;
+}
+
+/* t's enlarged copy, s times its size: image, views, slot, set */
+static bool movie_up_make(HleVkTex *t, const TexFmt *tf, uint32_t s)
+{
+    const uint32_t w = t->w * s, h = t->h * s;
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { w, h, 1 }, .mipLevels = 1,
+        .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (!t->src_view) {
+        VkImageViewCreateInfo sv = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = t->fmt,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        if (T.vkCreateImageView(g_hvk.dev, &sv, NULL, &t->src_view) != VK_SUCCESS) {
+            t->src_view = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    if (T.vkCreateImage(g_hvk.dev, &ici, NULL, &t->up_img) != VK_SUCCESS) {
+        t->up_img = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements req;
+    T.vkGetImageMemoryRequirements(g_hvk.dev, t->up_img, &req);
+    int mt = hle_vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt };
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->up_img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    bool ok = mt >= 0 && T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &t->up_mem) == VK_SUCCESS;
+    if (!ok) {
+        t->up_mem = VK_NULL_HANDLE;
+    }
+    ok = ok && T.vkBindImageMemory(g_hvk.dev, t->up_img, t->up_mem, 0) == VK_SUCCESS;
+    ok = ok && T.vkCreateImageView(g_hvk.dev, &vci, NULL, &t->up_rtv) == VK_SUCCESS;
+    vci.components = tf->sw;
+    ok = ok && T.vkCreateImageView(g_hvk.dev, &vci, NULL, &t->up_view) == VK_SUCCESS;
+    ok = ok && (t->up_set = hle_movieup_set_new(t->src_view)) != VK_NULL_HANDLE;
+    ok = ok && (t->up_slot = take_slot()) != 0;
+    if (!ok) {
+        /* nothing recorded uses them yet */
+        hle_movieup_set_free(t->up_set);
+        if (t->up_view) {
+            T.vkDestroyImageView(g_hvk.dev, t->up_view, NULL);
+        }
+        if (t->up_rtv) {
+            T.vkDestroyImageView(g_hvk.dev, t->up_rtv, NULL);
+        }
+        T.vkDestroyImage(g_hvk.dev, t->up_img, NULL);
+        if (t->up_mem) {
+            T.vkFreeMemory(g_hvk.dev, t->up_mem, NULL);
+        }
+        t->up_img = VK_NULL_HANDLE;
+        t->up_mem = VK_NULL_HANDLE;
+        t->up_view = t->up_rtv = VK_NULL_HANDLE;
+        t->up_set = VK_NULL_HANDLE;
+        t->up_slot = 0;
+        return false;
+    }
+    write_image(t->up_slot, t->up_view);
+    t->up_s = s;
+    g_mv_live++;
+    g_mv_bytes += (uint64_t)w * h * 4;
+    return true;
+}
+
+/* After an upload of t (c; its image SHADER_READ_ONLY): a movie's enlarged
+ * copy made again, made first once it shows as one */
+static void movie_up(HleVkTex *t, const HleCmdTex *c, const TexFmt *tf, VkCommandBuffer cb)
+{
+    t->up_ok = false;                   /* the copy holds an older frame until made again */
+    const bool yuv = c->gfmt == HLE_XFMT_YUY2 || c->gfmt == HLE_XFMT_UYVY;
+    if (t->vol || t->faces != 1 || t->levels != 1 || t->d > 1 || t->sgn || !mv_format(t->fmt)) {
+        return;
+    }
+    if (!yuv && !t->up_img) {
+        if (t->w < 256 || t->h < 128) {
+            return;
+        }
+        const uint64_t f = hle_back_swap_count() + 1;
+        const uint32_t h = mv_sample(c);
+        if (h != t->mv_hash && f != t->mv_last) {
+            t->mv_streak = t->mv_last && f - t->mv_last <= MV_GAP ? t->mv_streak + 1 : 1;
+            t->mv_last = f;
+        }
+        t->mv_hash = h;
+        if (t->mv_streak < MV_STREAK) {
+            return;
+        }
+    }
+    if (!hle_movieup_on()) {
+        return;
+    }
+    uint32_t s = g_hle_rscale;
+    while (s > 1 && (t->w * s > MV_MAX_DIM || t->h * s > MV_MAX_DIM)) {
+        s--;
+    }
+    if (s < 2 || (t->linear && s != g_hle_rscale)) {
+        return;
+    }
+    if (t->up_img && t->up_s != s) {
+        movie_up_drop(t);               /* the resolution scale changed */
+    }
+    if (!t->up_img) {
+        if (g_mv_live >= MV_LIVE || g_mv_bytes + (uint64_t)t->w * s * t->h * s * 4 > MV_BYTES ||
+            !movie_up_make(t, tf, s)) {
+            return;
+        }
+        static unsigned s_logged;
+        if (s_logged < 8) {
+            s_logged++;
+            hle_log("hakuX-hle-back", "movie upscaler (patch 355): texture %u %ux%u fmt 0x%x%s -> %ux%u",
+                    t->id, t->w, t->h, t->xfmt, yuv ? " (YUV)" : "", t->w * s, t->h * s);
+        }
+    }
+    hle_movieup_pass(cb, t->up_set, t->up_img, t->up_rtv, t->w * s, t->h * s,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    t->up_ok = true;
 }
 
 void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
@@ -1018,6 +1313,8 @@ void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
         t->linear = (hle_fmt_info(c->xfmt)->flags & HLE_FI_LIN) != 0;
         write_tex_slot(t);
     }
+    t->sgn = (uint8_t)hle_fmt_sign_rgba(c->xfmt, c->sign);     /* patch 334 */
+    t->gfmt = c->gfmt;
     VkImageMemoryBarrier2 b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
@@ -1055,6 +1352,7 @@ void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     T.vkCmdPipelineBarrier2(cb, &di);
+    movie_up(t, c, &tf, cb);            /* patch 355: a movie's enlarged copy */
 }
 
 /* A render-target surface sampled as a texture: its own bindless slot,
@@ -1145,10 +1443,25 @@ static HleVkSurf *tex_surface(uint32_t id, uint32_t rt_id)
 }
 
 /* Shadow-buffer depth range of the stage's texture (HlePshKey.shadow_fmt):
- * 0 not a depth surface. */
+ * 0 not a depth surface. Patch 335: an uploaded depth-format texture too, as
+ * the NV2A compares every depth format it samples (4, an uploaded F24 texture,
+ * is the key's 0: its float as it is). */
 static unsigned shadow_fmt(uint32_t id)
 {
-    HleVkSurf *s = id && !tex_find(id) ? hle_surf_get(id) : NULL;
+    HleVkTex *t = id ? tex_find(id) : NULL;
+    if (t) {
+        if (!shadow_tex_on() || (t->xfmt != HLE_XFMT_F24S8 && t->xfmt != HLE_XFMT_LIN_F24S8)) {
+            return 0;
+        }
+        switch (t->gfmt) {
+        case HLE_XFMT_D24S8: case HLE_XFMT_LIN_D24S8:   return 1;
+        case HLE_XFMT_D16: case HLE_XFMT_LIN_D16:       return 2;
+        case HLE_XFMT_F16: case HLE_XFMT_LIN_F16:       return 3;
+        case HLE_XFMT_F24S8: case HLE_XFMT_LIN_F24S8:   return 4;
+        default:                                        return 0;
+        }
+    }
+    HleVkSurf *s = id ? hle_surf_get(id) : NULL;
     if (!s || !s->img || (s->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         return 0;
     }
@@ -1280,10 +1593,22 @@ static bool g_snap_trunc;
 static unsigned g_prop_gen;
 unsigned g_hle_zeq;
 
+/* patch 333 (xogfix=eqtol, per game: Matrix: Path of Neo test): the EQUAL-pass tolerance the Turnip quirk turns on,
+ * for one game on any driver - its characters' second passes over the same mesh flickered */
+static bool eqtol_fix(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XOG_FIX");
+        on = e && strstr(e, "eqtol") ? 1 : 0;
+    }
+    return on == 1;
+}
+
 unsigned hle_draw_zeq(const HleCmdDraw *c, uint32_t ds_id)
 {
     const uint32_t *rs = g_dr.st.rs;
-    if (!g_hvk.caps.fbfetch || !g_dr.st_valid || !hle_quirk(HLE_QUIRK_EQ_DEPTH_STEP) || g_eqtol_off ||
+    if (!g_hvk.caps.fbfetch || !g_dr.st_valid || !(hle_quirk(HLE_QUIRK_EQ_DEPTH_STEP) || eqtol_fix()) || g_eqtol_off ||
         g_zeq_off || !ds_id ||
         rs[RS_ZENABLE] != 1 || rs[RS_ZWRITEENABLE] || rs[RS_ZFUNC] != 0x202 ||
         rs[RS_SOLIDOFFSETENABLE] || c->prim < VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
@@ -1593,6 +1918,26 @@ static VkSamplerAddressMode addr_mode(uint32_t a)
     }
 }
 
+/* Anisotropic filtering (patch 241): 0 or 1 off, else 2, 4, 8 or 16, the
+ * front end's (the PS5 layer's af= start line), set before the game runs.
+ * Only the games' own linearly minified textures get it (point-sampled ones
+ * stay as they are); it's in the sampler's key, so a change makes new ones. */
+int hle_vk_af;
+void hle_vk_set_af(int level)
+{
+    hle_vk_af = level >= 16 ? 16 : level >= 8 ? 8 : level >= 4 ? 4 : level >= 2 ? 2 : 0;
+}
+
+/* Texture sharpness (patch 247): a negative LOD bias on the games' linearly
+ * minified, mipmapped textures, more detailed mipmaps: 0 off, 1 -0.5, 2 -1.0,
+ * 3 -1.5. The front end's (texsharp= start line, the quick menu at any time):
+ * it's in the sampler's key (key2 bits 61-62), so a change makes new ones. */
+int hle_vk_texsharp;
+void hle_vk_set_texsharp(int level)
+{
+    hle_vk_texsharp = level < 0 ? 0 : level > 3 ? 3 : level;
+}
+
 /* sampler_index's lod_down: how many levels finer the stage must sample (the
  * source surface's resolution scale over the target's, as log2 in 1/16ths). */
 static uint32_t sampler_index(const uint32_t *tss, uint32_t lod_down)
@@ -1604,7 +1949,21 @@ static uint32_t sampler_index(const uint32_t *tss, uint32_t lod_down)
                    (uint64_t)(tss[TSS_MIPFILTER] & 7) << 12 |
                    (uint64_t)(tss[TSS_ADDRESSW] & 7) << 15 | (uint64_t)base << 18 |
                    (uint64_t)tss[TSS_BORDERCOLOR] << 32;
-    uint64_t key2 = tss[TSS_MIPMAPLODBIAS] | (uint64_t)lod_down << 32;
+    /* the AF level asked of this sampler, in key2's top byte (patch 241) */
+    const uint32_t af = g_hvk.caps.aniso && g_hvk.caps.max_aniso >= 2.0f &&
+                        (tss[TSS_MINFILTER] & 7) >= 2 && hle_vk_af > 1 ? (uint32_t)hle_vk_af : 0;
+    /* texture sharpness asked of this sampler, in key2 bits 61-62 (patch 247) */
+    const uint32_t tsharp = (tss[TSS_MINFILTER] & 7) >= 2 && (tss[TSS_MIPFILTER] & 7) != 0 ?
+                            (uint32_t)hle_vk_texsharp & 3u : 0;
+    /* patch 343: MAX_LOD_CLAMP + 1 (pb/kelvin.c, 0 none) in key2 bits 40-43, mipmapped
+     * samplers only (lod_down, bits 32-39, is below 64); XOG_FIX nolodmax: none */
+    static int s_lodmax = -1;
+    if (s_lodmax < 0) {
+        s_lodmax = !hle_xog_fix_word("nolodmax");
+    }
+    const uint32_t lodmax = s_lodmax && (tss[TSS_MIPFILTER] & 7) ? (tss[HLE_TSS_X_EXT] >> 16) & 0xF : 0;
+    uint64_t key2 = tss[TSS_MIPMAPLODBIAS] | (uint64_t)lod_down << 32 | (uint64_t)lodmax << 40 |
+                    (uint64_t)af << 56 | (uint64_t)tsharp << 61;
     /* one per stage a draw: the index last found for the key's hash, before the scan */
     static uint16_t hot[64];
     unsigned h = (unsigned)(((key ^ key2 * 0x9E3779B97F4A7C15ull) * 0xFF51AFD7ED558CCDull) >> 58);
@@ -1637,6 +1996,7 @@ static uint32_t sampler_index(const uint32_t *tss, uint32_t lod_down)
     memcpy(&bias, &bias_bits, 4);
     bias = isfinite(bias) ? MAX(MIN(bias, 15.0f), -15.0f) : 0.0f;
     bias -= lod_down / 16.0f;
+    bias -= 0.5f * (float)tsharp;       /* texture sharpness (patch 247) */
     const float lim = g_hvk.caps.max_lod_bias;          /* 15 on PowerVR */
     bias = MAX(MIN(bias, lim), -lim);
     /* Without format-less custom border colours for every sampler (PowerVR's
@@ -1658,7 +2018,10 @@ static uint32_t sampler_index(const uint32_t *tss, uint32_t lod_down)
         .addressModeV = addr_mode(tss[TSS_ADDRESSV]),
         .addressModeW = addr_mode(tss[TSS_ADDRESSW]),
         .mipLodBias = bias, .minLod = (float)base,
-        .maxLod = mip ? VK_LOD_CLAMP_NONE : base + 0.25f,
+        /* patch 343: a chain clamped at MAX_LOD_CLAMP (never below the base) */
+        .maxLod = mip ? (lodmax ? (float)MAX(lodmax - 1, base) : VK_LOD_CLAMP_NONE) : base + 0.25f,
+        .anisotropyEnable = af > 1 ? VK_TRUE : VK_FALSE,
+        .maxAnisotropy = af > 1 ? MIN((float)af, g_hvk.caps.max_aniso) : 1.0f,
         .borderColor = border };
     VkSampler s;
     if (T.vkCreateSampler(g_hvk.dev, &sci, NULL, &s) != VK_SUCCESS) {
@@ -1794,7 +2157,10 @@ typedef struct PipeKey {
     HleFfVsKey vs;
     HleFfPsKey ps;
     uint32_t blend_en, src, dst, op, wmask;
-    uint32_t cfmt, dfmt, topo_class;
+    uint32_t cfmt, dfmt, topo_class;     /* topo_class bits 8-9 (patch 325): log2 of the
+                                           pass's MSAA samples, 0 at 1x (keys as before);
+                                           bits 10-11 the polygon mode (1 point, 2 line),
+                                           12 the last provoking vertex (patch 341) */
     uint64_t vsh;                       /* vertex program hash, 0 = FF vertex shader */
     HleVshKey vk;
     uint32_t psh;                       /* 1 = register combiners (pk), else FF stages */
@@ -1805,6 +2171,10 @@ typedef struct PipeKey {
     /* After it, 8-aligned: there only without extended dynamic state */
     DsKey ds;
 } PipeKey;
+
+/* patch 337-345: their state in bits the key always had free (psh.h, ff.h,
+ * topo_class): its size, and every saved pipeline record, as before */
+HLE_BUILD_BUG_ON(sizeof(PipeKey) != 680);
 
 /* The key's bytes hashed, compared and recorded: up to vi, up to ds (caps.vids
  * off), or all of it (caps.eds1 or eds2 off) */
@@ -2091,7 +2461,7 @@ static HlePbResult pipeline_build(const void *key, const uint32_t *tok, uint32_t
             VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
         VkPipelineInputAssemblyStateCreateInfo ia = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-            .topology = k_class[k->topo_class] };
+            .topology = k_class[k->topo_class & 0xFF] };
         VkPipelineViewportStateCreateInfo vp = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
             .viewportCount = 1, .scissorCount = 1 };
@@ -2100,9 +2470,28 @@ static HlePbResult pipeline_build(const void *key, const uint32_t *tok, uint32_t
             /* without depthClamp the vertex shader clamps (HLE_ZCLAMP_GLSL) */
             .depthClampEnable = (k->vsh ? k->vk.zclamp : k->vs.zclamp) && g_hvk.caps.depth_clamp,
             .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1.0f };
+        /* patch 341: the key's polygon mode and provoking vertex (topo_class bits
+         * 10-12), where the device has them */
+        const unsigned pmode = (k->topo_class >> 10) & 3;
+        if (pmode && g_hvk.caps.fill_nonsolid) {
+            rs.polygonMode = pmode == 1 ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_LINE;
+        }
+        VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pvi = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+            .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT };
+        if (((k->topo_class >> 12) & 1) && g_hvk.caps.pv_last) {
+            rs.pNext = &pvi;
+        }
         VkPipelineMultisampleStateCreateInfo ms = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-            .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+            /* patch 325: the pass's MSAA samples (the key's) */
+            .rasterizationSamples = (VkSampleCountFlagBits)(1u << ((k->topo_class >> 8) & 3)) };
+        /* patch 354: alpha-to-coverage, an MSAA pass's cut-outs (the key's
+         * HLE_A2C_BIT, set only with samples > 1) */
+        if (((k->psh ? k->pk.alpha_func : k->ps.alpha_func) & HLE_A2C_BIT) &&
+            ms.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT) {
+            ms.alphaToCoverageEnable = VK_TRUE;
+        }
         VkPipelineDepthStencilStateCreateInfo ds = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
             /* all dynamic, but Turnip keys on the static masks: with zero
@@ -2403,6 +2792,53 @@ static uint32_t stage_lod_down(const HleCmdDraw *c, unsigned st, uint32_t rt_id)
     return (uint32_t)lrintf(log2f((float)ts->scale / (float)rt->scale) * 16.0f);
 }
 
+/* patch 334: stage st's sampler state (sampler_index), its border colour
+ * encoded as the texture's texels are: an offset-binary channel's byte
+ * (HleVkTex.sgn) with its top bit flipped, so that the border filters with the
+ * texels and decodes (psh.c sgnob) to the colour's signed value; *t holds the
+ * copy. A texture without such channels: its own state, as before. */
+static const uint32_t *stage_tss(const HleCmdState *s, const HleCmdDraw *c, unsigned st,
+                                 uint32_t t[HLE_TSS_COUNT])
+{
+    HleVkTex *tx = c->tex[st] ? tex_find(c->tex[st]) : NULL;
+    if (!tx || !tx->sgn) {
+        return s->tss[st];
+    }
+    memcpy(t, s->tss[st], HLE_TSS_COUNT * sizeof(t[0]));
+    t[TSS_BORDERCOLOR] ^= (tx->sgn & 1 ? 0x00800000u : 0) | (tx->sgn & 2 ? 0x00008000u : 0) |
+                          (tx->sgn & 4 ? 0x00000080u : 0) | (tx->sgn & 8 ? 0x80000000u : 0);
+    return t;
+}
+
+/* patch 334: stage st's colour sign (D3DTSIGN_*: A R G B) as the view's
+ * channels (bit 0 r .. 3 a): *ob those an uploaded texture's image holds
+ * offset binary (pb/pbres.c), mapped back exactly; *raw a target's, and L8's,
+ * AL8's, A8's and A8L8's, read as stored, two's complement after filtering. By
+ * the guest's format: DXT, 16-bit and P8 stay unsigned where the host expanded
+ * them to 8888 too. Both 0 without a sign (every draw that sets none). */
+static void stage_sign(const HleCmdState *s, const HleCmdDraw *c, unsigned st, unsigned *ob,
+                       unsigned *raw)
+{
+    *ob = *raw = 0;
+    const uint32_t sign = s->tss[st][TSS_COLORSIGN] >> 28;
+    if (!sign || !c->tex[st] || !sign_on()) {
+        return;
+    }
+    HleVkTex *tx = tex_find(c->tex[st]);
+    HleVkSurf *sf = tx ? NULL : hle_surf_get(c->tex[st]);
+    const uint32_t gx = tx ? tx->gfmt : sf ? sf->d.xfmt : 0;
+    const uint32_t want = tx || sf ? hle_fmt_sign_rgba(gx, sign) : 0;
+    *ob = tx ? tx->sgn & 15 : 0;
+    *raw = want & ~*ob & 15;
+    static unsigned s_logged;
+    if (s_logged < 8) {
+        s_logged++;
+        hle_log("hakuX-hle-pipe", "colour sign (patch 334): stage %u %s %u fmt 0x%x sign %x: "
+                "offset binary %x, as stored %x%s", st, tx ? "tex" : "surf", c->tex[st], gx, sign,
+                *ob, *raw, *ob | *raw ? "" : " (format stays unsigned)");
+    }
+}
+
 /* Surfaces sampled as textures, each told once (the first 64 ids below 8192) */
 static uint8_t g_rt_seen[8192 / 8];
 static unsigned g_rt_told;
@@ -2430,8 +2866,11 @@ static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uin
     uint32_t slot = 0;
     HleVkSurf *rt;
     if (tx) {
-        slot = tx->slot;
-        *flags |= tx->linear ? 1u << st : 0;
+        /* patch 355: a movie's enlarged copy (a linear one at the resolution
+         * scale: its texel coordinates divided by it, as a scaled surface's) */
+        const bool up = tx->up_ok && hle_movieup_on() && (!tx->linear || tx->up_s == g_hle_rscale);
+        slot = up ? tx->up_slot : tx->slot;
+        *flags |= tx->linear ? 1u << st | (up ? 256u << st : 0u) : 0u;
     } else if (c->tex[st] == rt_id && g_snap_cur >= 0 && g_snap_rt == rt_id &&
                (rt = hle_surf_get(rt_id)) != NULL) {
         slot = g_snap[g_snap_cur].slot;  /* the target, copied before the draw */
@@ -2936,11 +3375,29 @@ void hle_draw_psframe_next(void)
     g_psf_frame = (int64_t)hle_back_swap_count() + 1;
 }
 
+/* patch 358 (debug): the draw dump of `count` frames in a row, starting `delay` swaps from now (the quick menu's
+ * close, XOG_PSF_QM=1: the frames a player sees flicker, dumped on demand) */
+static int64_t g_psf_start = -1;
+static int g_psf_more;
+
+void hle_draw_psframe_after(unsigned delay, unsigned count)
+{
+    g_psf_start = (int64_t)hle_back_swap_count() + delay;
+    g_psf_more = (int)count;
+    hle_log("hakuX-hle-pipe", "psframe: %u frames from swap %lld", count, (long long)g_psf_start);
+}
+
 void hle_draw_psframe_poll(uint64_t swap)
 {
     if (g_psf_frame == -2) {
         const char *e = getenv("HAKUX_HLE_PSFRAME");
         g_psf_frame = e ? atoll(e) : -1;
+    }
+    if (g_psf_more > 0 && g_psf_start >= 0 && (int64_t)swap >= g_psf_start &&
+        (g_psf_frame < 0 || (int64_t)swap > g_psf_frame)) {
+        hle_draw_psframe_next();
+        g_psf_more--;
+        hle_log("hakuX-hle-pipe", "psframe: frame %lld dumped next (%d more)", (long long)g_psf_frame, g_psf_more);
     }
     probe_log(swap);
     hle_quirks_poll();
@@ -3487,7 +3944,14 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         fs->texture = c->tex[st] != 0;
         fs->unset = c->tex_unset >> st & 1;
         fs->alpha_kill = fs->texture && t[TSS_ALPHAKILL] != 0;
-        pc.tex[ki] = slot | sampler_index(t, stage_lod_down(c, st, rt_id)) << 16;
+        {   /* patch 334: colour sign (ff.h HleFfStage.sgn) */
+            unsigned ob, raw;
+            stage_sign(s, c, st, &ob, &raw);
+            fs->sgn = (uint8_t)(slot ? ob | raw << 4 : 0);
+        }
+        uint32_t tcopy[HLE_TSS_COUNT];
+        pc.tex[ki] = slot | sampler_index(stage_tss(s, c, st, tcopy),
+                                          stage_lod_down(c, st, rt_id)) << 16;
         k.vs.texcoord[ki] = t[TSS_TEXCOORDINDEX] & 7;
         k.ps.nstages = ki + 1;
         k.vs.ntex = ki + 1;
@@ -3499,8 +3963,9 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         memset(&k.ps, 0, sizeof(k.ps));
         pc.flags = 0;
         for (unsigned st = 0; st < HLE_FF_STAGES; st++) {
+            uint32_t tcopy[HLE_TSS_COUNT];      /* patch 334: a signed border */
             pc.tex[st] = stage_slot(c, st, rt_id, &pc.flags) |
-                         sampler_index(s->tss[st], stage_lod_down(c, st, rt_id)) << 16;
+                         sampler_index(stage_tss(s, c, st, tcopy), stage_lod_down(c, st, rt_id)) << 16;
             k.vs.texcoord[st] = s->tss[st][TSS_TEXCOORDINDEX] & 7;
         }
         k.vs.ntex = HLE_FF_STAGES;
@@ -3522,7 +3987,54 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
             unsigned sf = shadow_fmt(c->tex[st]);
             if (sf) {
                 k.pk.shadow |= 1u << st;
-                k.pk.shadow_fmt |= sf << (2 * st);
+                k.pk.shadow_fmt |= (sf & 3) << (2 * st);    /* 4 (patch 335's F24) as 0 */
+            }
+        }
+        for (unsigned st = 0; st < 4; st++) {
+            /* patch 334: colour sign, per stage 4 bits (r g b a) each */
+            unsigned ob, raw;
+            stage_sign(s, c, st, &ob, &raw);
+            k.pk.sgn_ob |= (uint16_t)(ob << (4 * st));
+            k.pk.sgn_raw |= (uint16_t)(raw << (4 * st));
+        }
+        /* patch 340: texture colour key (TEXTURE_CONTROL0 COLORKEYOP, SET_COLOR_KEY_COLOR),
+         * as xemu's psh.c: compared with the texel as fetched, an X format's alpha
+         * ignored; patch 342: the convolution filter. Program draws (psh.h);
+         * XOG_FIX nocolorkey / noconv: as before. */
+        static int s_ckey = -1, s_conv = -1;
+        if (s_ckey < 0) {
+            s_ckey = !hle_xog_fix_word("nocolorkey");
+            s_conv = !hle_xog_fix_word("noconv");
+        }
+        for (unsigned st = 0; prog && st < 4; st++) {
+            const uint32_t *t = s->tss[st];
+            if (!c->tex[st]) {
+                continue;
+            }
+            if (s_ckey && (t[TSS_COLORKEYOP] & 3)) {
+                HleVkTex *tx = tex_find(c->tex[st]);
+                HleVkSurf *sf = tx ? NULL : hle_surf_get(c->tex[st]);
+                const uint32_t gx = tx ? tx->gfmt : sf ? sf->d.xfmt : 0;
+                const bool xf = gx == HLE_XFMT_X1R5G5B5 || gx == HLE_XFMT_X8R8G8B8 ||
+                                gx == HLE_XFMT_LIN_X1R5G5B5 || gx == HLE_XFMT_LIN_X8R8G8B8;
+                const uint32_t kc = t[HLE_TSS_X_KEYCOLOR];
+                k.pk.input_tex |= (t[TSS_COLORKEYOP] & 3) << (2 * st) | (xf ? HLE_PSH_CKEY_X(st) : 0u);
+                pc.mvp[4 + st] = (float)(kc & 0xFFFF);
+                pc.mvp[8 + st] = (float)(kc >> 16);
+                static unsigned s_logged;
+                if (s_logged < 4) {
+                    s_logged++;
+                    hle_log("hakuX-hle-pipe", "colour key (patch 340): stage %u op %u key %08x fmt 0x%x%s", st,
+                            t[TSS_COLORKEYOP] & 3, kc, gx, xf ? " (alpha ignored)" : "");
+                }
+            }
+            if (s_conv && (t[HLE_TSS_X_EXT] & 1) && !((k.pk.shadow >> st) & 1)) {
+                k.pk.input_tex |= HLE_PSH_CONV(st);
+                static unsigned s_logged;
+                if (s_logged < 4) {
+                    s_logged++;
+                    hle_log("hakuX-hle-pipe", "convolution filter (patch 342): stage %u tex %u", st, c->tex[st]);
+                }
             }
         }
         for (unsigned st = 0; st < 4; st++) {
@@ -3612,6 +4124,38 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         }
 #endif
         k.pk.debug = psdbg;
+        {   /* patch 364 (debug): HAKUX_HLE_PSDBG_VSH="<hex vsh>[,<hex vsh>]" (up to 4) gives the debug view
+             * HAKUX_HLE_PSDBG_ON (default 18, magenta with alpha 1) only to draws of those vertex programs -
+             * RalliSport Challenge 2's trees: drawn but cut away, or not reaching the screen at all? */
+            static int nv = -1;
+            static uint64_t vs[4];
+            static int view = 18;
+            if (nv < 0) {
+                nv = 0;
+                const char *e = getenv("HAKUX_HLE_PSDBG_VSH");
+                for (const char *q = e; q && *q && nv < 4;) {
+                    char *end;
+                    const unsigned long long v = strtoull(q, &end, 16);
+                    if (end == q) {
+                        break;
+                    }
+                    vs[nv++] = v;
+                    q = *end == ',' ? end + 1 : end;
+                }
+                const char *o = getenv("HAKUX_HLE_PSDBG_ON");
+                view = o ? atoi(o) : 18;
+                if (nv) {
+                    hle_log("hakuX-hle-pipe", "debug view %d for %d vertex programs", view, nv);
+                }
+            }
+            static const uint8_t colour[4] = { 18, 25, 26, 27 };   /* pink, green, light blue, yellow */
+            for (int i = 0; i < nv; i++) {
+                if (c->vsh == vs[i]) {
+                    k.pk.debug = view == 18 ? colour[i] : view;
+                    k.pk.alpha_test = false;    /* the whole quad shows, whatever its alpha */
+                }
+            }
+        }
         static int pbtint = -1;         /* debug: push-buffer runs' draws in magenta */
         if (pbtint < 0) {
             pbtint = getenv("HAKUX_HLE_PBTINT") != NULL;
@@ -3787,6 +4331,36 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
     k.cfmt = rt ? rt->fmt : 0;
     k.dfmt = ds ? ds->fmt : 0;
     k.topo_class = c->prim == 0 ? 0 : c->prim <= 2 ? 1 : 2;
+    /* patch 325: an MSAA pass's draws need pipelines of its samples (in the
+     * key; nothing added at 1x, so its keys and records stay as they were) */
+    k.topo_class |= (g_hle_pass_samples >= 8 ? 3u : g_hle_pass_samples >= 4 ? 2u :
+                     g_hle_pass_samples >= 2 ? 1u : 0u) << 8;
+    /* patch 341: SET_FRONT / BACK_POLYGON_MODE (topo_class bits 10-11: 1 point,
+     * 2 line; Vulkan has one mode for both faces: the faces culling leaves,
+     * else the front's) and SET_PROVOKING_VERTEX LAST for flat shading (bit
+     * 12), where the device has them (else as before: filled, the first
+     * vertex). Fill and FIRST, the defaults, add nothing. XOG_FIX nopolymode. */
+    {
+        static int s_poly = -1;
+        if (s_poly < 0) {
+            s_poly = !hle_xog_fix_word("nopolymode");
+        }
+        const uint32_t xr = s_poly ? s->rs[HLE_RS_X_RASTER] : 0;
+        if ((xr & 0xF) && c->prim >= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && g_hvk.caps.fill_nonsolid) {
+            const uint32_t cm = s->rs[RS_CULLMODE], fface = s->rs[RS_FRONTFACE];
+            const uint32_t pm = cm && cm == fface ? (xr >> 2) & 3 : xr & 3;
+            k.topo_class |= (pm & 3) << 10;
+            static unsigned s_logged;
+            if (s_logged < 4 && pm) {
+                s_logged++;
+                hle_log("hakuX-hle-pipe", "polygon mode (patch 341): front %u back %u cull %x: %s", xr & 3,
+                        (xr >> 2) & 3, cm, pm == 1 ? "points" : "lines");
+            }
+        }
+        if ((xr & 0x10) && g_hvk.caps.pv_last && s->rs[RS_SHADEMODE] == 0x1D00) {
+            k.topo_class |= 1u << 12;
+        }
+    }
     /* HAKUX_HLE_DBGFLAGS (debug): 1 stencil test off, 2 depth test off on
      * stencil-tested draws, 4 polygon offset off, 8 W-buffering off, 16 fog
      * off, 32 culling off */
@@ -3873,7 +4447,31 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
      * is further in front (hle_draw_zeq, bound by back.c). Only on the drivers
      * with HLE_QUIRK_EQ_DEPTH_STEP; debug.hakux.eqtol=0 turns it off (live). */
     bool eq_tol = zt && tri && !(dbgf & 4) && !s->rs[RS_ZWRITEENABLE] &&
-                  s->rs[RS_ZFUNC] == 0x202 && hle_quirk(HLE_QUIRK_EQ_DEPTH_STEP) && !g_eqtol_off;
+                  s->rs[RS_ZFUNC] == 0x202 && (hle_quirk(HLE_QUIRK_EQ_DEPTH_STEP) || eqtol_fix()) && !g_eqtol_off;
+    {   /* patch 333: signed textures (TSS_COLORSIGN), which this core samples unsigned - a count, to see if a game uses them */
+        static unsigned n_sign, n_eq, n_all, bits;
+        static uint64_t t_last;
+        n_all++;
+        n_eq += eq_tol;
+        for (unsigned st = 0; st < HLE_FF_STAGES; st++) {
+            if (s->tss[st][TSS_COLORSIGN]) {
+                n_sign++;
+                bits |= s->tss[st][TSS_COLORSIGN] >> 28 << (4 * st);
+                break;
+            }
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const uint64_t now = (uint64_t)ts.tv_sec;
+        if (now != t_last) {
+            if (t_last && (n_sign || n_eq)) {
+                hle_log("hakuX-hle-draw", "per s: draws %u, with signed textures %u (stage bits %04x), EQUAL passes "
+                        "with tolerance %u", n_all, n_sign, bits, n_eq);
+            }
+            t_last = now;
+            n_sign = n_eq = n_all = bits = 0;
+        }
+    }
     if (eq_tol) {
         zslope = bias ? zslope : 0.0f;
         zofs = (bias ? zofs : 0.0f) - 1.0f;
@@ -3882,6 +4480,38 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
             k.pk.fbfetch |= (uint8_t)g_hle_zeq;
         } else {
             k.ps.fbfetch |= (uint8_t)g_hle_zeq;
+        }
+    }
+    /* patch 338: the depth clip range (SET_CLIP_MIN / MAX, xemu's clipRange):
+     * a range inside the buffer's [0, maximum] keeps a program draw's depth
+     * in it, clamped, or with ZCLAMP_EN CULL discarded outside it (half a step
+     * of slack: the range's own ends pass). The whole range (D3D's usual
+     * viewport 0..1) is the rasterizer's own clip, as before. XOG_FIX noclipz. */
+    {
+        static int s_clipz = -1;
+        if (s_clipz < 0) {
+            s_clipz = !hle_xog_fix_word("noclipz");
+        }
+        const uint32_t zc = s->rs[HLE_RS_X_ZCTL];
+        if (s_clipz && (zc & 1) && s->psh && prog && zt && !k.vk.zfree) {
+            const float zs = c->zscale;
+            const bool zint = zs == 1.0f / 16777216.0f || zs == 1.0f / 65536.0f;
+            const float zmax = zs > 0.0f ? (zint ? 1.0f / zs - 1.0f : 1.0f / zs) : 0.0f;
+            float lo, hi;
+            memcpy(&lo, &s->rs[HLE_RS_X_CLIPMIN], 4);
+            memcpy(&hi, &s->rs[HLE_RS_X_CLIPMAX], 4);
+            if (zmax > 0.0f && __builtin_isfinite(lo) && !__builtin_isnan(hi) && (lo > 0.0f || hi < zmax)) {
+                const float slack = (zc & 2) ? 0.5f : 0.0f;
+                k.pk.tex_modes |= HLE_PSH_ZCLIP | ((zc & 2) ? HLE_PSH_ZCLIP_CULL : 0u);
+                pc.mvp[12] = (MAX(lo, 0.0f) - slack) / zmax;
+                pc.mvp[13] = (MIN(hi, zmax) + slack) / zmax;
+                static unsigned s_logged;
+                if (s_logged < 4) {
+                    s_logged++;
+                    hle_log("hakuX-hle-pipe", "depth clip range (patch 338): %g..%g of %g, %s", lo, hi, zmax,
+                            (zc & 2) ? "culled" : "clamped");
+                }
+            }
         }
     }
     /* the slope is per guest pixel; the target has scale pixels to one */
@@ -3944,6 +4574,27 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
     }
     if (!g_hvk.caps.eds2) {
         k.ds.bias = bias;
+    }
+    /* patch 354: MSAA alpha-to-coverage ("MSAA smooth cut-outs", a2c= start
+     * line, the quick menu's row; XOG_FIX noa2c): in an MSAA pass, an
+     * alpha-tested draw that doesn't blend, with a cut-out's test (GREATER
+     * 0..254 or GEQUAL 1..255: one that can fail and pass), into a colour
+     * target the shader writes alone (no fbfetch, no signed blend). Its key's
+     * alpha_func gets HLE_A2C_BIT (ff.h); every other draw's key as before. */
+    if (((k.topo_class >> 8) & 3) && !k.blend_en && k.cfmt && hle_a2c_on()) {
+        uint8_t *af = k.psh ? &k.pk.alpha_func : &k.ps.alpha_func;
+        const bool at = k.psh ? k.pk.alpha_test : k.ps.alpha_test;
+        const bool fb = k.psh ? k.pk.fbfetch || k.pk.sblend : k.ps.fbfetch || k.ps.sblend;
+        const uint32_t ref = s->rs[RS_ALPHAREF] & 0xFF;
+        if (at && !fb && ((*af == 4 && ref < 255) || (*af == 6 && ref > 0))) {
+            *af |= HLE_A2C_BIT;
+            static unsigned s_logged;
+            if (s_logged < 4) {
+                s_logged++;
+                hle_log("hakuX-hle-pipe", "MSAA smooth cut-outs (patch 354): %ux, alpha %s %u",
+                        1u << ((k.topo_class >> 8) & 3), (*af & 7) == 4 ? ">" : ">=", ref);
+            }
+        }
     }
     bool pending;
     VkPipeline p = pipeline(&k, rt ? rt : ds, &pending);
@@ -4291,7 +4942,34 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         mp.prim = c->prim;
         mp.end = vfirst + c->count;
     }
-    if (c->ib_off != UINT32_MAX) {
+    /* patch 339: a window clip of several rectangles (HleCmdViewport.crect,
+     * disjoint): the draw once under each one's scissor (target pixels, scaled
+     * as the scissor above), never held for a strip batch */
+    const uint32_t nwc = vpc->clip && vpc->nclip > 1 && !g_hle_gpucut ? MIN(vpc->nclip, (uint32_t)HLE_VP_CLIP_RECTS) : 0;
+    if (nwc) {
+        hle_batch_flush(cb);
+        if (c->ib_off != UINT32_MAX && REC_CHANGED(ibuf, g_harena.buf)) {
+            T.vkCmdBindIndexBuffer(cb, g_harena.buf, 0, VK_INDEX_TYPE_UINT16);
+        }
+        for (uint32_t i = 0; i < nwc; i++) {
+            const int32_t *r = vpc->crect[i];
+            const int32_t x1 = MAX(r[0], 0), y1 = MAX(r[1], 0);
+            const int32_t x2 = MIN(r[2], (int32_t)tw), y2 = MIN(r[3], (int32_t)th);
+            VkRect2D wr = { { x1 * (int32_t)rs, y1 * (int32_t)rs },
+                            { x2 > x1 ? (uint32_t)(x2 - x1) * rs : 0, y2 > y1 ? (uint32_t)(y2 - y1) * rs : 0 } };
+            if (!wr.extent.width || !wr.extent.height) {
+                continue;
+            }
+            g_rec.sc = wr;
+            T.vkCmdSetScissor(cb, 0, 1, &wr);
+            g_dr.emits[EM_SC]++;
+            if (c->ib_off != UINT32_MAX) {
+                T.vkCmdDrawIndexed(cb, c->count, 1, c->ib_off / 2, (int32_t)vfirst, 0);
+            } else {
+                T.vkCmdDraw(cb, c->count, 1, vfirst, 0);
+            }
+        }
+    } else if (c->ib_off != UINT32_MAX) {
         /* A strip run still held binds its index buffer as it is recorded,
          * which this draw's own recording would set off after the check
          * below: the draw then read the run's indices. Nightcaster's terrain

@@ -10,6 +10,7 @@ int scePadInit(void);
 int scePadOpen(int32_t user_id, int32_t type, int32_t index, const void *param);
 int scePadGetHandle(int32_t user_id, int32_t type, int32_t index);
 int scePadReadState(int32_t handle, void *data);
+void rx_pad_extras_dashboard(int32_t handle);    // main_ps5.c (patch 266)
 }
 
 InputManager g_input_mgr;
@@ -43,6 +44,7 @@ void InputManager::Update()
         if (m_handle < 0) {
             return;
         }
+        rx_pad_extras_dashboard(m_handle);     // patch 266: no stiff triggers or a game's light bar here
     }
     PadData d;
     memset(&d, 0, sizeof(d));

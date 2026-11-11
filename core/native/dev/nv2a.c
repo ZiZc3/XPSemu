@@ -288,6 +288,7 @@ static void update_irq(void)
 /* ---- PTIMER's alarm ---- */
 
 uint64_t nc_ke_host_ns(uint64_t guest_ns);  /* native/kernel/ke.c */
+unsigned nc_ff_mul(void);   /* XOG patch 253 (ps5/src/ff_ps5.c): 2 while fast-forward is on */
 
 /* The alarm interrupt comes when the time's low word reaches ALARM_0: D3D
  * times its vblank work with it in the modes whose vblank it doesn't take
@@ -424,7 +425,8 @@ plain:
         return (uint32_t)(nc_ke_now_ns() >> 32) & 0x1FFFFFFFu;
     case NV_PCRTC_RASTER: { /* the line since the last vblank */
         const uint64_t since = now_ns() - __atomic_load_n(&g_last_vblank_ns, __ATOMIC_ACQUIRE);
-        return (uint32_t)((since % g_frame_ns) * LINES / g_frame_ns);
+        const uint64_t fr = g_frame_ns / nc_ff_mul();      /* patch 253: the frame as the vblank runs it */
+        return (uint32_t)((since % fr) * LINES / fr);
     }
     default:
         break;
@@ -497,6 +499,10 @@ static void nv2a_write(void *opaque, uint32_t off, uint64_t value, unsigned size
                    ld(NV_PFIFO_CACHE1_DMA_GET), ld(NV_PFIFO_CACHE1_DMA_PUT));
         }
         if (off == NV_USER_DMA_PUT) {
+            extern uint32_t g_xog_ring_start;
+            if (!g_xog_ring_start) {
+                g_xog_ring_start = (uint32_t)value;     /* the ring's start: D3D's first PUT (patch 193) */
+            }
             hle_pb_pushed((uint32_t)value);         /* before the decoder can see it */
         }
         __atomic_store_n(reg(off - NV_USER_DMA_PUT + NV_PFIFO_CACHE1_DMA_PUT), (uint32_t)value,
@@ -686,7 +692,8 @@ void nc_dev_nv2a_display_pickup(uint64_t ns)
  * vblank so the guest's clock never jumps). */
 static uint64_t next_vblank(uint64_t prev)
 {
-    const uint64_t frame = __atomic_load_n(&g_frame_ns, __ATOMIC_RELAXED);
+    /* patch 253: fast-forward halves the frame (the 120 Hz mods' too): free running, or locked to a 120 Hz panel */
+    const uint64_t frame = __atomic_load_n(&g_frame_ns, __ATOMIC_RELAXED) / nc_ff_mul();
     const uint64_t vs = __atomic_load_n(&g_disp_vsync_ns, __ATOMIC_ACQUIRE);
     const uint64_t pd = __atomic_load_n(&g_disp_period_ns, __ATOMIC_RELAXED);
     if (!vs || !pd || now_ns() - vs > VSYNC_STALE) {
@@ -726,6 +733,26 @@ static bool uncapped(void)
 #define EARLY_GAP_NS 1000000ull     /* uncapped: early vblanks at most this often */
 #define EARLY_POLL_NS 250000ull
 
+/* xogfix=flippace (patch 294, per game): a near-miss vsync rescue. A
+ * double-buffered title locked to the mode's vblank whose frame finishes a
+ * hair after a vblank (Morrowind's ~0.3 ms over in open views) misses that
+ * refresh, the FLIP_STALL buffer stays shown a whole frame, and 60 snaps to
+ * 30. When no flip is ready at the scheduled vblank but one lands within a
+ * short grace, we fire the vblank then (a touch late) so it makes this
+ * refresh. We never fire EARLY, so the rate is still capped at the mode's --
+ * no speed-up, no tearing; a frame that misses by more than the grace still
+ * drops as before. Time-based titles only (gated per game, not vblank-paced). */
+static bool flippace(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XOG_FIX");
+        on = e && strstr(e, "flippace") != NULL;
+    }
+    return on;
+}
+#define FLIPPACE_GRACE_NS 3000000ull    /* rescue a flip that lands up to this late */
+
 /* Uncapped push-buffer mode: the title's own D3D flips in its vblank
  * handler (and with a presentation interval of n, every n vblanks), so
  * while PGRAPH waits in FLIP_STALL (the buffer it would draw next is still
@@ -744,6 +771,23 @@ static uint64_t wait_vblank(uint64_t next, uint64_t last)
             const uint64_t until = next < t + EARLY_POLL_NS ? next : t + EARLY_POLL_NS;
             const struct timespec ts = {(time_t)(until / 1000000000ull), (long)(until % 1000000000ull)};
             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+        }
+        return next;
+    }
+    if (g_pbmode && flippace()) {
+        const struct timespec due = {(time_t)(next / 1000000000ull), (long)(next % 1000000000ull)};
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &due, NULL) != 0) {
+        }
+        if (!hle_pb_flip_waiting()) {       /* the guest's frame wasn't ready at the vblank */
+            const uint64_t deadline = next + FLIPPACE_GRACE_NS;
+            for (uint64_t t = now_ns(); t < deadline; t = now_ns()) {
+                if (hle_pb_flip_waiting()) {
+                    return t;               /* it just landed: show it this refresh, a touch late */
+                }
+                const uint64_t until = deadline < t + EARLY_POLL_NS ? deadline : t + EARLY_POLL_NS;
+                const struct timespec ps = {(time_t)(until / 1000000000ull), (long)(until % 1000000000ull)};
+                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ps, NULL);
+            }
         }
         return next;
     }

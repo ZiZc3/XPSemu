@@ -1,40 +1,52 @@
 #!/usr/bin/env bash
-# Builds XPSemu 3: hakuX's core, our PS5 layer, RADV, into a PS5 title (dist/).
+# Builds XOG: hakuX's core, our PS5 layer, RADV, into the title PPSA97360.
 # Stops on the first stage that fails; prints the errors, most frequent first.
 set -u
 B=$(cd "$(dirname "$0")/.." && pwd)
 export B
-core=$B/core
-deps=${XOG_DEPS:-$B/deps}            # tools/deps.sh fills it
-vk=${PS5_VULKAN:-$HOME/ps5/PS5_Vulkan}   # github.com/mihawk-99/PS5_Vulkan, built
+core=$HOME/ps5/xog-writefix/core
+deps=$HOME/ps5/xog/deps
+vk=$HOME/ps5/PS5_Vulkan
 sdk=$vk/.deps/native/ps5-payload-sdk
 native=$vk/tooling/native
-tool=${PS5_NATIVE_TOOL:-$vk/build/host/ps5-native-tool}
+tool=$HOME/ps5/xog/tool/ps5-native-tool
 archive=$vk/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a
-out=$B/build
-PREFIX=${XOG_PREFIX:-$HOME/ps5/prefix}   # curl + mbedTLS built for the PS5 (lib/, include/)
+out=$HOME/ps5/xog-writefix/build
 # RELEASE=1: the release, over the old XPSemu (PPSA97358, "XPSemu"); else the test app.
 if [ -n "${RELEASE:-}" ]; then ID=PPSA97358; NAME="XPSemu"; CONTENT=XEMUPS5000000001
-else ID=PPSA97360; NAME="XPSemu V3"; CONTENT=XOG0000000000001; fi
+else ID=PPSA97360; NAME="XPSemu V3.5"; CONTENT=XOG0000000000001; fi
 export ID NAME CONTENT
 th="$B/ps5/include/xog_title.h"
 want="#define XOG_TITLE \"$ID\""
 if [ "$(cat "$th" 2>/dev/null)" != "$want" ]; then
   echo "$want" > "$th"
-  touch "$B/ps5/src/main_ps5.c" "$B/ps5/ui/dashboard.cc" "$B/ps5/ui/ui_main.cc"
+  touch "$B/ps5/src/main_ps5.c" "$B/ps5/ui/dashboard.cc" "$B/ps5/ui/ui_main.cc" "$B/ps5/ui/updater.cc"
 fi
 echo "title $ID ($NAME)"
+# FAKE_VERSION=3.1: the app says it's that version (to try the updater against GitHub's release).
+# A change of it rebuilds the two files that show the version.
+fv="${FAKE_VERSION:-}"
+if [ "$(cat "$HOME/ps5/xog-writefix/build/fake_version" 2>/dev/null)" != "$fv" ]; then
+  mkdir -p "$HOME/ps5/xog-writefix/build"; echo "$fv" > "$HOME/ps5/xog-writefix/build/fake_version"
+  touch "$B/ps5/ui/updater.cc" "$B/ps5/ui/dashboard.cc"
+fi
+[ -n "$fv" ] && echo "plays version $fv"
 mkdir -p "$out/obj" "$out/err" "$out/stubs" "$out/ld"
 cd "$core" || exit 1
 
 [ -f "$deps/glslang/glslang/build_info.h" ] || python3 "$deps/glslang/build_info.py" "$deps/glslang" -i "$deps/glslang/build_info.h.tmpl" -o "$deps/glslang/glslang/build_info.h"
 
-COMMON="-O2 -march=znver2 -w -fno-delete-null-pointer-checks -ffunction-sections -fdata-sections -include xog_ps5.h -D_GNU_SOURCE -D__BSD_VISIBLE=1 -DCONFIG_VULKAN=1 -DHAKUX_HLE_GPU=1 -DHAKUX_NATIVE_CORE=1 -DVK_NO_PROTOTYPES -I $B/ps5/include -I $B/ps5/src -I $core -I $core/native -I $core/native/compat/glib -I $deps/root -I $deps/volk -I $deps/vma/include -I $deps/glslang -I $deps/spirv_reflect -I $deps/root/subprojects/nv2a_vsh_cpu/src -I $deps/libslirp/src -I $core/external/fex/External/xxhash -I $vk/.deps/native/zlib/root/usr/include -I ${PS5_MESA:-$HOME/ps5/PS5_Mesa}/include -DIMGUI_IMPL_VULKAN_USE_VOLK -I $B/ps5/ui -I $B/third_party/imgui -I $B/third_party/imgui/backends -I $B/third_party/stb_image -I $B/third_party/fpng -I $B/third_party/fa -I $PREFIX/include"
+COMMON="-O2 -march=znver2 -w -fno-delete-null-pointer-checks -ffunction-sections -fdata-sections -include xog_ps5.h -D_GNU_SOURCE -D__BSD_VISIBLE=1 -DCONFIG_VULKAN=1 -DHAKUX_HLE_GPU=1 -DHAKUX_NATIVE_CORE=1 -DVK_NO_PROTOTYPES -I $B/ps5/include -I $B/ps5/src -I $core -I $core/native -I $core/native/compat/glib -I $deps/root -I $deps/volk -I $deps/vma/include -I $deps/glslang -I $deps/spirv_reflect -I $deps/root/subprojects/nv2a_vsh_cpu/src -I $deps/libslirp/src -I $deps/libchdr/include -I $core/external/fex/External/xxhash -I $vk/.deps/native/zlib/root/usr/include -I $HOME/ps5/PS5_Mesa/include -DIMGUI_IMPL_VULKAN_USE_VOLK -I $B/ps5/ui -I $HOME/ps5/xemu/subprojects/imgui -I $HOME/ps5/xemu/subprojects/imgui/backends -I $HOME/ps5/xemu/ui/thirdparty/stb_image -I $HOME/ps5/xemu/ui/thirdparty/fpng -I $HOME/ps5/xemu/ui/thirdparty/fa -I $HOME/ps5/xemu/ps5/deps/prefix/include"
+
+[ -n "${FAKE_VERSION:-}" ] && COMMON="$COMMON -DXOG_FAKE_VERSION=$FAKE_VERSION"
 
 list_sources() {
   # hakuX's own lists (native/CMakeLists.txt, cmake/hle.cmake), less FEX and Android.
   grep -oE '(core|dev|net|kernel|state)/[a-z0-9_/]+\.c' native/CMakeLists.txt | grep -v 'net/slirp' | grep -v 'net/nat' | grep -vx 'core/xbe\.c' | sed 's#^#native/#'
   echo hw/xbox/hle/core/xbe.c
+  echo native/core/trainer.c   # trainers (patch 246): not in hakuX's lists
+  # Sega Chihiro base boards (phase 3): not in hakuX's lists
+  for f in i8051 an2131 jvs chihiro_usb driveboard driveboard_v257 cardreader_hw210 cardreader_crp1231; do echo native/dev/chihiro/$f.c; done
   grep -oE 'NC_HLE\}/[a-z0-9_/]+\.c' native/cmake/hle.cmake | sed 's#NC_HLE}#hw/xbox/hle#'
   grep -oE 'NC_APU\}/[a-z0-9_/]+\.c' native/cmake/hle.cmake | sed 's#NC_APU}#native/dev/apu#' | grep -v 'apu/out\.c'
   grep -oE 'CMAKE_CURRENT_SOURCE_DIR\}/hle/[a-z_]+\.c' native/cmake/hle.cmake | sed 's#.*}/#native/#'
@@ -44,12 +56,14 @@ list_sources() {
   done
   echo "$deps/volk/volk.c" "$deps/spirv_reflect/spirv_reflect.c" | tr ' ' '\n'
   ls "$B"/ps5/src/*.c "$B"/ps5/src/*.S
+  echo "$deps/libchdr/unity.c" "$deps/libchdr/src/libchdr_codec_avhuff.c" | tr " " "
+"   # CHD images (patch 173)
   ls "$B"/ps5/ui/*.cc "$B"/ps5/ui/data/*.c
   ls "$B"/ps5/framegen/src/fg_*.cpp
-  im=$B/third_party/imgui
+  im=$HOME/ps5/xemu/subprojects/imgui
   echo "$im/imgui.cpp" "$im/imgui_draw.cpp" "$im/imgui_tables.cpp" "$im/imgui_widgets.cpp" "$im/backends/imgui_impl_vulkan.cpp" "$im/misc/cpp/imgui_stdlib.cpp" | tr ' ' '
 '
-  echo "$B/third_party/stb_image/stb_image_impl.c" "$B/third_party/fpng/fpng.cpp" | tr ' ' '
+  echo "$HOME/ps5/xemu/ui/thirdparty/stb_image/stb_image_impl.c" "$HOME/ps5/xemu/ui/thirdparty/fpng/fpng.cpp" | tr ' ' '
 '
   ls "$deps"/glslang/glslang/CInterface/*.cpp "$deps"/glslang/glslang/GenericCodeGen/*.cpp \
      "$deps"/glslang/glslang/MachineIndependent/*.cpp "$deps"/glslang/glslang/MachineIndependent/preprocessor/*.cpp \
@@ -63,12 +77,12 @@ one() {
   f=$1
   n=$(echo "$f" | sed 's#^/##' | tr '/' '_')
   o="$out/obj/$n.o"
-  if [ -f "$o" ] && [ "$o" -nt "$f" ] && [ "$o" -nt "$B/ps5/include/xog_ps5.h" ] && [ "$o" -nt "$B/core/hw/xbox/hle/host.h" ] && [ "$o" -nt "$B/ps5/src/vmblocks_ps5.inc" ] && [ "$o" -nt "$B/ps5/src/sites_ps5.inc" ] && [ "$o" -nt "$B/core/native/core/vm.h" ] && [ -z "${REBUILD:-}" ]; then echo "OK $f"; return; fi
+  if [ -f "$o" ] && [ "$o" -nt "$f" ] && [ "$o" -nt "$B/ps5/include/xog_ps5.h" ] && [ "$o" -nt "$core/hw/xbox/hle/host.h" ] && [ "$o" -nt "$B/ps5/src/vmblocks_ps5.inc" ] && [ "$o" -nt "$B/ps5/src/sites_ps5.inc" ] && [ "$o" -nt "$core/native/core/vm.h" ] && [ -z "${REBUILD:-}" ]; then echo "OK $f"; return; fi
   case "$f" in
     *.cc) std="-std=gnu++20 -DXPSEMU_DEV=0 -DPSEMU_CUSTOM_DASHBOARD=1 -DXPS_EMBEDDED_MUSIC=1 -DIMGUI_DEFINE_MATH_OPERATORS" ;;
     */imgui/*.cpp) std="-std=gnu++20" ;;
     */framegen/src/*.cpp) std="-std=gnu++20 -include volk.h -I $B/ps5/framegen/include -I $B/ps5/framegen/src" ;;
-    *.cpp) std="-std=gnu++17" ;;
+    */libchdr/*.c) std="-std=gnu11 -I $deps/libchdr/deps/lzma-26.02/include -I $deps/libchdr/deps/zstd-1.5.7 -I $deps/libchdr/deps/miniz-3.1.2 -DWANT_RAW_DATA_SECTOR=1 -DWANT_SUBCODE=1 -DVERIFY_BLOCK_CRC=1 -DZSTD_DISABLE_ASM=1" ;;    *.cpp) std="-std=gnu++17" ;;
     *.S)
       if PS5_PAYLOAD_SDK="$sdk" sh "$vk/tooling/prospero-clang18" -c "$f" -o "$o" > "$out/err/$n.txt" 2>&1; then
         rm -f "$out/err/$n.txt"; echo "OK $f"; else echo "BAD $f"; fi
@@ -124,23 +138,22 @@ zlib=$vk/.deps/native/zlib/root/usr/lib/libz.a
 } > "$out/libc-local.map"
 radv_link_flags+=(--version-script "$out/libc-local.map")
 radv_link_flags+=(--wrap=sceVideoOutIsOutputSupported --wrap=pthread_sigmask --wrap=exit --wrap=_exit --wrap=abort --wrap=geteuid --wrap=getegid)
-
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --error-limit=0 --gc-sections --eh-frame-hdr --no-dynamic-linker \
   -z nodynamic-undefined-weak "${radv_link_flags[@]}" --version-script "$native/app-symbols.map" --exclude-libs=ALL \
   -e _start -o "$out/llvm-pie.elf" "$out/stubs/app_crt.o" "$out/stubs/app_cpp_runtime.o" \
   --start-group "$out"/obj/*.o --end-group "$out/stubs/libSceAgc.so" "$out/stubs/libSceAgcDriver.so" \
-  "${radv_link_inputs[@]}" $PREFIX/lib/libcurl.a $PREFIX/lib/libmbedtls.a $PREFIX/lib/libmbedx509.a $PREFIX/lib/libmbedcrypto.a --as-needed "$sdk"/target/lib/*.so > "$out/link.txt" 2>&1
+  "${radv_link_inputs[@]}" $HOME/ps5/xemu/ps5/deps/prefix/lib/libcurl.a $HOME/ps5/xemu/ps5/deps/prefix/lib/libmbedtls.a $HOME/ps5/xemu/ps5/deps/prefix/lib/libmbedx509.a $HOME/ps5/xemu/ps5/deps/prefix/lib/libmbedcrypto.a --as-needed "$sdk"/target/lib/*.so > "$out/link.txt" 2>&1
 rc=$?
 grep -v 'unknown -z' "$out/link.txt" | grep -E 'undefined symbol|duplicate symbol|error:' | sed -E 's/^ld.lld: error: //' | sort | uniq -c | sort -rn | cut -c1-120 | head -70
 [ $rc -eq 0 ] || { echo "LINK FAILED ($(grep -c 'undefined symbol' "$out/link.txt") undefined)"; exit 1; }
 
 "$tool" link --in "$out/llvm-pie.elf" --out "$out/eboot.elf" --stub-dir "$sdk/target/lib" \
   --stub "$out/stubs/libSceAgc.so" --stub "$out/stubs/libSceAgcDriver.so" --module-sdk 0x02000009 --companion-sdk 0x08050001 --file-name eboot.elf || exit 1
-app=$B/dist/$ID
+app=$HOME/ps5/xog-writefix/dist/$ID
 rm -rf "$app"
 mkdir -p "$app/sce_sys" "$app/sce_module"
 "$tool" self --sign --in "$out/eboot.elf" --out "$app/eboot.bin" --magic 0x1D3D154F || exit 1
-python3 - "$B/ps5/sce_sys/param.json" "$app/sce_sys/param.json" <<'P'
+python3 - "$HOME/ps5/xemu/ps5/sce_sys/param.json" "$app/sce_sys/param.json" <<'P'
 import json,sys,os
 p=json.load(open(sys.argv[1]))
 i=os.environ["ID"]
@@ -151,11 +164,16 @@ p["contentId"]="UP9000-"+i+"_00-"+os.environ["CONTENT"]
 p["localizedParameters"]["en-US"]["titleName"]=os.environ["NAME"]
 json.dump(p,open(sys.argv[2],"w"),indent=2)
 P
-cp "$B/ps5/sce_sys/icon0.png" "$B/ps5/sce_sys/pic0.dds" "$B/ps5/sce_sys/pic1.dds" "$app/sce_sys/"
-# frame rate mods, the frame generation network and the licences go with the app
-cp -r "$B/mods" "$B/licenses" "$app/"
-mkdir -p "$app/framegen"; cp "$B/ps5/framegen/network/network.fgw" "$app/framegen/"
+cp "$HOME/ps5/xemu/ps5/sce_sys/icon0.png" "$HOME/ps5/xemu/ps5/sce_sys/pic0.dds" "$HOME/ps5/xemu/ps5/sce_sys/pic1.dds" "$app/sce_sys/"
 cp "$vk/runtime/libc.prx" "$app/sce_module/libc.prx"
+# Patch 307: the persistent write-helper payload, shipped beside eboot.bin. The app streams it to elfldr
+# (port 9021) once at start-up; it runs in its own (un-throttled) process and takes cache-drive writes over
+# the socket. A build failure here is not fatal to the app - it just falls back to in-process writes.
+if bash "$B/tools/build-wbwriter.sh" "$app/wbwriter.elf"; then
+  echo "wbwriter payload built"
+else
+  echo "wbwriter payload FAILED to build (app still packaged; writes stay in-process)"
+fi
 "$tool" self --inspect --file "$app/eboot.bin" > /dev/null || exit 1
 # every import's GOT slot, for the start-up report of ones the console leaves empty
 llvm-readelf-18 -r --wide "$out/llvm-pie.elf" | awk '$3 == "R_X86_64_GLOB_DAT" || $3 == "R_X86_64_JUMP_SLOT" { print $1, $5 }' > "$app/imports.txt"

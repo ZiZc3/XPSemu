@@ -70,6 +70,7 @@
 #define NV097_SET_TEXTURE_FORMAT          0x1B04u   /* a D3D header's Format */
 #define NV097_SET_TEXTURE_CONTROL0        0x1B0Cu   /* bit 30: enable */
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10u   /* linear pitch 31:16 */
+#define NV097_SET_TEXTURE_FILTER          0x1B14u   /* colour sign 31:28 (patch 334) */
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1Cu   /* linear width 31:16, height 15:0 */
 #define NV097_SET_TEXTURE_PALETTE         0x1B20u   /* offset 31:6 | length 3:2 (256 >> n) */
 
@@ -107,6 +108,7 @@
  * (a neighbour's writes there don't make its memory newer) */
 typedef struct CohSnap {
     uint64_t sum, h0, hl;
+    uint64_t in4;                       /* the sum without its first and last 4 KiB pages (XOG_COHLOG) */
     uint64_t bsum;                      /* by blocks (hle_mem_wseq_blocks): a coarse first look */
     uint32_t w0, wl;
     bool valid;
@@ -153,8 +155,32 @@ typedef struct PbTex {
     uint32_t pal_hash;
     uint64_t checked;                   /* the epoch it was last checked at */
     uint64_t edge_hash[2];              /* its bytes on its first and last pages, at definition */
+    uint64_t body_hash;                 /* patch 362 (XOG_TEXSTALE): a sample of all its bytes, at definition */
     bool ok;                            /* defined (else it can't be: not again) */
 } PbTex;
+
+/* patch 362 (debug, XOG_TEXSTALE=1): a cached texture whose memory no longer matches what was uploaded, though
+ * the write tracking said it was clean, is logged and uploaded again. RalliSport Challenge 2's roadside trees
+ * vanish while driving: their alpha comes from a streamed atlas; a stale copy would cut them away. */
+static int g_texstale = -1;
+
+static uint64_t tex_body_hash(uint32_t pa, uint32_t bytes)
+{
+    const uint8_t *m = bytes ? hle_pa_ptr(pa, bytes) : NULL;
+    if (!m) {
+        return 0;
+    }
+    uint64_t h = 0xcbf29ce484222325ull;
+    const uint32_t step = bytes > 65536 ? 509 : 61;     /* odd strides: every texel row gets samples */
+    for (uint32_t i = 0; i + 8 <= bytes; i += step) {
+        uint64_t w;
+        memcpy(&w, m + i, 8);
+        h = (h ^ w) * 0x100000001b3ull;
+    }
+    uint64_t w;
+    memcpy(&w, m + bytes - 8, 8);
+    return (h ^ w) * 0x100000001b3ull;
+}
 
 static struct {
     bool on, device;
@@ -1048,6 +1074,95 @@ static bool window_clip(uint32_t w, uint32_t h, int32_t r[4])
     return true;
 }
 
+/* patch 339: the window clip as the NV2A does it (xemu's psh.c clipRegion):
+ * every used rectangle (corners inclusive, ax x ay target pixels a logical
+ * one), a pixel drawn inside one of them (inclusive) or outside all
+ * (exclusive). The region inside the base [b0, b1) x [b2, b3) (target pixels)
+ * as disjoint rectangles: the grid of their edges, cells in the region merged
+ * along rows, then rows of equal runs down. Its count (0: nothing drawn), or
+ * -1: not one that needs them (one inclusive rectangle, none used: the
+ * scissor of window_clip), or more than HLE_VP_CLIP_RECTS. */
+static int window_clip_rects(const int32_t b[4], int32_t out[HLE_VP_CLIP_RECTS][4])
+{
+    const bool excl = R(NV097_SET_WINDOW_CLIP_TYPE) & 1;
+    int32_t r[8][4];
+    unsigned nr = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        const uint32_t x = R(NV097_SET_WINDOW_CLIP_HORIZONTAL + 4 * i), y = R(NV097_SET_WINDOW_CLIP_VERTICAL + 4 * i);
+        if (!x && !y) {
+            continue;                   /* D3D's unused ones (as window_clip) */
+        }
+        r[nr][0] = (int32_t)(x & 0xFFF) * (int32_t)g_pd.aa_x;
+        r[nr][1] = (int32_t)(y & 0xFFF) * (int32_t)g_pd.aa_y;
+        r[nr][2] = (int32_t)(((x >> 16) & 0xFFF) + 1) * (int32_t)g_pd.aa_x;
+        r[nr][3] = (int32_t)(((y >> 16) & 0xFFF) + 1) * (int32_t)g_pd.aa_y;
+        if (!excl && r[nr][0] <= b[0] && r[nr][1] <= b[1] && r[nr][2] >= b[2] && r[nr][3] >= b[3]) {
+            return -1;                  /* one covers the whole base: no clip (as window_clip) */
+        }
+        nr++;
+    }
+    if (!nr || (!excl && nr == 1)) {
+        return -1;
+    }
+    int32_t xs[18], ys[18];
+    unsigned nx = 0, ny = 0;
+    xs[nx++] = b[0], xs[nx++] = b[2], ys[ny++] = b[1], ys[ny++] = b[3];
+    for (unsigned i = 0; i < nr; i++) {
+        xs[nx++] = MIN(MAX(r[i][0], b[0]), b[2]);
+        xs[nx++] = MIN(MAX(r[i][2], b[0]), b[2]);
+        ys[ny++] = MIN(MAX(r[i][1], b[1]), b[3]);
+        ys[ny++] = MIN(MAX(r[i][3], b[1]), b[3]);
+    }
+    for (unsigned i = 1; i < nx; i++) {         /* sorted (insertion: 18 at most) */
+        for (unsigned j = i; j > 0 && xs[j - 1] > xs[j]; j--) {
+            const int32_t t = xs[j]; xs[j] = xs[j - 1]; xs[j - 1] = t;
+        }
+    }
+    for (unsigned i = 1; i < ny; i++) {
+        for (unsigned j = i; j > 0 && ys[j - 1] > ys[j]; j--) {
+            const int32_t t = ys[j]; ys[j] = ys[j - 1]; ys[j - 1] = t;
+        }
+    }
+    int n = 0;
+    for (unsigned j = 0; j + 1 < ny; j++) {
+        if (ys[j] == ys[j + 1]) {
+            continue;
+        }
+        int32_t run0 = 0;
+        bool in_run = false;
+        for (unsigned i = 0; i + 1 <= nx; i++) {
+            bool in = false;
+            if (i + 1 < nx && xs[i] != xs[i + 1]) {
+                for (unsigned q = 0; q < nr && !in; q++) {
+                    in = r[q][0] <= xs[i] && xs[i + 1] <= r[q][2] && r[q][1] <= ys[j] && ys[j + 1] <= r[q][3];
+                }
+                in = in != excl;
+            } else if (i + 1 < nx) {
+                continue;               /* an empty column: the run goes on over it */
+            }
+            if (in && !in_run) {
+                run0 = xs[i];
+                in_run = true;
+            } else if (!in && in_run) {
+                in_run = false;
+                int k = 0;              /* the run below an equal one: that one grows */
+                while (k < n && !(out[k][0] == run0 && out[k][2] == xs[i] && out[k][3] == ys[j])) {
+                    k++;
+                }
+                if (k < n) {
+                    out[k][3] = ys[j + 1];
+                } else if (n == HLE_VP_CLIP_RECTS) {
+                    return -1;
+                } else {
+                    out[n][0] = run0, out[n][1] = ys[j], out[n][2] = xs[i], out[n][3] = ys[j + 1];
+                    n++;
+                }
+            }
+        }
+    }
+    return n;
+}
+
 /* A video mode set since the display last followed one: the display is its
  * size. CreateDevice binds its back buffer before it sets the mode, and the
  * back buffer needn't be the frame shown: Hunter: The Reckoning - Redeemer
@@ -1210,6 +1325,41 @@ static void sync_rt(void)
             v->cy1 = MAX(r[1] * (int32_t)g_pd.aa_y, (int32_t)v->y);
             v->cx2 = MIN(r[2] * (int32_t)g_pd.aa_x, (int32_t)(v->x + v->w));
             v->cy2 = MIN(r[3] * (int32_t)g_pd.aa_y, (int32_t)(v->y + v->h));
+        }
+        /* patch 339: several rectangles, or exclusive ones: the region they make
+         * (window_clip_rects), not one box; a single inclusive one keeps the
+         * scissor above. XOG_FIX nowinclip: as before. */
+        static int s_winclip = -1;
+        if (s_winclip < 0) {
+            s_winclip = !hle_xog_fix_word("nowinclip");
+        }
+        const int32_t base[4] = { (int32_t)v->x, (int32_t)v->y, (int32_t)(v->x + v->w), (int32_t)(v->y + v->h) };
+        int32_t cr[HLE_VP_CLIP_RECTS][4];
+        const int nc = s_winclip ? window_clip_rects(base, cr) : -1;
+        if (nc >= 0) {
+            v->clip = 1;
+            v->cx1 = v->cx2 = base[0];  /* none: an empty scissor */
+            v->cy1 = v->cy2 = base[1];
+            for (int i = 0; i < nc; i++) {
+                if (!i) {
+                    v->cx1 = cr[i][0], v->cy1 = cr[i][1], v->cx2 = cr[i][2], v->cy2 = cr[i][3];
+                }
+                v->cx1 = MIN(v->cx1, cr[i][0]);
+                v->cy1 = MIN(v->cy1, cr[i][1]);
+                v->cx2 = MAX(v->cx2, cr[i][2]);
+                v->cy2 = MAX(v->cy2, cr[i][3]);
+            }
+            if (nc > 1) {
+                v->nclip = (uint32_t)nc;
+                memcpy(v->crect, cr, sizeof(cr[0]) * (size_t)nc);
+            }
+            static unsigned s_logged;
+            if (s_logged < 8) {
+                s_logged++;
+                hle_log("hakuX-hle-pb", "window clip (patch 339): %s, %d rectangle(s) in %d,%d-%d,%d",
+                        (R(NV097_SET_WINDOW_CLIP_TYPE) & 1) ? "exclusive" : "inclusive", nc, v->cx1, v->cy1,
+                        v->cx2, v->cy2);
+            }
         }
         hle_fe_commit();
     }
@@ -1468,11 +1618,13 @@ void hle_pb_set_fps_cap(int fps)
     hle_log("xog-cap", "FPS cap %d%s", fps, fps > 0 ? "" : " (off)");
 }
 
+unsigned nc_ff_mul(void);   /* XOG patch 253 (ps5/src/ff_ps5.c) */
+
 static void fps_cap_wait(void)
 {
     static int64_t next;
     const int cap = g_fps_cap;
-    if (cap <= 0) {
+    if (cap <= 0 || nc_ff_mul() > 1) {     /* patch 253: fast-forward: frames aren't held to the cap */
         next = 0;
         return;
     }
@@ -1887,14 +2039,51 @@ void hle_pbd_overlay(bool show)
     const bool on = show && size_in != 0xFFFFFFFFu;
     uint32_t w = 0, h = 0, off = HLE_ARENA_FULL;
     int32_t src[4], dst[4];
+    uint32_t key_on = 0, key = 0;
+    /* patch 337: colour key and scaling (PVIDEO_DS_DX / DT_DY, POINT_IN), as
+     * xemu's display; XOG_FIX noovlkey: as before (no key, capped at the output) */
+    static int s_ovl = -1;
+    if (s_ovl < 0) {
+        s_ovl = !hle_xog_fix_word("noovlkey");
+    }
+    float scx = 1.0f, scy = 1.0f;
+    bool scaled = false;
+    uint32_t in_s = 0, in_t = 0;
     if (on) {
         const uint32_t base = hle_host_gpu_reg(0x008900), offset = hle_host_gpu_reg(0x008920);
         const uint32_t fmt = hle_host_gpu_reg(0x008958), pitch = fmt & 0x1FFF;
         const uint32_t pout = hle_host_gpu_reg(0x008948), sout = hle_host_gpu_reg(0x008950);
         const uint32_t ow = sout & 0xFFF, oh = (sout >> 16) & 0xFFF;
         uint32_t iw = size_in & 0x7FF, ih = (size_in >> 16) & 0x7FF;
-        iw = MIN(iw, ow ? ow : iw);         /* larger than the output: capped, not scaled */
-        ih = MIN(ih, oh ? oh : ih);
+        if (s_ovl) {
+            /* the input step per output pixel (unity 1 << 20; 0, never written: as before) */
+            const uint32_t dsdx = hle_host_gpu_reg(0x008938), dtdy = hle_host_gpu_reg(0x008940);
+            const uint32_t pin = hle_host_gpu_reg(0x008930);
+            if (dsdx && dsdx != 0x00100000u && ow) {
+                scx = (floorf((float)dsdx * (float)(ow - 1) / 1048576.0f + 0.5f) + 1.0f) / (float)ow;
+            }
+            if (dtdy && dtdy != 0x00100000u && oh) {
+                scy = (floorf((float)dtdy * (float)(oh - 1) / 1048576.0f + 0.5f) + 1.0f) / (float)oh;
+            }
+            in_s = (pin & 0x7FFF) / 16;     /* 12.4 */
+            in_t = (pin >> 17) / 8;         /* 12.3 */
+            scaled = scx != 1.0f || scy != 1.0f || in_s || in_t;
+            key_on = (fmt >> 20) & 1;       /* DISPLAY: COLOR_KEY */
+            key = hle_host_gpu_reg(0x008B00) & 0xFFFFFFu;
+        }
+        /* larger than the output: capped to the output's span of the input
+         * (scaled by the step), not cropped (as before: capped at the output) */
+        if (scaled) {
+            if (ow && iw > ow) {
+                iw = MIN((uint32_t)floorf((float)ow * scx + 0.5f), 0x7FFu);
+            }
+            if (oh && ih > oh) {
+                ih = MIN((uint32_t)floorf((float)oh * scy + 0.5f), 0x7FFu);
+            }
+        } else {
+            iw = MIN(iw, ow ? ow : iw);
+            ih = MIN(ih, oh ? oh : ih);
+        }
         /* a linear YUY2 (CR8YB8CB8YA8) or UYVY surface's header words */
         const uint32_t code = ((fmt >> 16) & 3) == 1 ? HLE_XFMT_YUY2 : HLE_XFMT_UYVY;
         const uint32_t h5[5] = { HLE_COMMON_TYPE_SURFACE | 1, (base + offset) & 0x0FFFFFFFu, 0,
@@ -1904,6 +2093,12 @@ void hle_pbd_overlay(bool show)
         coh_pend_wait((base + offset) & 0x0FFFFFFFu, MAX(pitch, 64u) * ih);   /* a copy queued into it lands first */
         off = iw && ih ? hle_draw_overlay_upload(h5, &w, &h) : HLE_ARENA_FULL;
         src[0] = 0; src[1] = 0; src[2] = (int32_t)w; src[3] = (int32_t)h;
+        if (scaled && w && h) {             /* patch 337: the output's span of the input */
+            src[0] = (int32_t)MIN(in_s, w - 1);
+            src[1] = (int32_t)MIN(in_t, h - 1);
+            src[2] = MIN(src[0] + (int32_t)floorf((float)(ow ? ow : w) * scx + 0.5f), (int32_t)w);
+            src[3] = MIN(src[1] + (int32_t)floorf((float)(oh ? oh : h) * scy + 0.5f), (int32_t)h);
+        }
         dst[0] = (int32_t)(pout & 0xFFF);
         dst[1] = (int32_t)((pout >> 16) & 0xFFF);
         dst[2] = dst[0] + (int32_t)ow;
@@ -1924,6 +2119,8 @@ void hle_pbd_overlay(bool show)
         c->h = h;
         memcpy(c->src, src, sizeof(src));
         memcpy(c->dst, dst, sizeof(dst));
+        c->key_on = key_on;                 /* patch 337 */
+        c->key = key;
     }
     const HleSurfDesc *sd = g_pd.shown_id ? object_desc(g_pd.shown_id) : NULL;
     c->fb_w = sd ? sd->w : 640;
@@ -1952,6 +2149,10 @@ void hle_pbd_overlay(bool show)
     if (s_logged++ < 4 || g_dlog_left > 0) {
         hle_log("hakuX-hle-pb", "overlay %s: %ux%u -> %d,%d-%d,%d", on ? "on" : "off", w, h,
                 on ? dst[0] : 0, on ? dst[1] : 0, on ? dst[2] : 0, on ? dst[3] : 0);
+        if (on && (key_on || scaled)) {
+            hle_log("hakuX-hle-pb", "overlay (patch 337): source %d,%d-%d,%d step %.3f x %.3f, colour key %s %06x",
+                    src[0], src[1], src[2], src[3], scx, scy, key_on ? "on" : "off", key);
+        }
     }
 }
 
@@ -2150,6 +2351,19 @@ static uint64_t ff_program(void)
         k.texmat |= (uint8_t)((R(0x0420 + 4 * s) & 1) << s);
     }
     k.points = R(0x0318) & 1;
+    /* patch 345: SET_TEXGEN_VIEW_MODEL (0x09CC) INFINITE_VIEWER (1), for the
+     * sphere and reflection maps only (other keys as before). XOG_FIX notexgenview. */
+    static int s_tgview = -1;
+    if (s_tgview < 0) {
+        s_tgview = !hle_xog_fix_word("notexgenview");
+    }
+    if (s_tgview && R(0x09CC) == 1) {
+        for (unsigned s = 0; s < 4; s++) {
+            for (unsigned j = 0; j < 4; j++) {
+                k.infinite |= k.texgen[s][j] == HLE_FFHW_TG_SPHERE || k.texgen[s][j] == HLE_FFHW_TG_REFLECTION;
+            }
+        }
+    }
     return send_vsh(&k, HLE_FFHW_SLOTS, &g_vh_ff);
 }
 
@@ -2814,8 +3028,26 @@ static uint32_t texture(unsigned s, bool *unset, bool *lin)
      * (coh_mem_newer: a copy into it, its twin's image landed there, the
      * title's writes): the memory is what the NV2A samples */
     coh_adopt();
+    /* patch 347: nor a target smaller than a swizzled texture there - it is not that target's image. The Matrix:
+     * Path of Neo's movie is two 512x256 A8R8G8B8 frames the CPU writes in turn; the second's memory had held a
+     * 64x64 target, so every other frame drew that target (white) instead of the movie. XOG_FIX "notexfit": off. */
+    static int fit_on = -1;
+    if (fit_on < 0) {
+        const char *e = getenv("XOG_FIX");
+        fit_on = !(e && strstr(e, "notexfit"));
+    }
+    const bool swz = fi && !(fi->flags & HLE_FI_LIN) && !(fmt & 4);
+    const uint32_t tw = 1u << ((fmt >> 20) & 0xF), th = 1u << ((fmt >> 24) & 0xF);
     for (unsigned i = 0; !dxt && i < g_pd.nobjs; i++) {
         PbObj *o = &g_pd.objs[i];
+        if (fit_on && swz && o->d.pa == pa && (o->d.w < tw || o->d.h < th)) {
+            static unsigned told;
+            if (told++ < 8) {
+                hle_log("hakuX-hle-pb", "texture at %08x (%ux%u fmt %x): target %u (%ux%u) there is smaller, "
+                        "not its image (the memory instead)", pa, tw, th, code, o->id, o->d.w, o->d.h);
+            }
+            continue;
+        }
         const HleFmtInfo *oi = o->d.pa == pa && !o->cube ? hle_fmt_info(o->d.xfmt) : NULL;
         if (oi && !!(oi->flags & HLE_FI_DEPTH) == want_depth && (!best || o->bound > best->bound) &&
             (want_depth || !coh_mem_newer(o))) {
@@ -2837,7 +3069,19 @@ static uint32_t texture(unsigned s, bool *unset, bool *lin)
         return best->id;
     }
     uint32_t pal_reg = code == HLE_XFMT_P8 ? R(NV097_SET_TEXTURE_PALETTE + b) : 0;
-    uint32_t key[4] = { off, fmt, size, pal_reg };
+    /* patch 334: colour sign, the signed 8-bit channels uploaded offset binary
+     * (pb/pbres.c), an object apart from the texture read unsigned: its XOR in
+     * the key's last word, which only P8 (never signed this way) uses for its
+     * palette, so an unsigned texture's key is as before. Off with XOG_FIX
+     * containing "nosign". */
+    static int sign_on = -1;
+    if (sign_on < 0) {
+        const char *e = getenv("XOG_FIX");
+        sign_on = !(e && strstr(e, "nosign"));
+    }
+    const uint32_t sign = sign_on ? R(NV097_SET_TEXTURE_FILTER + b) >> 28 : 0;
+    const uint32_t sxor = hle_fmt_sign_xor(code, sign);
+    uint32_t key[4] = { off, fmt, size, pal_reg | sxor };
     uint32_t h = hash32(key, sizeof(key)) % TEX_SLOTS;
     PbTex *t = &g_pd.tex[h];
     while (t->id && memcmp(t->key, key, sizeof(key))) {
@@ -2863,6 +3107,27 @@ static uint32_t texture(unsigned s, bool *unset, bool *lin)
         t->checked = g_pd.epoch;
         coh_pend_wait(t->pa, t->bytes);             /* a copy queued into it lands first */
         redefine = tex_written(t);
+        if (g_texstale < 0) {
+            g_texstale = getenv("XOG_TEXSTALE") != NULL;
+        }
+        if (g_texstale && !redefine && t->bytes && tex_body_hash(t->pa, t->bytes) != t->body_hash) {
+            static unsigned told, per;
+            static uint64_t t0;
+            per++;
+            if (told++ < 64) {
+                hle_log("hakuX-hle-pb", "texstale: texture %u at %08x (%u bytes, fmt %x) changed in memory, the "
+                        "tracking said clean: uploaded again", t->id, t->pa, t->bytes, (fmt >> 8) & 0xFF);
+            }
+            const uint64_t now = hle_now_ns();
+            if (now - t0 >= 1000000000ull) {
+                if (t0) {
+                    hle_log("hakuX-hle-pb", "texstale: %u stale textures caught in the last second", per);
+                }
+                t0 = now;
+                per = 0;
+            }
+            redefine = true;
+        }
     }
     static uint32_t pal[256];
     uint32_t npal = 0, pal_hash = 0;
@@ -2905,13 +3170,16 @@ static uint32_t texture(unsigned s, bool *unset, bool *lin)
         const uint32_t h5[5] = { HLE_COMMON_TYPE_TEXTURE | 1, off, 0, fmt, size };
         uint32_t bytes = 0;
         coh_pend_wait(pa, hle_draw_tex_bytes(h5));  /* a copy queued into its texels lands first */
-        t->ok = hle_draw_tex_define(t->id, h5, pal, npal, &bytes) != 0;
+        t->ok = hle_draw_tex_define(t->id, h5, pal, npal, sxor ? sign : 0, &bytes) != 0;
         t->pa = pa;
         t->bytes = bytes;
         t->pal_hash = pal_hash;
         if (t->ok) {
             hle_mem_written(pa, bytes);             /* clean from this definition on */
             tex_edges_set(t);
+            if (g_texstale == 1) {
+                t->body_hash = tex_body_hash(pa, bytes);   /* patch 362 */
+            }
             mem_supersedes(pa, bytes);
             g_pd.tex_defs++;
         }
@@ -4280,15 +4548,108 @@ static bool coh_managed(const PbObj *o, uint32_t *len)
     return coh_len(o, len) && !coh_display(o) && (!o->d.pitch || (*len > WRITEBACK_MAX && !o->cpu_used));
 }
 
+/* XOG patch 265 (xogfix=coh16k): a target's edges are the host's protection blocks, not 4 KiB pages. The
+ * console protects 16 KiB at a time, and a guest store's fault reports every page of its block written
+ * (native/hle/dirty.c rx_open_block: over-reporting a neighbour's write). By 4 KiB edges, a store to the
+ * data before or after a target in its first or last block moved the counts of the target's own inner
+ * pages there: its memory was judged newer than its image (no hash looked at them), the textures over it
+ * read the stale memory, and its next draw uploaded that memory over the image. Midnight Club 3: its
+ * reflection map (256 x 256 swizzled at 02d84e80, 3.6 KiB of other data before it in its block) came back
+ * from memory in alternate frames (the sky added twice, the cars' shine flickering), and its 384 x 240
+ * glow targets (edges in blocks shared with CPU data) can come back as the memory's white (the white
+ * flashes). Whole blocks as edges: their own bytes there tell, by hash, as the 4 KiB edges' did. */
+static bool coh16k_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XOG_FIX");
+        on = e && strstr(e, "coh16k") != NULL;
+    }
+    return on;
+}
+
+static bool cohlog_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("XOG_COHLOG") != NULL;
+    }
+    return on;
+}
+
+typedef struct CohEdges {
+    uint32_t e, end, p0, pl;            /* edge size; the first and last edges' starts */
+    bool e0, el;                        /* the first / last edge shared with other data */
+    uint32_t w0, wl;                    /* the counts of its own pages in them */
+    uint64_t sum;                       /* all its pages' */
+    uint64_t in4;                       /* without its first and last 4 KiB pages (the log) */
+} CohEdges;
+
+static uint64_t wseq_of(uint32_t pa, uint32_t len)
+{
+    uint32_t a, b;
+    return len ? hle_mem_wseq_sum(pa, len, &a, &b) : 0;
+}
+
+static void coh_edges(uint32_t pa, uint32_t len, CohEdges *x)
+{
+    const uint32_t e = coh16k_on() ? hle_host_mem_block() : 4096u;
+    uint32_t f4, l4;
+    x->e = e;
+    x->end = pa + len;
+    x->p0 = pa & ~(e - 1);
+    x->pl = (x->end - 1) & ~(e - 1);
+    x->e0 = (pa & (e - 1)) || (x->p0 == x->pl && (x->end & (e - 1)));
+    x->el = x->pl != x->p0 && (x->end & (e - 1));
+    x->sum = hle_mem_wseq_sum(pa, len, &f4, &l4);
+    {
+        const uint32_t q0 = pa & ~4095u, ql = (x->end - 1) & ~4095u;
+        x->in4 = x->sum - f4 - (ql != q0 ? l4 : 0);
+    }
+    if (e == 4096u) {
+        x->w0 = f4;
+        x->wl = l4;
+    } else {
+        x->w0 = (uint32_t)wseq_of(pa, MIN(x->end, x->p0 + e) - pa);
+        x->wl = x->pl != x->p0 ? (uint32_t)wseq_of(x->pl, x->end - x->pl) : 0;
+    }
+}
+
 /* Any thread: [pa, pa + len) as it is now (CohSnap) */
 static void coh_snap_take(uint32_t pa, uint32_t len, CohSnap *s)
 {
-    const uint32_t end = pa + len, p0 = pa & ~4095u, pl = (end - 1) & ~4095u;
-    s->sum = hle_mem_wseq_sum(pa, len, &s->w0, &s->wl);
+    CohEdges x;
+    coh_edges(pa, len, &x);
+    s->sum = x.sum;
+    s->w0 = x.w0;
+    s->wl = x.wl;
+    s->in4 = x.in4;
     s->bsum = hle_mem_wseq_blocks(pa, len);
-    s->h0 = (pa & 4095) || (p0 == pl && (end & 4095)) ? span_hash(pa, MIN(end, p0 + 4096) - pa) : 0;
-    s->hl = pl != p0 && (end & 4095) ? span_hash(pl, end - pl) : 0;
+    s->h0 = x.e0 ? span_hash(pa, MIN(x.end, x.p0 + x.e) - pa) : 0;
+    s->hl = x.el ? span_hash(x.pl, x.end - x.pl) : 0;
     s->valid = true;
+}
+
+/* debug: XOG_COHLOG=1, why targets' memory was judged newer than their images (patch 265) */
+static void cohlog(const PbObj *o, const char *what, const char *why)
+{
+    static unsigned told;
+    static uint64_t n, t0;
+    n++;
+    if (told < 64) {
+        told++;
+        hle_log("xog-coh", "target %u (%08x %ux%u fmt %02x%s): %s: %s (swap %llu)", o->id, o->d.pa, o->d.w, o->d.h,
+                o->d.xfmt, o->d.pitch ? "" : " swizzled", what, why, (unsigned long long)g_pd.swaps);
+    }
+    const uint64_t now = (uint64_t)hle_now_ns();
+    if (now - t0 > 5000000000ull) {
+        if (t0) {
+            hle_log("xog-coh", "5 s: %llu lines (first 64 logged; coh16k %s)", (unsigned long long)n,
+                    coh16k_on() ? "on" : "off");
+        }
+        t0 = now;
+        n = 0;
+    }
 }
 
 /* The landings done (coh_landed), taken in: their targets' memory matched
@@ -4356,10 +4717,11 @@ static bool coh_mem_newer(PbObj *o)
         o->mn = false;
         return false;
     }
-    uint32_t w0, wl;
-    const uint64_t sum = hle_mem_wseq_sum(o->d.pa, len, &w0, &wl);
-    const uint32_t end = o->d.pa + len, p0 = o->d.pa & ~4095u, pl = (end - 1) & ~4095u;
-    const bool e0 = (o->d.pa & 4095) || (p0 == pl && (end & 4095)), el = pl != p0 && (end & 4095);
+    CohEdges x;
+    coh_edges(o->d.pa, len, &x);            /* (patch 265: the host's blocks with xogfix=coh16k) */
+    const uint32_t w0 = x.w0, wl = x.wl, end = x.end, p0 = x.p0, pl = x.pl, eb = x.e;
+    const uint64_t sum = x.sum;
+    const bool e0 = x.e0, el = x.el;
     const bool m0 = e0 && w0 != o->snap.w0, ml = el && wl != o->snap.wl;
     /* its own bytes hashed at a new count, while the page is written open
      * (its stores there not counted), and before the counts are taken in */
@@ -4368,9 +4730,20 @@ static bool coh_mem_newer(PbObj *o)
     const bool hl = ml && (wl != o->vwl || due || hle_host_mem_open(pl));
     const uint64_t in = sum - (e0 ? w0 : 0) - (el ? wl : 0);
     const uint64_t was = o->snap.sum - (e0 ? o->snap.w0 : 0) - (el ? o->snap.wl : 0);
-    const bool newer = in != was ||
-                       (h0 && span_hash(o->d.pa, MIN(end, p0 + 4096) - o->d.pa) != o->snap.h0) ||
-                       (hl && span_hash(pl, end - pl) != o->snap.hl);
+    const bool hash0 = h0 && span_hash(o->d.pa, MIN(end, p0 + eb) - o->d.pa) != o->snap.h0;
+    const bool hashl = hl && span_hash(pl, end - pl) != o->snap.hl;
+    const bool newer = in != was || hash0 || hashl;
+    if (cohlog_on()) {
+        if (newer) {
+            char why[96];
+            snprintf(why, sizeof(why), "%s%s%s", in != was ? "inner pages written " : "",
+                     hash0 ? "own bytes on its first edge changed " : "", hashl ? "own bytes on its last edge changed" : "");
+            cohlog(o, "memory newer", why);
+        } else if (eb != 4096u && x.in4 != o->snap.in4) {
+            cohlog(o, "memory NOT newer (coh16k)", "by 4 KiB edges its inner pages moved: neighbour stores in its edge "
+                   "blocks, its own bytes unchanged");
+        }
+    }
     if (!newer) {
         o->vw0 = h0 ? w0 : o->vw0;
         o->vwl = hl ? wl : o->vwl;
@@ -4380,11 +4753,12 @@ static bool coh_mem_newer(PbObj *o)
             o->snap.sum = sum;
             o->snap.w0 = w0;
             o->snap.wl = wl;
+            o->snap.in4 = x.in4;
             if (m0) {
-                hle_host_mem_rearm(p0, 4096);
+                hle_host_mem_rearm(p0, eb);
             }
             if (ml) {
-                hle_host_mem_rearm(pl, 4096);
+                hle_host_mem_rearm(pl, eb);
             }
         }
         if (!(m0 || ml) || absorb) {
@@ -4614,9 +4988,18 @@ static bool copy_covers(const PbObj *o, uint32_t len, uint32_t dlo, uint32_t dp,
  * in flight over either range, the copies queued into either, and those
  * queued from its destination (they read it as they land); queued, the
  * guest's first write to its source waits for it too. */
+static bool g_copy_sync;                /* patch 344: hle_pbd_copy_sync_next */
+
+void hle_pbd_copy_sync_next(void)
+{
+    g_copy_sync = true;
+}
+
 uint64_t hle_pbd_copy_begin(uint32_t slo, uint32_t sp, uint32_t dlo, uint32_t dp, uint32_t row,
                             uint32_t rows, uint32_t dbase)
 {
+    const bool sync = g_copy_sync;
+    g_copy_sync = false;
     g_coh_rows.id = 0;
     if (!g_pd.on || !rows || !row) {
         return 0;
@@ -4646,15 +5029,17 @@ uint64_t hle_pbd_copy_begin(uint32_t slo, uint32_t sp, uint32_t dlo, uint32_t dp
             v = MAX(v, g_wbn[i].v);
         }
     }
-    /* (again for rd's own, when the copy is queued after all) */
-    for (int pass = 0; pass < 2 && (!pass || (v && rd)); pass++) {
+    /* (again for rd's own, when the copy is queued after all; patch 344: or
+     * made now for a blend, which reads the destination's rows) */
+    for (int pass = 0; pass < 2 && (!pass || ((v || sync) && rd)); pass++) {
         for (unsigned i = 0; i < g_pd.nobjs; i++) {
             PbObj *o = &g_pd.objs[i];
             if (!coh_managed(o, &len) || o->written <= o->synced || (pass && o != rd)) {
                 continue;
             }
             const bool src = o->d.pa < s1 && o->d.pa + len > s0;
-            const bool dst = o->d.pa < d1 && o->d.pa + len > d0 && !copy_covers(o, len, dlo, dp, row, rows, d0, d1);
+            const bool dst = o->d.pa < d1 && o->d.pa + len > d0 &&
+                             (sync || !copy_covers(o, len, dlo, dp, row, rows, d0, d1));
             if (src || (dst && (pass || o != rd))) {
                 v = MAX(v, coh_land(o));
             }
@@ -4671,8 +5056,9 @@ uint64_t hle_pbd_copy_begin(uint32_t slo, uint32_t sp, uint32_t dlo, uint32_t dp
         kick();                             /* (a writeback in the open submission: sent, so a
                                                wait for the copy never waits on the decoder) */
     }
-    if (v && !hle_tl_land_copy(v, slo, sp, dlo, dp, row, rows, NULL, 0)) {
-        coh_wait(v);                        /* no room in the queue: made now, after its landings */
+    if (v && (sync || !hle_tl_land_copy(v, slo, sp, dlo, dp, row, rows, NULL, 0))) {
+        coh_wait(v);                        /* no room in the queue: made now, after its landings
+                                               (patch 344: or asked to be) */
         coh_adopt();
         v = 0;
     }
@@ -4918,6 +5304,11 @@ static void coh_first_write(PbObj *o, bool full)
      * of it needs none of it) */
     coh_managed(o, &len);
     coh_pend_wait(o->d.pa, len);
+    if (cohlog_on()) {
+        cohlog(o, full ? "memory newer at its first write (a full clear: not uploaded)" :
+               "its memory uploaded over its image at its first write", o->mem_pend ? "a copy into it" :
+               !o->written ? "never drawn" : "judged newer");
+    }
     if (!full) {
         if (o->d.pitch) {
             rt_upload(o, o->id, false);

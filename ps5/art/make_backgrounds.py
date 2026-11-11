@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# XOG's backgrounds, drawn from nothing in one mood: a burst of
+# XOG's backgrounds, drawn from nothing in the mood of the user's two references: a burst of
 # green light with shards and sparks, and a column of green smoke on black. No text, no logo.
 # usage: make_backgrounds.py OUT_DIR
 import os, sys
@@ -28,7 +28,7 @@ def noise(h, w, octaves, base, gain=0.55, stretch=(1.0, 1.0)):
 
 
 def tone(field):
-    """Black through deep green and lime to white: one colour."""
+    """Black through deep green and lime to white: the references' one colour."""
     f = np.clip(field, 0, None)[..., None]
     deep = np.array([0.02, 0.30, 0.03], np.float32)
     lime = np.array([0.38, 0.92, 0.10], np.float32)
@@ -86,7 +86,7 @@ def burst():
     shards = np.clip((torn - 0.50) * 5, 0, 1) ** 1.5
     field = fall * (0.10 + rays * (0.75 + beam * 1.4)) + core
     field = field + shards * 0.62 * fall * (0.30 + beam * 1.3)
-    # the right and the far corners go to black
+    # the right and the far corners go to black, as in the reference
     field = field * (1 - np.clip((xx / W - 0.68) / 0.32, 0, 1) ** 2 * (1 - np.clip(beam * 1.2, 0, 1)) * 0.96)
     rgb = tone(field)
     rgb = sparks(rgb, 3400, W * 0.28, H * 0.42, (W * 0.17, H * 0.27), 11)
@@ -98,7 +98,7 @@ def smoke():
     """A column of green smoke rising through the middle of a black frame."""
     n1 = noise(H, W, 7, 5, 0.58)
     n2 = noise(H, W, 7, 7, 0.58)
-    # warped: the smoke folds on itself
+    # warped: the smoke folds on itself, as it does in the reference
     ix = np.clip(xx + (n1 - 0.5) * W * 0.22, 0, W - 1).astype(int)
     iy = np.clip(yy + (n2 - 0.5) * H * 0.34, 0, H - 1).astype(int)
     base = noise(H, W, 8, 4, 0.60)

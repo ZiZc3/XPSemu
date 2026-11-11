@@ -22,6 +22,7 @@
 #include "scene.hh"
 #include "game-patches.hh"
 #include "game-profile.hh"
+#include "padmap_ps5.h"
 
 class DashboardScene : public Scene {
 public:
@@ -48,7 +49,7 @@ public:
 
 protected:
     // The main menu: three pages, then the Xbox's own dashboard.
-    enum Page { PAGE_GAMES, PAGE_BROWSER, PAGE_SETTINGS, PAGE_SYSTEM, PAGE__COUNT };
+    enum Page { PAGE_GAMES, PAGE_CHIHIRO, PAGE_BROWSER, PAGE_SETTINGS, PAGE_SYSTEM, PAGE__COUNT };  // Chihiro: patch 184
     static const int MENU_XBOX_DASHBOARD = -1;  // no BIOS, no Xbox dashboard
     static const int MENU__COUNT = PAGE__COUNT;
 
@@ -91,15 +92,22 @@ public: // (The rows' order is kGameRows, dashboard.cc)
     static const int GS_FRAMEGEN = GO__COUNT + 6; // Frame Generation (as the quick menu's)
     static const int GS_FPSPATCH = GO__COUNT + 7; // FPS Patch: a frame rate mod or the 60 unlock
     static const int GS_PAL60 = GO__COUNT + 8;    // PAL 60 Hz (a PAL disc)
-    static const int GS__COUNT = GO__COUNT + 9;
+    static const int GS_DELETE_SAVES = GO__COUNT + 9; // The game's own saves on the Xbox hard disk (patch 182)
+    static const int GS_TRAINER = GO__COUNT + 10; // Trainer: On/Off, L1/R1 picks one (patch 246)
+    static const int GS_PADMAP = GO__COUNT + 11;  // Button mapping: opens its own screen (patch 269)
+    static const int GS_TOPT = GO__COUNT + 12;    // its options: GS_TOPT + i, up to 100
+    static const int GS__COUNT = GO__COUNT + 112;
     double m_delete_armed = 0;
-    struct BrowserRow { std::string name, path; bool game; };
+    double m_saves_armed = 0;
+    double m_saves_deleted_at = -100;                   // when the last delete went through (patch 183)                           // its own timer: a press on one row never arms the other
+    struct BrowserRow { std::string name, path; bool game; bool chihiro = false; };   // chihiro: patch 239
     std::vector<BrowserRow> m_br_rows;
     std::string m_br_dir;   // "" the drives
     int m_br_sel = 0;
     float m_br_top = -1, m_br_shown = 0;
     bool m_br_ready = false;
     void BrowserOpen(const std::string &dir, const std::string &select = "");
+    bool BrowserPlayChihiro(const std::string &path, bool must);  // patch 239
     void BrowserInput(bool accept, bool up, bool down, bool l1, bool r1);
     void BrowserPlay(const std::string &path);
     bool BrowserBack();
@@ -181,6 +189,17 @@ private:
                   bool options);
     void PadCapture();
     void DrawPadPage(float s, float a);
+    // A game's own button mapping (game settings > Controller > Button mapping, patch 269): its own screen over
+    // the game's settings. m_gm_map is what's shown and saved (Default: your layout).
+    bool m_gm_open = false, m_gm_capture = false, m_gm_released = false;
+    int m_gm_sel = 0;
+    float m_gm_capture_t = 0, m_gm_done_t = -9;
+    XbPadMap m_gm_map;
+    void GmOpen();
+    void GmSave();
+    void GmInput(bool accept, bool left, bool right, bool up, bool down);
+    void GmCapture();
+    void DrawGameMapping(float s, float a);
     // Home screen shortcuts: this game's (its folder, or ""), and the
     // disc to start at once when XPSemu runs as one.
     std::string m_gs_shortcut, m_autolaunch;
@@ -330,6 +349,22 @@ protected:
     void DrawGameArt(const Game &game, ImVec2 p0, ImVec2 p1, float a,
                      bool cover);
     void DrawSystem(float s, float a);
+    // Sega Chihiro games (patch 184): their own page, never in Games or anywhere else
+public:     // the start helper outside the class keeps one (patch 187)
+    struct ChihiroGame { std::string path, name, details, why, id, exe; bool ok = false; };
+protected:
+    void StartChihiro(const ChihiroGame &g);       // patch 187: after its volume is unpacked
+    static std::string ChihiroFlash();
+    // patch 217: the base boards' three files, checked (and taken out of a chihiro.zip) on each scan
+    std::vector<std::string> m_chihiro_boards;     // one line per file
+    bool m_chihiro_boards_ok = false;
+    void CheckChihiroBoards();
+    std::vector<ChihiroGame> m_chihiro;
+    int m_chihiro_sel = 0;
+    double m_chihiro_scanned = -100;
+    void ScanChihiro();
+    void DrawChihiro(float s, float a);
+    void ChihiroInput(bool accept, bool up, bool down, bool l1, bool r1, bool triangle);
     void DrawHints(float s);
     void DrawStatus(float s);
     void DrawSetup(float s, float a);

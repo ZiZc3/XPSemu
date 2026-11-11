@@ -115,6 +115,24 @@ static inline size_t hle_host_page_size(void)
     return (size_t)sysconf(_SC_PAGESIZE);
 }
 
+/* patch 337-345: a word of XOG_FIX (comma list, exact match): the features'
+ * kill switches (noovlkey, noclipz, nowinclip, nocolorkey, nopolymode,
+ * noconv, nolodmax, noblitblend, notexgenview). Callers read it once. */
+static inline bool hle_xog_fix_word(const char *word)
+{
+    const char *p = getenv("XOG_FIX");
+    const size_t n = strlen(word);
+    while (p && *p) {
+        const char *q = strchr(p, ',');
+        const size_t l = q ? (size_t)(q - p) : strlen(p);
+        if (l == n && !memcmp(p, word, n)) {
+            return true;
+        }
+        p = q ? q + 1 : NULL;
+    }
+    return false;
+}
+
 #include "hw/xbox/hle/host.h"
 #include "hw/xbox/hle/util/thread.h"
 

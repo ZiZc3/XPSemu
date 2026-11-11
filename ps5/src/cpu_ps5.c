@@ -20,6 +20,7 @@
 #include "native/core/mmio.h"
 #include "native/core/vm.h"
 #include "native/kernel/kernel.h"
+#include "native/core/trainer.h"
 
 #include <errno.h>
 #include <machine/sysarch.h>
@@ -96,6 +97,23 @@ uint64_t rx_host_rsp, rx_gate_stack;
 volatile uint32_t rx_irq_pending;
 uint16_t rx_data_sel, rx_guest_cs = RX_GUEST_CS;
 uint32_t rx_host_mxcsr = 0x1F80;
+/* Patch 323: the host's fs (its TLS) on the vCPU thread, put back if the guest loads fs (mov fs / pop fs / lfs):
+ * code gone astray (Def Jam: Fight for NY ran into the middle of an instruction after a wrong patch) did a
+ * "mov fs, ebx" and the next libkernel call in the gate read its TLS through a guest descriptor: the app died.
+ * Checked at every gate entry (cpu_ps5_asm.S) and signal; a real game's code never loads fs, so it costs a compare. */
+uint16_t rx_host_fs_sel;
+uint64_t rx_host_fs_base;
+static unsigned rx_fs_repairs;
+
+__attribute__((noinline)) void rx_fs_repair(void)
+{
+    __asm__ volatile("movw %0, %%fs" : : "m"(rx_host_fs_sel));
+    uint64_t base = rx_host_fs_base;
+    sysarch(AMD64_SET_FSBASE, &base);   /* before anything uses TLS */
+    if (rx_fs_repairs++ < 8) {
+        nc_log("xog-cpu", "the guest loaded fs: the host's fs and its base put back (#%u, patch 323)", rx_fs_repairs);
+    }
+}
 
 void rx_sig_c(int sig, siginfo_t *si, void *uc);
 extern void rx_enter(void);
@@ -155,6 +173,15 @@ static inline uint64_t rx_rdtsc(void)
     uint32_t a, d;
     __asm__ volatile("rdtsc" : "=a"(a), "=d"(d));
     return ((uint64_t)d << 32) | a;
+}
+
+/* patch 253: the TSC as the guest goes by it: the host's, twice as fast while fast-forward is on (ff_ps5.c).
+ * The guest's rdtsc, its cycles and the offsets kept in them (pauses, holds) all use it; rx_rdtsc stays for
+ * the host's own waits. */
+uint64_t nc_ff_tsc(void);
+static inline uint64_t rx_vtsc(void)
+{
+    return nc_ff_tsc();
 }
 
 /* ---- the frame ---- */
@@ -493,9 +520,38 @@ static unsigned insn_len(const uint8_t *p)
 
 /* 0F 31 in a section is real code if what's around it says so: a good run of instructions before it, the
  * start of a function just before it, or the next instruction using the result (edx:eax). */
-static bool rdtsc_is_code(uint32_t lo, uint32_t va, unsigned run)
+/* The bytes at va sit in a jump table's entry: the dword holding them is an address in [lo, hi), and so is the
+ * dword before or after it (patch 312 for cpuid; patch 360 for rdtsc too). Mortal Kombat: Shaolin Monks' movie
+ * decoder (0x30e2b0) dispatches through a table at 0x311910 whose entry 0x00310f86 holds 0F 31: rewritten to ud2
+ * it read 0x000b0f86, the first movie jumped into game code and the game crashed after the Midway logo (issue #38). */
+static bool in_addr_table(uint32_t lo, uint32_t hi, uint32_t va)
+{
+    const uint32_t d = va & ~3u;
+    for (uint32_t w = d; w <= ((va + 1) & ~3u); w += 4) {   /* both bytes' dwords */
+        if (w < lo + 4 || w + 8 > hi) {
+            continue;
+        }
+        uint32_t here, before, after;
+        memcpy(&here, (const void *)(uintptr_t)w, 4);
+        memcpy(&before, (const void *)(uintptr_t)(w - 4), 4);
+        memcpy(&after, (const void *)(uintptr_t)(w + 4), 4);
+        if (here >= lo && here < hi && ((before >= lo && before < hi) || (after >= lo && after < hi))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rdtsc_is_code(uint32_t lo, uint32_t hi, uint32_t va, unsigned run)
 {
     const uint8_t *q = (const uint8_t *)(uintptr_t)va;
+    if (in_addr_table(lo, hi, va)) {
+        static unsigned told;
+        if (told++ < 16) {
+            nc_log("xog-sweep", "0F 31 at %08x is in an address table: left alone", va);
+        }
+        return false;
+    }
     if (run >= 8) {
         return true;
     }
@@ -506,6 +562,20 @@ static bool rdtsc_is_code(uint32_t lo, uint32_t va, unsigned run)
         }
     }
     const uint8_t *n = q + 2;
+    /* A two-byte "rdtsc; ret" helper at the very start of a section (nothing before it to judge by):
+     * RalliSport Challenge 2's frame clock at 0x12000 read the PS5's raw 1.6 GHz counter against the
+     * Xbox's 733 MHz, every frame time 2.2x too long. Per game (xogfix=rdtscret), as the sweep's
+     * judgement is shared by every title. */
+    if (n[0] == 0xC3 && va == lo) {
+        static int on = -1;
+        if (on < 0) {
+            const char *fix = getenv("XOG_FIX");
+            on = fix && strstr(fix, "rdtscret") ? 1 : 0;
+        }
+        if (on) {
+            return true;
+        }
+    }
     switch (n[0]) {
     case 0x50: case 0x52:               /* push eax, edx */
     case 0xA3: case 0x05: case 0x2D:    /* mov [mem], eax; add, sub eax, imm */
@@ -520,6 +590,99 @@ static bool rdtsc_is_code(uint32_t lo, uint32_t va, unsigned run)
     default:
         return false;
     }
+}
+
+/* Trap cpuid so the core reports the Xbox's CPU, a Pentium III (GenuineIntel, family 6, with SSE),
+ * instead of the PS5's native AMD (family 15): every game sees the CPU it was made for. Titles that
+ * check it: Midnight Club II's DirectSound, DICE's voice codec (Midtown Madness 3, RalliSport
+ * Challenge 2), RalliSport 2's CPU-type detector.
+ * History: patch 300 made it general, but that froze Dead or Alive 3 after the logo and it went back
+ * to per game (302). The cause, found later: DOA3 has NO cpuid; the sweep took the bytes 0F A2 inside
+ * its movie scanner's jump table (entry 0x001aa20f at 0x1aa24c) for one and rewrote the table entry,
+ * so the first movie jumped into another function. cpuid_is_code (below) now rejects tables and wants
+ * the leaf set in eax just before, so the trap is general again (patch 312).
+ * Off for one game: xogfix=nocpuid; for a run: NC_SWEEP_CPUID=0. */
+static bool sweep_cpuid_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NC_SWEEP_CPUID");
+        const char *fix = getenv("XOG_FIX");
+        on = (e && e[0] == '0') || (fix && strstr(fix, "nocpuid")) ? 0 : 1;
+    }
+    return on == 1;
+}
+
+/* 0F A2 at va is a real cpuid only if code says so. A cpuid always has its leaf put in eax just
+ * before it (mov eax, imm32 / xor eax, eax / mov eax, reg / pop eax), at most one push or pop of
+ * another register in between; and bytes that sit in a run of addresses into this section are a
+ * jump table (DOA3's 0x1aa24c), whatever decodes after them. Every cpuid seen so far passes: Midtown
+ * Madness 3 0xa4fed/0xa504b, RalliSport 2 0x891dd/0x8923b/0xa0f9d/0xa0fbc/0x5f47e. */
+static bool cpuid_is_code(uint32_t lo, uint32_t hi, uint32_t va)
+{
+    const uint8_t *q = (const uint8_t *)(uintptr_t)va;
+    if (in_addr_table(lo, hi, va)) {
+        return false;                   /* a table entry's bytes (DOA3's movie scanner, patch 312) */
+    }
+    for (int skip = 0; skip <= 1; skip++) {
+        if (va < lo + 8 + (uint32_t)skip) {
+            return false;
+        }
+        const uint8_t *e = q - skip;    /* the end of the eax setup */
+        if (skip && !(q[-1] >= 0x50 && q[-1] <= 0x5F && q[-1] != 0x58 && q[-1] != 0x50)) {
+            break;                      /* only a push/pop of another register may sit between */
+        }
+        if (e[-5] == 0xB8) {
+            return true;                /* mov eax, imm32 */
+        }
+        if ((e[-2] == 0x33 || e[-2] == 0x31) && e[-1] == 0xC0) {
+            return true;                /* xor eax, eax */
+        }
+        if ((e[-2] == 0x8B && (e[-1] & 0xF8) == 0xC0) || (e[-2] == 0x89 && (e[-1] & 0xC7) == 0xC0)) {
+            return true;                /* mov eax, reg */
+        }
+        if (e[-1] == 0x58) {
+            return true;                /* pop eax */
+        }
+        /* mov eax, [memory] (patch 314): Thief: Deadly Shadows' cpuid(leaf) helper at 0x2056c7
+         * takes its leaf from the stack (mov eax, [esp+0x10]); left alone, it got the PS5's answer
+         * and the game crashed loading. Checked over the whole library: only Thief's site changes. */
+        if (e[-5] == 0xA1) {
+            return true;                /* mov eax, [moffs32] */
+        }
+        if (e[-2] == 0x8B && (e[-1] & 0xF8) == 0x00 && (e[-1] & 7) != 4 && (e[-1] & 7) != 5) {
+            return true;                /* mov eax, [reg] */
+        }
+        if (e[-3] == 0x8B && (e[-2] & 0xF8) == 0x40 && (e[-2] & 7) != 4) {
+            return true;                /* mov eax, [reg+disp8] */
+        }
+        if (e[-4] == 0x8B && e[-3] == 0x44) {
+            return true;                /* mov eax, [sib+disp8] (mov eax, [esp+N]) */
+        }
+        if (e[-6] == 0x8B && (e[-5] & 0xF8) == 0x80 && (e[-5] & 7) != 4) {
+            return true;                /* mov eax, [reg+disp32] */
+        }
+        if (e[-7] == 0x8B && e[-6] == 0x84) {
+            return true;                /* mov eax, [sib+disp32] */
+        }
+    }
+    return false;
+}
+
+/* A cpuid site's bytes for the log: 8 before, 8 from it. */
+static void cpuid_site_log(uint32_t va, bool taken)
+{
+    static unsigned told;
+    if (told++ >= 32) {
+        return;
+    }
+    const uint8_t *q = (const uint8_t *)(uintptr_t)va;
+    char b[3 * 16 + 1];
+    int o = 0;
+    for (int i = -8; i < 8; i++) {
+        o += snprintf(b + o, sizeof(b) - (size_t)o, "%02x%s", q[i], i == -1 ? "|" : " ");
+    }
+    nc_log("xog-sweep", "cpuid at %08x %s: %s", va, taken ? "trapped (Pentium III answer)" : "is data: left alone", b);
 }
 
 static void sweep_range(uint32_t lo, uint32_t hi)
@@ -548,6 +711,14 @@ static void sweep_range(uint32_t lo, uint32_t hi)
         int kind = 0;
         if (len == 2 && q[0] == 0x0F && q[1] == 0x31) {
             kind = RX_K_RDTSC;
+        } else if (sweep_cpuid_on() && len == 2 && q[0] == 0x0F && q[1] == 0xA2) {
+            /* patch 298c (xogfix=cpuid, per game): trap cpuid so it goes through the core's
+             * emulation, which reports a Pentium III (family 6, the Xbox CPU). Native cpuid on the
+             * PS5 (AMD) reports family 15, and games that check for family 6 (Midnight Club II's
+             * DirectSound voice init) then fail - their sound setup returns an error and the title
+             * reboots to the dashboard ("disc damaged"). The 0F A2 is replaced with 0F 0B (UD2) like
+             * rdtsc, and the site's kind sends the trap to NC_SYSOP_CPUID. */
+            kind = RX_K_CPUID;
         }
         if (kind) {
             /* six instructions after it decode too: code, not constants */
@@ -561,7 +732,11 @@ static void sweep_range(uint32_t lo, uint32_t hi)
                 code = l && l <= 15;
                 at += l;
             }
-            if (code && !rdtsc_is_code(lo, va, run)) {
+            if (kind == RX_K_CPUID) {
+                /* patch 312: its own code check (a table entry's bytes froze DOA3) */
+                code = code && cpuid_is_code(lo, hi, va);
+                cpuid_site_log(va, code);
+            } else if (code && !rdtsc_is_code(lo, hi, va, run)) {
                 static unsigned told;
                 if (told++ < 16) {
                     nc_log("xog-sweep", "0F 31 at %08x looks like data: left alone", va);
@@ -676,7 +851,10 @@ static void sweep_image(NcCpu *cpu, uint32_t lo, uint32_t hi)
         }
         nc_log("xog-cpu", "sweep: image range %08x-%08x not usable: the XBE at %08x", lo, hi, base);
     }
-    if (!given || hi <= lo || lo > base) {
+    /* patch 250: a range inside the image is swept alone (it was the whole image every time: Fable, 2039 sweeps of
+     * 135 sections, the game frozen up to 1.8 s) */
+    const bool whole = !given || hi <= lo || lo <= base;
+    if (whole) {
         lo = base;
         hi = base + nc_rd32((const void *)(uintptr_t)(base + 0x10C));   /* SizeOfImage */
     }
@@ -686,7 +864,9 @@ static void sweep_image(NcCpu *cpu, uint32_t lo, uint32_t hi)
         nc_log("xog-cpu", "sweep: section table %08x (%u sections) not readable: nothing swept", tab, n);
         return;
     }
-    nc_log("xog-cpu", "sweep: %08x-%08x, %u sections", lo, hi, n);
+    if (whole) {
+        nc_log("xog-cpu", "sweep: %08x-%08x, %u sections", lo, hi, n);
+    }
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t *h = (const uint8_t *)(uintptr_t)(tab + i * 56);
         const uint32_t flags = nc_rd32(h), sva = nc_rd32(h + 4), size = nc_rd32(h + 8);
@@ -713,7 +893,9 @@ static void sweep_image(NcCpu *cpu, uint32_t lo, uint32_t hi)
 }
 
 static bool finish_common(NcCpu *cpu, bool *step_out);
+#define rx_rdtsc rx_vtsc            /* patch 253: the sites' rdtsc is the guest's (no edit there: it rebuilds all) */
 #include "sites_ps5.inc"
+#undef rx_rdtsc
 
 /* ---- save states: what this CPU keeps beside the console ---- */
 #include "native/state/state.h"
@@ -826,6 +1008,37 @@ void rx_poke_add(const char *text)
 static void rx_unlock_patches(void)
 {
     extern int g_xog_vblank_factor;
+    /* Breakdown (patch 346): its clock is vblanks x 1/60 s (0x18ff20) and its frame waits for a number of them
+     * (0x190234, set by 0x22290: 1 in menus, 2 in play from 0x1c59a). Vblanks twice as often ran its clock
+     * twice as fast and play stayed at 30, so instead: the real vblank rate, and play asks for 1 (60 a second). */
+    if (g_xog_vblank_factor >= 2 && nc_vm_phys(&g_core_for_faults->vm, 0x1c59a) != UINT32_MAX) {
+        static const uint8_t play[] = {0x6A, 0x02, 0xE8, 0xEF, 0x5C, 0x00, 0x00};   /* push 2; call 0x22290 */
+        static const uint8_t setter[] = {0x8B, 0x44, 0x24, 0x04, 0x85, 0xC0, 0x7F, 0x0B};
+        /* patch 373: a save state's memory holds it already patched (push 1): only the vblank rate back to the
+         * video mode's - left at twice it, play ran at 120 and the game's clock twice as fast (user) */
+        static const uint8_t done[] = {0x6A, 0x01, 0xE8, 0xEF, 0x5C, 0x00, 0x00};
+        if (nc_vm_phys(&g_core_for_faults->vm, 0x22290) != UINT32_MAX &&
+            !memcmp((const void *)(uintptr_t)0x1c59a, done, sizeof(done)) &&
+            !memcmp((const void *)(uintptr_t)0x22290, setter, sizeof(setter))) {
+            extern void nc_dev_nv2a_vblank_multiply(unsigned n);
+            g_xog_vblank_factor = 1;
+            nc_dev_nv2a_vblank_multiply(1);
+            nc_log("xog-title", "Breakdown: already patched (a save state): vblanks at the video mode's rate");
+            return;
+        }
+        if (nc_vm_phys(&g_core_for_faults->vm, 0x22290) != UINT32_MAX &&
+            !memcmp((const void *)(uintptr_t)0x1c59a, play, sizeof(play)) &&
+            !memcmp((const void *)(uintptr_t)0x22290, setter, sizeof(setter)) && code_byte(0x1c59b)) {
+            extern void nc_dev_nv2a_vblank_multiply(unsigned n);
+            *code_byte(0x1c59b) = 0x01;
+            g_xog_vblank_factor = 1;
+            nc_dev_nv2a_vblank_multiply(1);
+            nc_log("xog-title", "Breakdown: play waits 1 vblank (60 a second), vblanks at the video mode's rate");
+            return;
+        }
+    }
+    /* Otogi (patch 348, removed): interval 1 + game speed 0.5 ran its play fast (user); its clock counts frames
+     * and more than the one speed value follows it - the 60 is hakuX's mod (logic at 30, frames between) */
     if (g_xog_vblank_factor < 2 || nc_vm_phys(&g_core_for_faults->vm, 0x2ED2D) == UINT32_MAX) {
         return;
     }
@@ -906,6 +1119,98 @@ static void rx_dsnull_patch(void)
     nc_log("xog-title", "dsnull: Morrowind's music pause checks its stream");
 }
 
+/* patch 257: Sega Chihiro Maximum Tune (SBHQ, \A\V307.xbe) steers by JVS analog 0 minus the steering centre its
+ * operator sets in the test menu (0x0006ef20: movzx ecx, word [esi+0x207c] at 0x0006ef37; esi 0x23ce48, so the
+ * backup block's word at 0x0023eec4), / 64, clamped to +-384 (0x0006f950); the test menu calls >= +0x180 "RIGHT
+ * OK", <= -0x180 "LEFT OK" (0x0006c9bf, 0x0006c9e5). Our backup memory carries no calibrated "SBHQ0000" record:
+ * the factory reset (0x0006f77a) leaves the centre 0, and the wheel at rest (0x8000) read as a full lock. The
+ * centre is taken as 0x8000, where our wheel rests (a cabinet set up in its test menu): mov ecx, 0x8000.
+ * patch 258: Maximum Tune 2 (SBKD, \A\V322.xbe) has the same code with the centre at [esi+0x20c0] (test menu
+ * RIGHT/LEFT OK at 0x000528bf/0x000528e5 in gdx-0016a; factory reset 0x00056373 sets it 0). Four discs, four
+ * builds: each told apart by the steering bytes and by the "mov ecx, <object>" before the wrapper's call. */
+typedef struct {
+    const char *id, *disc;
+    uint32_t site;          /* movzx ecx, word [esi+disp] ; sub eax, ecx */
+    uint16_t disp;
+    uint32_t caller, obj;   /* mov ecx, obj at caller (the in-game wrapper's call) */
+} RxWmmtSteer;
+static const RxWmmtSteer g_wmmt_builds[] = {
+    {"SBHQ", "V307 (gdx-0009b/0008b)", 0x6ef37, 0x207c, 0x46db0, 0x23ce48},
+    {"SBKD", "V322 gdx-0015 (Japan)", 0x557b7, 0x20c0, 0xe0e8d, 0x2891a0},
+    {"SBKD", "V322 gdx-0015a (Japan)", 0x55827, 0x20c0, 0xe0e1d, 0x2892e0},
+    {"SBKD", "V322 gdx-0016 (Export)", 0x557b7, 0x20c0, 0xe0cbd, 0x289000},
+    {"SBKD", "V322 gdx-0016a (Export)", 0x55827, 0x20c0, 0xe0d2d, 0x2891a0},
+};
+static uint32_t g_wmmt_centre_va;
+
+static bool rx_chihiro_game_is(const char *want)
+{
+    const char *fs = getenv("NC_CHIHIRO_FS");
+    if (!getenv("NC_CHIHIRO") || !fs) {
+        return false;
+    }
+    char bp[600];
+    snprintf(bp, sizeof(bp), "%s/boot.id", fs);
+    FILE *f = fopen(bp, "rb");
+    if (!f) {
+        return false;
+    }
+    char b[0x34];
+    const bool ok = fread(b, 1, sizeof(b), f) == sizeof(b) && !memcmp(b + 0x30, want, 4);
+    fclose(f);
+    return ok;
+}
+
+static bool rx_mapped(uint32_t va, uint32_t n)
+{
+    return nc_vm_phys(&g_core_for_faults->vm, va) != UINT32_MAX &&
+           nc_vm_phys(&g_core_for_faults->vm, va + n - 1) != UINT32_MAX;
+}
+
+static void rx_wmmt_steer_patch(void)
+{
+    const bool mt1 = rx_chihiro_game_is("SBHQ"), mt2 = !mt1 && rx_chihiro_game_is("SBKD");
+    if (!mt1 && !mt2) {
+        return;
+    }
+    static const uint8_t now[] = {0xB9, 0x00, 0x80, 0x00, 0x00, 0x90, 0x90};
+    for (unsigned b = 0; b < sizeof(g_wmmt_builds) / sizeof(g_wmmt_builds[0]); b++) {
+        const RxWmmtSteer *w = &g_wmmt_builds[b];
+        if (strcmp(w->id, mt1 ? "SBHQ" : "SBKD") || !rx_mapped(w->site, 9) || !rx_mapped(w->caller, 5)) {
+            continue;
+        }
+        const uint8_t was[9] = {0x0F, 0xB7, 0x8E, (uint8_t)w->disp, (uint8_t)(w->disp >> 8), 0x00, 0x00, 0x2B, 0xC1};
+        const uint8_t mov[5] = {0xB9, (uint8_t)w->obj, (uint8_t)(w->obj >> 8), (uint8_t)(w->obj >> 16),
+                                (uint8_t)(w->obj >> 24)};
+        if (memcmp((const void *)(uintptr_t)w->site, was, sizeof(was)) ||
+            memcmp((const void *)(uintptr_t)w->caller, mov, sizeof(mov))) {
+            continue;
+        }
+        for (unsigned i = 0; i < sizeof(now); i++) {
+            if (!code_byte(w->site + i)) {
+                return;
+            }
+        }
+        for (unsigned i = 0; i < sizeof(now); i++) {
+            *code_byte(w->site + i) = now[i];
+        }
+        g_wmmt_centre_va = w->obj + w->disp;
+        nc_log("xog-title", "Maximum Tune steering: %s %s: centre 8000 used at %08x, not the uncalibrated one in its "
+               "backup (%08x) (patch %s)", w->id, w->disc, w->site, g_wmmt_centre_va, mt1 ? "257" : "258");
+        return;
+    }
+    nc_log("xog-title", "Maximum Tune steering: %s: no known build's bytes, left as it is", mt1 ? "SBHQ" : "SBKD");
+}
+
+/* patch 257: the steering centre the game holds in its backup block (what the patch overrides), -1 without it */
+int rx_wmmt_backup_centre(void)
+{
+    if (!g_wmmt_centre_va || !rx_mapped(g_wmmt_centre_va, 2)) {
+        return -1;
+    }
+    return *(volatile const uint16_t *)(uintptr_t)g_wmmt_centre_va;
+}
+
 static void rx_title_patches(NcCpu *cpu)
 {
     (void)cpu;
@@ -913,6 +1218,7 @@ static void rx_title_patches(NcCpu *cpu)
     rx_unlock_patches();
     rx_ftol_patch();
     rx_dsnull_patch();
+    rx_wmmt_steer_patch();
     for (unsigned p = 0; p < g_npokes; p++) {
         extern bool rx_mod_overlaps(uint32_t va, uint32_t len);
         if (rx_mod_overlaps(g_pokes[p].va, g_pokes[p].len)) {
@@ -1289,6 +1595,14 @@ static void trace(int sig, const siginfo_t *si, const RxMc *m, bool guest)
 
 void rx_sig_c(int sig, siginfo_t *si, void *uc)
 {
+    {
+        /* patch 323: the host's fs back first, if the guest changed it (pthread_self below reads TLS) */
+        uint16_t fs;
+        __asm__ volatile("movw %%fs, %0" : "=r"(fs));
+        if (rx_host_fs_base && fs != rx_host_fs_sel) {
+            rx_fs_repair();
+        }
+    }
     RxMc *m = mc_of(uc);
     const bool me = g_cpu && g_cpu->running && pthread_equal(pthread_self(), g_cpu->thread);
     trace(sig, si, m, (uint16_t)m->cs == RX_GUEST_CS);
@@ -1541,7 +1855,7 @@ static void rx_sig_inner(int sig, siginfo_t *si, void *uc)
                 finish(cpu, m, false);
                 return;
             }
-            const uint64_t t = (uint64_t)(((unsigned __int128)(rx_rdtsc() - cpu->cycle_offset) * g_tsc_ratio) >> 32);
+            const uint64_t t = (uint64_t)(((unsigned __int128)(rx_vtsc() - cpu->cycle_offset) * g_tsc_ratio) >> 32);
             f->regs[NC_EAX] = (uint32_t)t;
             f->regs[NC_EDX] = (uint32_t)(t >> 32);
             f->rip = eip + 2;
@@ -1801,10 +2115,10 @@ bool rx_mmio_fault(void *ucontext, uint32_t addr)
 
 /* ---- time ---- */
 
-uint64_t nc_cpu_host_cycles(void) { return rx_rdtsc(); }
+uint64_t nc_cpu_host_cycles(void) { return rx_vtsc(); }   /* patch 253: the pauses' and holds' cycles, as the guest's */
 void nc_cpu_cycle_offset_add(NcCpu *cpu, uint64_t ticks) { cpu->cycle_offset += ticks; }
-uint64_t nc_cpu_guest_cycles(NcCpu *cpu) { return rx_rdtsc() - cpu->cycle_offset; }
-void nc_cpu_guest_cycles_set(NcCpu *cpu, uint64_t ticks) { cpu->cycle_offset = rx_rdtsc() - ticks; }
+uint64_t nc_cpu_guest_cycles(NcCpu *cpu) { return rx_vtsc() - cpu->cycle_offset; }
+void nc_cpu_guest_cycles_set(NcCpu *cpu, uint64_t ticks) { cpu->cycle_offset = rx_vtsc() - ticks; }
 bool nc_cpu_x87_single_check(NcCpu *cpu) { (void)cpu; return false; }   /* a real x87 */
 bool nc_cpu_x87_single(NcCpu *cpu) { (void)cpu; return false; }
 void nc_cpu_x87_single_restore(NcCpu *cpu) { (void)cpu; }
@@ -2154,6 +2468,7 @@ static void *heartbeat(void *arg)
         const uint64_t mmio = nc_mmio_total(), frames = rx_frames_shown;
         static uint64_t last_gate, last_site;
         nc_hold_report();
+        nc_trainer_live_watch();      /* patch 254 */
         nc_log("xog-beat", "gate +%llu, rewritten sites ran +%llu, %u sites", (unsigned long long)(g_gate_n - last_gate),
                (unsigned long long)(g_site_n - last_site), g_nstubs);
         last_gate = g_gate_n;
@@ -2224,6 +2539,61 @@ static void rx_core_layout(void)
 
 extern __thread bool rx_on_vcpu;
 
+/* patch 246: the trainer's entry returned (trainer.c, its stub's port write, on this CPU's
+ * thread): the code changes nc_cpu_run held back, made now on the code as the trainer left
+ * it, so nothing of ours puts back a byte it changed and its new code is swept too. */
+void rx_cpu_after_trainer(void)
+{
+    NcCpu *cpu = g_core_for_faults ? g_core_for_faults->cpu : NULL;
+    if (!cpu) {
+        return;
+    }
+    rx_title_patches(cpu);
+    sweep_image(cpu, cpu->image_lo, cpu->image_hi);
+    hooks_sync(cpu, cpu->image_lo, cpu->image_hi);
+    nc_log("xog-cpu", "after the trainer: title patches, sweep (rdtsc %u, cpuid %u, pushfd %u, popfd %u) and hooks made",
+           g_sweep_counts[RX_K_RDTSC], g_sweep_counts[RX_K_CPUID], g_sweep_counts[RX_K_PUSHFD], g_sweep_counts[RX_K_POPFD]);
+}
+
+/* patch 252: trainer live switches (trainer.c). The host's view of a guest byte as the code that runs
+ * sees it (a shadow's or a step's VA, else the RAM). */
+uint8_t *rx_cpu_code_ptr(uint32_t va)
+{
+    return code_byte(va);
+}
+
+/* patch 252: n bytes of the game's code (or the trainer's block) at va, the game paused, its CPU at its
+ * pause point. Our int3 hooks in the range come off first (the byte each keeps would be stale), the bytes
+ * go in through code_byte, then nc_cpu_invalidate as mods.c does: sites there forgotten, the range swept
+ * (64 bytes and up) and the hooks made again on the new bytes. */
+bool rx_cpu_code_write(uint32_t va, const uint8_t *bytes, uint32_t n)
+{
+    NcCpu *cpu = g_core_for_faults ? g_core_for_faults->cpu : NULL;
+    if (!cpu || !n) {
+        return cpu != NULL;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (!code_byte(va + i)) {
+            return false;
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (hook_slot(cpu, va + i, false)) {
+            hook_off(cpu, va + i);
+        }
+    }
+    bool rdtsc = false;
+    for (uint32_t i = 0; i < n; i++) {
+        *code_byte(va + i) = bytes[i];
+        rdtsc |= i + 1 < n && bytes[i] == 0x0F && bytes[i + 1] == 0x31;
+    }
+    nc_cpu_invalidate(cpu, va, n);
+    if (rdtsc && n < 64) {
+        nc_log("xog-cpu", "trainer switch: an rdtsc back at %08x+%u (too short to sweep: it runs raw)", va, n);
+    }
+    return true;
+}
+
 void nc_cpu_run(NcCpu *cpu, const NcCpuContext *c)
 {
     cpu->thread = pthread_self();
@@ -2232,6 +2602,12 @@ void nc_cpu_run(NcCpu *cpu, const NcCpuContext *c)
     sigaltstack(&ss, NULL);
     uint64_t fsb = 0, gsb = cpu->fs_base;
     sysarch(AMD64_GET_FSBASE, &fsb);
+    {
+        uint16_t sel;
+        __asm__ volatile("movw %%fs, %0" : "=r"(sel));
+        rx_host_fs_sel = sel;       /* patch 323: what the gate and the signals put back */
+        rx_host_fs_base = fsb;
+    }
     const int r = sysarch(AMD64_SET_GSBASE, &gsb);
     /* fs: cut to 32 bits must fault, not land in memory the guest has. */
     nc_log("xog-cpu", "this thread: fs base %llx, gs base set to %llx (rc %d)", (unsigned long long)fsb,
@@ -2243,7 +2619,7 @@ void nc_cpu_run(NcCpu *cpu, const NcCpuContext *c)
         const uint64_t hz = sceKernelGetTscFrequency();
         g_tsc_ratio = (uint64_t)(((unsigned __int128)733333333ull << 32) / hz);
         if (!g_state_loaded) {
-            cpu->cycle_offset = rx_rdtsc();     /* a state brought its own */
+            cpu->cycle_offset = rx_vtsc();      /* a state brought its own */
         }
         if (g_state_loaded) {
             /* patched and swept when it was saved: the stubs just get this run's gate, and the pad its
@@ -2255,6 +2631,10 @@ void nc_cpu_run(NcCpu *cpu, const NcCpuContext *c)
             nc_log("xog-cpu", "from a state: %u sites kept", g_nstubs);
             rx_ftol_patch();    /* xogfix=ftol: the state's memory has the game's own helper */
             rx_dsnull_patch();
+            rx_unlock_patches();    /* patch 373: the 60 FPS patches' vblank rate too (Breakdown ran at 120) */
+        } else if (nc_trainer_pending()) {
+            /* patch 246: a trainer runs first and patches the game's code; ours is made on its result */
+            nc_log("xog-cpu", "a trainer runs first: the title patches, the sweep and the hooks wait for it");
         } else {
             rx_title_patches(cpu);
             sweep_image(cpu, cpu->image_lo, cpu->image_hi);
@@ -2263,7 +2643,9 @@ void nc_cpu_run(NcCpu *cpu, const NcCpuContext *c)
                g_sweep_counts[RX_K_CPUID], g_sweep_counts[RX_K_PUSHFD], g_sweep_counts[RX_K_POPFD],
                (unsigned long long)hz);
     }
-    hooks_sync(cpu, cpu->image_lo, cpu->image_hi);
+    if (!nc_trainer_pending()) {
+        hooks_sync(cpu, cpu->image_lo, cpu->image_hi);
+    }
     rx_kernel_stage("after the hooks");
     rx_core_layout();
     cpu->running = true;

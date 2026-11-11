@@ -6,6 +6,7 @@
  * version, offset, length, CRC-32 per section), then the sections.
  */
 #include "native/state/state.h"
+#include "native/core/hostio.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -225,23 +226,6 @@ static bool get_info(NcRd *r, NcStateInfo *in)
     return !h.fail;
 }
 
-static bool write_all(int fd, const void *p, size_t n)
-{
-    const uint8_t *q = p;
-    while (n) {
-        const ssize_t w = write(fd, q, n);
-        if (w < 0 && errno == EINTR) {
-            continue;
-        }
-        if (w <= 0) {
-            return false;
-        }
-        q += w;
-        n -= (size_t)w;
-    }
-    return true;
-}
-
 const char *nc_state_write(const char *path, const NcStateInfo *info, const NcStateSection *secs,
                            unsigned nsecs)
 {
@@ -286,19 +270,21 @@ const char *nc_state_write(const char *path, const NcStateInfo *info, const NcSt
     if (!err) {
         char tmp[600];
         snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-        const int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        bool ok = fd >= 0 && write_all(fd, head.p, head.len);
+        /* XOG patch 308: through the un-throttled helper when it is up. A
+         * 15.6 MiB state took 30 s at the app's throttled ~0.5 MB/s; the
+         * helper keeps its bytes from counting toward the app's budget. */
+        NcHostOut out;
+        bool ok = nc_host_out_open(&out, tmp, 0644, true) == 0;
+        ok = ok && nc_host_write(&out, head.p, head.len) == (long)head.len;
         for (unsigned i = 0; ok && i < nsecs; i++) {
-            ok = write_all(fd, body[i].p, body[i].len);
+            ok = nc_host_write(&out, body[i].p, body[i].len) == (long)body[i].len;
         }
-        ok = ok && fsync(fd) == 0;
-        if (fd >= 0) {
-            ok = close(fd) == 0 && ok;
-        }
-        if (!ok || rename(tmp, path) != 0) {
+        ok = ok && nc_host_out_sync(&out) == 0;
+        ok = nc_host_out_close(&out) == 0 && ok;
+        if (!ok || nc_host_rename(tmp, path) != 0) {
             snprintf(why, sizeof(why), "can't write %s: %s", path, strerror(errno));
             err = why;
-            unlink(tmp);
+            nc_host_unlink(tmp);
         }
     }
     nc_buf_free(&head);

@@ -12,6 +12,7 @@
 #include "native/hle/hle_native.h"
 #include "native/core/mmio.h"
 #include "native/core/mods.h"
+#include "native/core/trainer.h"
 #include "native/net/net.h"
 #include "native/state/save.h"
 
@@ -28,6 +29,8 @@ static bool g_relaunch;
 static bool g_dashboard;        /* boot the dashboard (nc_core_set_dashboard) */
 static char g_loadstate[512];   /* boot into this savestate (nc_core_set_loadstate) */
 static bool g_loaded;
+
+unsigned (*nc_chihiro_mount_hook)(const char *img, NcDisc *disc);   /* patch 219, set by the app */
 
 void nc_core_set_relaunch(bool on)
 {
@@ -170,9 +173,27 @@ bool nc_core_boot(NcCore *c, int disc_fd)
             return boot_failed("The game's file isn't an Xbox disc image.");
         }
         nc_mods_install(&c->disc);      /* the mods' files and XBE patches, the cheats */
+        nc_disc_cache_folders(&c->disc);   /* the folders' tables, read ahead */
     } else if (g_folder[0]) {
         unsigned files = 0;
         folder_walk(c, g_folder, "", &files);
+        {
+            /* Sega Chihiro (XPSemu patch 200): the game's unpacked image (mbfs) is on the disc too, as the media
+             * board shows it as the CD drive: SEGABOOT launches \Device\CdRom0\OUTRUN2.XBE */
+            const char *cfs = getenv("NC_CHIHIRO_FS");
+            const char *cimg = getenv("NC_CHIHIRO_IMG");
+            extern unsigned (*nc_chihiro_mount_hook)(const char *img, NcDisc *disc);
+            if (cimg && *cimg && nc_chihiro_mount_hook) {
+                /* patch 219: the game's image read in place (no unpacking): its files on the disc from it */
+                const unsigned n = nc_chihiro_mount_hook(cimg, &c->disc);
+                files += n;
+                nc_log("xog", "Chihiro: the game image %s read in place: %u files", cimg, n);
+            } else if (cfs && *cfs) {
+                const unsigned before = files;
+                folder_walk(c, cfs, "", &files);
+                nc_log("xog", "Chihiro: the game image %s is on the disc too: %u files", cfs, files - before);
+            }
+        }
         nc_disc_overlay_seal(&c->disc);
         nc_log("xog", "game folder %s: %u files", g_folder, files);
         if (!files) {
@@ -276,7 +297,20 @@ bool nc_core_boot(NcCore *c, int disc_fd)
     if (c->xbe.stack_commit > stack) {
         stack = nc_align_up(c->xbe.stack_commit, NC_PAGE);
     }
-    g_boot = nc_kernel_boot_thread(&c->kernel, c->cpu, c->xbe.info.entry, stack);
+    /* patch 246: a trainer (trainer.h) runs first, from a stub the boot thread starts at;
+     * never from a savestate (the state's memory has it), the dashboard or a Chihiro game */
+    uint32_t start = c->xbe.info.entry;
+    if (nc_trainer_wanted()) {
+        if (g_loadstate[0]) {
+            nc_log("hakuX-native-trainer", "from a savestate: not run again (the state's memory has it and its patches)");
+            nc_trainer_state_loaded();  /* patch 252: no live switches over a state's memory */
+        } else if (g_dashboard || getenv("NC_CHIHIRO")) {
+            nc_log("hakuX-native-trainer", "refused: not for the dashboard or a Chihiro game");
+        } else {
+            start = nc_trainer_install(&c->kernel, &c->vm, &c->xbe.info, start);
+        }
+    }
+    g_boot = nc_kernel_boot_thread(&c->kernel, c->cpu, start, stack);
     if (!g_boot) {
         return boot_failed("The emulated CPU couldn't start.");
     }
@@ -333,7 +367,8 @@ void nc_core_run(NcCore *c)
 /* Hooked guest addresses: the HLE GPU's functions and device-access sites. */
 static bool core_hook_query(void *opaque, uint32_t eip)
 {
-    return nc_x86mmio_is_site(eip) || nc_hle_hook_query(opaque, eip);
+    extern bool nc_probe_is(uint32_t eip);
+    return nc_x86mmio_is_site(eip) || nc_hle_hook_query(opaque, eip) || nc_probe_is(eip);   /* patch 361 */
 }
 
 /* A fault in translated code the core can't take as the guest's: where the

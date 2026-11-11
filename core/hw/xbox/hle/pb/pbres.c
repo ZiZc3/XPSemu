@@ -231,6 +231,9 @@ static bool yuv_define(uint32_t id, const uint32_t h5[5], const HleResDesc *d)
     c->faces = 1;
     c->arena_off = off;
     c->arena_len = total;
+    c->sign = 0;
+    c->gfmt = (uint8_t)d->fmt;
+    c->pad = 0;
     return true;
 }
 
@@ -266,14 +269,32 @@ static bool tex_desc(const uint32_t h5[5], HleResDesc *dp, HleResInfo *rip)
 /* The texels of texture d (header words h5; P8: palette pal, npal entries)
  * unswizzled or converted into the arena as object id's image (HLE_OP_TEX);
  * false if they can't be (format, memory, arena). */
+/* patch 335: depth-format textures uploaded (as floats, hle_tex_depth_convert)
+ * and compared as shadow buffers; off with XOG_FIX containing "noshadowtex"
+ * (they are then not uploaded, as before) */
+static bool shadow_tex_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XOG_FIX");
+        on = !(e && strstr(e, "noshadowtex"));
+    }
+    return on;
+}
+
 static bool tex_define(uint32_t id, const uint32_t h5[5], const HleResDesc *dp,
-                       const HleResInfo *rip, const uint32_t *pal, uint32_t npal)
+                       const HleResInfo *rip, const uint32_t *pal, uint32_t npal, uint32_t sign)
 {
     const HleResDesc d = *dp;
     const HleResInfo ri = *rip;
     const HleFmtInfo *fi = hle_fmt_info(d.fmt);
     bool p8 = d.fmt == HLE_XFMT_P8;
-    if (!fi || (fi->flags & (HLE_FI_YUV | HLE_FI_DEPTH)) || (p8 && !npal)) {
+    /* patch 335: a 2D depth texture's texels as floats (F24S8's code, the
+     * back end's R32_SFLOAT), a linear texture a linear one */
+    const bool zconv = fi && (fi->flags & HLE_FI_DEPTH) && d.kind == HLE_RK_TEXTURE &&
+                       shadow_tex_on();
+    if (!fi || (fi->flags & HLE_FI_YUV) || ((fi->flags & HLE_FI_DEPTH) && !zconv) ||
+        (p8 && !npal)) {
         /* YUV / depth textures, P8 without a palette */
         static uint32_t s_seen[8];
         for (unsigned i = 0; i < 8; i++) {
@@ -306,7 +327,13 @@ static bool tex_define(uint32_t id, const uint32_t h5[5], const HleResDesc *dp,
     uint32_t oxfmt = p8 || dxtd ? HLE_XFMT_A8R8G8B8 :
                      x4444 ? (d.fmt == HLE_XFMT_LIN_A4R4G4B4 ? HLE_XFMT_LIN_A8R8G8B8
                                                             : HLE_XFMT_A8R8G8B8) : d.fmt;
+    if (zconv) {
+        oxfmt = (fi->flags & HLE_FI_LIN) ? HLE_XFMT_LIN_F24S8 : HLE_XFMT_F24S8;
+    }
     const HleFmtInfo *ofi = hle_fmt_info(oxfmt);
+    /* patch 334: colour sign, those 8-bit channels offset binary (the texels
+     * as stored, not a conversion's) */
+    const uint32_t sxor = oxfmt == d.fmt ? hle_fmt_sign_xor(d.fmt, sign) : 0;
     uint32_t faces = d.kind == HLE_RK_CUBE ? 6 : 1, levels = MAX(ri.levels, 1u), total = 0;
     uint32_t depth = vol ? MAX(d.d, 1u) : 1;
     for (uint32_t l = 0; l < levels; l++) {
@@ -332,12 +359,13 @@ static bool tex_define(uint32_t id, const uint32_t h5[5], const HleResDesc *dp,
             uint32_t sw, sh, bo;
             hle_res_level(&d, l, &sw, &sh, &bo);
             HleXgRect img = { bo, bo, w, h };
-            /* x4444: the 16-bit texels to a scratch copy first, expanded below */
+            /* x4444: the 16-bit texels to a scratch copy first, expanded below;
+             * zconv (patch 335): the depth texels, converted below */
             uint8_t *out = dst + pos;
             uint32_t orow = row;
             g_autofree uint8_t *t16 = NULL;
-            if (x4444) {
-                orow = w * 2;
+            if (x4444 || zconv) {
+                orow = w * (fi->bpp / 8);
                 out = t16 = g_malloc((size_t)orow * h * dd);
             }
             if (dxtd && !vol) {
@@ -370,6 +398,24 @@ static bool tex_define(uint32_t id, const uint32_t h5[5], const HleResDesc *dp,
             }
             if (x4444) {
                 expand_4444((const uint16_t *)t16, (size_t)w * h * dd, (uint32_t *)(dst + pos));
+            }
+            if (zconv) {
+                hle_tex_depth_convert(d.fmt, t16, w * h * dd, dst + pos);
+            }
+            if (sxor && ofi->bpp == 32) {           /* patch 334 */
+                for (uint32_t i = 0; i + 4 <= n; i += 4) {
+                    uint32_t v;
+                    memcpy(&v, dst + pos + i, 4);
+                    v ^= sxor;
+                    memcpy(dst + pos + i, &v, 4);
+                }
+            } else if (sxor && ofi->bpp == 16) {
+                for (uint32_t i = 0; i + 2 <= n; i += 2) {
+                    uint16_t v;
+                    memcpy(&v, dst + pos + i, 2);
+                    v ^= (uint16_t)sxor;
+                    memcpy(dst + pos + i, &v, 2);
+                }
             }
             pos += n;
         }
@@ -439,6 +485,9 @@ static bool tex_define(uint32_t id, const uint32_t h5[5], const HleResDesc *dp,
     c->faces = faces;
     c->arena_off = off;
     c->arena_len = total;
+    c->sign = (uint8_t)(sxor ? sign : 0);
+    c->gfmt = (uint8_t)d.fmt;
+    c->pad = 0;
     return true;
 }
 
@@ -450,7 +499,7 @@ uint32_t hle_draw_tex_bytes(const uint32_t h5[5])
 }
 
 uint32_t hle_draw_tex_define(uint32_t id, const uint32_t h5[5], const uint32_t *pal, uint32_t npal,
-                             uint32_t *bytes)
+                             uint32_t sign, uint32_t *bytes)
 {
     HleResDesc d;
     HleResInfo ri;
@@ -458,10 +507,46 @@ uint32_t hle_draw_tex_define(uint32_t id, const uint32_t h5[5], const uint32_t *
         return 0;
     }
     *bytes = ri.bytes;
+    {   /* debug: XOG_TEXLOG=1, each texture upload (the first 3000): which textures a scene (re)uploads, and their
+         * first bytes and a sample of the middle - patch 336, Matrix's white movies */
+        static int on = -1;
+        static unsigned n;
+        if (on < 0) {
+            on = getenv("XOG_TEXLOG") != NULL;
+        }
+        {   /* debug: XOG_PSF_MOVIE=1, the draw dump (psframe) of four frames once a 512x256 A8R8G8B8 texture has
+             * been uploaded 200 times - a CPU-made movie (patch 336) */
+            static int mv = -1;
+            static unsigned ups;
+            if (mv < 0) {
+                mv = getenv("XOG_PSF_MOVIE") != NULL;
+            }
+            if (mv && d.fmt == 6 && d.w == 512 && d.h == 256 && ++ups >= 150 && ups <= 300 && ups % 5 == 0) {
+                extern void hle_draw_psframe_next(void);
+                hle_draw_psframe_next();
+                hle_log("hakuX-hle-front", "movie texture %u: upload %u, its frame's draws dumped next", id, ups);
+            }
+        }
+        if (on && n < 3000) {
+            n++;
+            const uint32_t pa = hle_res_data_pa(h5[1]);
+            const uint8_t *b0 = hle_pa_ptr(pa, ri.bytes > 16 ? 16 : ri.bytes);
+            const uint8_t *bm = ri.bytes > 32 ? hle_pa_ptr(pa + ri.bytes / 2, 8) : NULL;
+            uint32_t sum = 2166136261u;
+            const uint8_t *all = hle_pa_ptr(pa, ri.bytes);
+            for (uint32_t i = 0; all && i < ri.bytes; i += 61) {
+                sum = (sum ^ all[i]) * 16777619u;
+            }
+            hle_log("hakuX-hle-front", "texlog #%u id %u fmt %x %ux%u lv %u pa %08x %u bytes sum %08x first %02x%02x%02x%02x "
+                    "%02x%02x%02x%02x mid %02x%02x%02x%02x", n, id, d.fmt, d.w, d.h, ri.levels, pa, ri.bytes, sum,
+                    b0 ? b0[0] : 0, b0 ? b0[1] : 0, b0 ? b0[2] : 0, b0 ? b0[3] : 0, b0 ? b0[4] : 0, b0 ? b0[5] : 0,
+                    b0 ? b0[6] : 0, b0 ? b0[7] : 0, bm ? bm[0] : 0, bm ? bm[1] : 0, bm ? bm[2] : 0, bm ? bm[3] : 0);
+        }
+    }
     if (d.fmt == HLE_XFMT_YUY2 || d.fmt == HLE_XFMT_UYVY) {
         return yuv_define(id, h5, &d) ? id : 0;        /* movies: converted to A8R8G8B8 */
     }
-    return tex_define(id, h5, &d, &ri, pal, npal) ? id : 0;
+    return tex_define(id, h5, &d, &ri, pal, npal, sign) ? id : 0;
 }
 
 /* The overlay is not a texture object: the video decoder rewrites it every

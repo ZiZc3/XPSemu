@@ -145,3 +145,81 @@ int xemu_ps5_pad_pressed_source(void)
     }
     return -1;
 }
+
+/* patch 269: a game's own button mapping (see padmap_ps5.h). */
+void xemu_ps5_padmap_global(XbPadMap *m)
+{
+    for (int x = 0; x < XB__COUNT; x++) {
+        m->src[x] = (int8_t)xemu_ps5_map_get(x);
+    }
+    m->flags = 0;
+}
+
+int xemu_ps5_padmap_parse(const char *text, XbPadMap *m)
+{
+    XbPadMap t;
+    if (!text) {
+        return 0;
+    }
+    for (int x = 0; x < XB__COUNT; x++) {
+        const int c = (unsigned char)text[x] - 'a';
+        if (c < 0 || c >= PS5_SRC__COUNT) {
+            return 0;   /* also a text too short */
+        }
+        t.src[x] = (int8_t)c;
+    }
+    t.flags = 0;
+    const char *f = text + XB__COUNT;
+    if (*f == ':') {
+        f++;
+        while (*f >= '0' && *f <= '9' && t.flags < 1000) {
+            t.flags = t.flags * 10 + (*f++ - '0');
+        }
+        t.flags &= PADMAP_SWAP_STICKS | PADMAP_INVERT_RY | PADMAP_INVERT_LY;
+    }
+    if (*f && *f != '\r' && *f != '\n' && *f != ' ') {
+        return 0;
+    }
+    *m = t;
+    return 1;
+}
+
+void xemu_ps5_padmap_format(const XbPadMap *m, char *out, unsigned n)
+{
+    char t[XB__COUNT + 1];
+    for (int x = 0; x < XB__COUNT; x++) {
+        const int s = m->src[x];
+        t[x] = (char)('a' + (s >= 0 && s < PS5_SRC__COUNT ? s : k_default[x]));
+    }
+    t[XB__COUNT] = 0;
+    snprintf(out, n, "%s:%d", t, m->flags);
+}
+
+int xemu_ps5_padmap_same(const XbPadMap *a, const XbPadMap *b)
+{
+    return a->flags == b->flags && !memcmp(a->src, b->src, sizeof(a->src));
+}
+
+const char *xemu_ps5_xbox_name(int xbox)
+{
+    static const char *const names[XB__COUNT] = {
+        "A", "B", "X", "Y", "Black", "White", "Back", "Start", "Left stick click",
+        "Right stick click", "D-pad up", "D-pad down", "D-pad left", "D-pad right",
+        "Left trigger", "Right trigger",
+    };
+    return xbox >= 0 && xbox < XB__COUNT ? names[xbox] : "";
+}
+
+void xemu_ps5_padmap_describe(const XbPadMap *m, char *out, unsigned n)
+{
+    size_t at = 0;
+    out[0] = 0;
+    for (int x = 0; x < XB__COUNT && at < n; x++) {
+        at += (size_t)snprintf(out + at, n - at, "%s=%s ", k_xbox_key[x], xemu_ps5_source_name(m->src[x]));
+    }
+    if (at < n) {
+        snprintf(out + at, n - at, "| swap sticks %s, invert right stick %s, invert left stick %s",
+                 m->flags & PADMAP_SWAP_STICKS ? "on" : "off", m->flags & PADMAP_INVERT_RY ? "on" : "off",
+                 m->flags & PADMAP_INVERT_LY ? "on" : "off");
+    }
+}

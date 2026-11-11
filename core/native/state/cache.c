@@ -27,6 +27,7 @@
  */
 #include "native/kernel/kernel.h"
 #include "native/state/save.h"
+#include "native/core/hostio.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -178,17 +179,20 @@ static void index_save(const char *bdir)
     char p[700], tmp[710];
     snprintf(p, sizeof(p), "%s/index", bdir);
     snprintf(tmp, sizeof(tmp), "%s.tmp", p);
-    FILE *fp = fopen(tmp, "wb");
-    if (!fp) {
+    /* XOG patch 308: the index too: once the app's budget is used even a
+     * 1 KiB write can block for seconds (2.9 s measured). */
+    NcHostOut out;
+    const uint32_t head[2] = {INDEX_MAGIC, sizeof(IndexEntry)};
+    bool ok = nc_host_out_open(&out, tmp, 0644, true) == 0 &&
+              nc_host_write(&out, head, sizeof(head)) == (long)sizeof(head) &&
+              nc_host_write(&out, g_idx, (size_t)g_nidx * sizeof(IndexEntry)) ==
+                  (long)((size_t)g_nidx * sizeof(IndexEntry)) &&
+              nc_host_out_sync(&out) == 0;
+    ok = nc_host_out_close(&out) == 0 && ok;
+    if (ok && nc_host_rename(tmp, p) == 0) {
         return;
     }
-    const uint32_t head[2] = {INDEX_MAGIC, sizeof(IndexEntry)};
-    const bool ok = fwrite(head, sizeof(head), 1, fp) == 1 && fwrite(g_idx, sizeof(IndexEntry), g_nidx, fp) == g_nidx;
-    if (fclose(fp) == 0 && ok) {
-        rename(tmp, p);
-    } else {
-        unlink(tmp);
-    }
+    nc_host_unlink(tmp);
 }
 
 static IndexEntry *index_find(const char *key)
@@ -223,21 +227,9 @@ static void index_set(const char *key, uint64_t size, uint64_t mtime, uint64_t c
     memcpy(e->hash, hash, 16);
 }
 
-static bool write_all(int fd, const void *p, size_t n)
+static bool write_all(NcHostOut *o, const void *p, size_t n)
 {
-    const uint8_t *q = p;
-    while (n) {
-        const ssize_t w = write(fd, q, n);
-        if (w < 0 && errno == EINTR) {
-            continue;
-        }
-        if (w <= 0) {
-            return false;
-        }
-        q += w;
-        n -= (size_t)w;
-    }
-    return true;
+    return nc_host_write(o, p, n) == (long)n;
 }
 
 #define CHUNK (1u << 20)
@@ -293,7 +285,7 @@ static void *pz_piece(void *arg)
 }
 
 /* src (size bytes) to the gzip file out, hashed meanwhile (XXH3-128 into st) */
-static bool pz_file(int in, uint64_t size, int out, XXH3_state_t *st)
+static bool pz_file(int in, uint64_t size, NcHostOut *out, XXH3_state_t *st)
 {
     static const uint8_t head[10] = {0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 4, 3};
     uint8_t *buf = malloc(PZ_DICT + (size_t)PZ_THREADS * PZ_PIECE);
@@ -369,11 +361,14 @@ static bool store_file(const char *src, const char *bdir, uint8_t hash[16], uint
     char tmp[700];
     snprintf(tmp, sizeof(tmp), "%s/.tmp", bdir);
     const int in = open(src, O_RDONLY | O_CLOEXEC);
-    const int out = in >= 0 ? open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) : -1;
+    /* XOG patch 308: the blob (the biggest part of a state) goes through the
+     * un-throttled helper when it is up. */
+    NcHostOut out;
+    const bool opened = in >= 0 && nc_host_out_open(&out, tmp, 0600, true) == 0;
     struct stat isb;
     XXH3_state_t *st = XXH3_createState();
-    bool ok = in >= 0 && out >= 0 && fstat(in, &isb) == 0 && st && XXH3_128bits_reset(st) == XXH_OK &&
-              pz_file(in, (uint64_t)isb.st_size, out, st);
+    bool ok = opened && fstat(in, &isb) == 0 && st && XXH3_128bits_reset(st) == XXH_OK &&
+              pz_file(in, (uint64_t)isb.st_size, &out, st);
     const uint64_t n = ok ? (uint64_t)isb.st_size : 0;
     if (ok) {
         XXH128_canonical_t c;
@@ -383,8 +378,8 @@ static bool store_file(const char *src, const char *bdir, uint8_t hash[16], uint
     if (in >= 0) {
         close(in);
     }
-    if (out >= 0) {
-        ok = close(out) == 0 && ok;
+    if (opened) {
+        ok = nc_host_out_sync(&out) == 0 && nc_host_out_close(&out) == 0 && ok;
     }
     if (st) {
         XXH3_freeState(st);
@@ -392,14 +387,14 @@ static bool store_file(const char *src, const char *bdir, uint8_t hash[16], uint
     char final[700];
     struct stat sb;
     if (ok && blob_find(bdir, hash, n, final, sizeof(final)) != BLOB_NONE) {
-        unlink(tmp);                        /* that content is stored already */
+        nc_host_unlink(tmp);                /* that content is stored already */
     } else if (ok) {
         blob_path(bdir, hash, true, final, sizeof(final));
         *packed += stat(tmp, &sb) == 0 ? (uint64_t)sb.st_size : 0;
-        ok = rename(tmp, final) == 0;
+        ok = nc_host_rename(tmp, final) == 0;
         *stored += n;
     } else {
-        unlink(tmp);
+        nc_host_unlink(tmp);
     }
     return ok;
 }
@@ -412,9 +407,11 @@ static bool copy_blob(const char *src, int kind, uint64_t size, const char *dst)
     snprintf(tmp, sizeof(tmp), "%s.state-tmp", dst);
     const int in = open(src, O_RDONLY | O_CLOEXEC);
     gzFile gz = in >= 0 && kind == BLOB_GZ ? gzdopen(in, "rb") : NULL;   /* closes in */
-    const int out = in >= 0 ? open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0664) : -1;
+    /* XOG patch 308: state loads write the cache back through the helper too. */
+    NcHostOut out;
+    const bool opened = in >= 0 && nc_host_out_open(&out, tmp, 0664, true) == 0;
     uint8_t *buf = malloc(CHUNK);
-    bool ok = in >= 0 && (kind != BLOB_GZ || (gz && gzbuffer(gz, 256u << 10) == 0)) && out >= 0 && buf;
+    bool ok = opened && (kind != BLOB_GZ || (gz && gzbuffer(gz, 256u << 10) == 0)) && buf;
     uint64_t n = 0;
     while (ok) {
         const ssize_t r = gz ? gzread(gz, buf, CHUNK) : read(in, buf, CHUNK);
@@ -425,7 +422,7 @@ static bool copy_blob(const char *src, int kind, uint64_t size, const char *dst)
             ok = r == 0;
             break;
         }
-        ok = write_all(out, buf, (size_t)r);
+        ok = write_all(&out, buf, (size_t)r);
         n += (uint64_t)r;
     }
     if (gz) {
@@ -433,13 +430,13 @@ static bool copy_blob(const char *src, int kind, uint64_t size, const char *dst)
     } else if (in >= 0) {
         close(in);
     }
-    if (out >= 0) {
-        ok = close(out) == 0 && ok;
+    if (opened) {
+        ok = nc_host_out_sync(&out) == 0 && nc_host_out_close(&out) == 0 && ok;
     }
     free(buf);
-    ok = ok && n == size && rename(tmp, dst) == 0;
+    ok = ok && n == size && nc_host_rename(tmp, dst) == 0;
     if (!ok) {
-        unlink(tmp);
+        nc_host_unlink(tmp);
     }
     return ok;
 }
@@ -739,13 +736,13 @@ bool nc_cache_state_load(NcRd *r, unsigned v)
             char p[600];
             snprintf(p, sizeof(p), "%s/raw-partition%u.bin", nc_io_part_root((int)cp.part), cp.part);
             if (cp.raw_len) {
-                const int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0664);
-                ok = fd >= 0 && write_all(fd, raw, cp.raw_len);
-                if (fd >= 0) {
-                    close(fd);
+                NcHostOut out;
+                ok = nc_host_out_open(&out, p, 0664, true) == 0 && write_all(&out, raw, cp.raw_len);
+                if (out.fd >= 0 || out.helper > 0) {
+                    ok = nc_host_out_sync(&out) == 0 && nc_host_out_close(&out) == 0 && ok;
                 }
             } else {
-                unlink(p);
+                nc_host_unlink(p);
             }
         }
         if (ok && cp.part >= 3) {

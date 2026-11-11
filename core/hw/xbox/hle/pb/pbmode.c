@@ -25,6 +25,8 @@
 #define NV_PFIFO_CACHE1_PUSH1        0x003204u  /* bits 4:0: the channel */
 #define NV_PFIFO_CACHE1_DMA_INSTANCE 0x00322Cu  /* bits 15:0: the push buffer's DMA object >> 4 */
 #define NV_PFIFO_CACHE1_DMA_PUT      0x003240u
+uint32_t g_xog_ring_start;      /* the push buffer ring's start (nv2a.c, patch 193) */
+
 #define NV_PFIFO_CACHE1_DMA_GET      0x003244u
 #define NV_PFIFO_CACHE1_DMA_SUBROUTINE 0x00324Cu /* the return offset | 1 inside a call */
 #define NV_PGRAPH_INTR               0x400100u  /* pending; the ISR writes 1s to clear */
@@ -42,6 +44,7 @@
 #define NV_CLASS_PATTERN    0x44u
 #define NV_CLASS_SURFACES2D 0x62u
 #define NV_CLASS_BLIT       0x9Fu
+#define NV_CLASS_BETA       0x12u       /* patch 344: SET_BETA, the blit's BLEND_AND factor */
 #define PGRAPH_INTR_ERROR            (1u << 20)
 #define PGRAPH_NSOURCE_NOTIFICATION  1u
 #define NV_PRAMIN                    0x700000u
@@ -100,6 +103,8 @@ static struct {
     uint32_t sub_r[8][0x400 / 4];       /* the 2D objects' methods, by subchannel */
     uint32_t s2d[0x400 / 4];            /* the 2D surfaces' (one at a time in D3D) */
     uint64_t blits, blit_bytes, m2mfs, m2mf_bytes, copies_skipped;
+    uint32_t beta;                      /* patch 344: NV012 SET_BETA as the NV2A keeps it */
+    uint64_t blend_blits;
     volatile bool in_run;               /* debug: the decode thread is in the pusher */
     uint32_t disp_pa;                   /* hle_pb_display_start's, for the decode thread */
     bool disp_req;
@@ -570,6 +575,44 @@ static void blit(const uint32_t *r)
         g_pb.copies_skipped++;
         return;
     }
+    /* patch 344: SET_OPERATION BLEND_AND (2): the source blended over the
+     * destination by beta, colour bytes (32-bit pixels), its alpha kept, as
+     * xemu's blit; in memory (the images over either follow, as a copy's).
+     * Never written (0) or SRCCOPY (3): the copy as before. XOG_FIX noblitblend. */
+    static int s_blend = -1;
+    if (s_blend < 0) {
+        s_blend = !hle_xog_fix_word("noblitblend");
+    }
+    if (s_blend && r[0x2FC >> 2] == 2 && bpp == 4) {
+        const uint32_t slo = sbase + iy * sp + ix * bpp, dlo = dbase + oy * dp + ox * bpp;
+        const uint32_t bm = g_pb.beta >> 16, ibm = 0x7F80u - bm;   /* 0 .. 0x7F80 */
+        hle_pbd_copy_sync_next();          /* made now: the blend reads the destination */
+        const uint64_t dep = hle_pbd_copy_begin(slo, sp, dlo, dp, row, h, dbase);
+        for (uint32_t y = 0; !dep && y < h; y++) {
+            const uint8_t *sr = hle_pa_ptr(slo + y * sp, row);
+            uint8_t *dr = hle_pa_ptr(dlo + y * dp, row);
+            if (!sr || !dr) {
+                g_pb.copies_skipped++;
+                return;
+            }
+            for (uint32_t x = 0; x < w; x++) {
+                for (unsigned ch = 0; ch < 3; ch++) {
+                    dr[4 * x + ch] = (uint8_t)((sr[4 * x + ch] * bm + dr[4 * x + ch] * ibm) / 0x7F80u);
+                }
+            }
+            hle_mem_mark_written(dlo + y * dp, row);
+        }
+        hle_pbd_copy_done(dlo, dp, row, h, dep);
+        hle_pbd_blit(dbase, dp, ox, oy, w, h, dep);
+        g_pb.blits++;
+        g_pb.blend_blits++;
+        g_pb.blit_bytes += (uint64_t)row * h;
+        if (g_pb.blend_blits <= 4) {
+            hle_log("hakuX-hle-pb", "blit BLEND_AND (patch 344): %ux%u beta %08x %08x -> %08x%s", w, h,
+                    g_pb.beta, slo, dlo, dep ? " (queued: copied, not blended)" : "");
+        }
+        return;
+    }
     /* between linear render targets, their images' copy (a render target's
      * pixels are in its image); else the copy in memory, now or queued behind
      * the landings of the images it reads (pbdraw.c hle_pbd_copy_begin),
@@ -640,6 +683,11 @@ static void method_2d(unsigned subch, uint32_t m, uint32_t v)
     case NV_CLASS_BLIT:
         if (m == 0x308) {
             blit(r);
+        }
+        break;
+    case NV_CLASS_BETA:                 /* patch 344: SET_BETA (sign: 0; 8 fraction bits) */
+        if (m == 0x300) {
+            g_pb.beta = (v & 0x80000000u) ? 0 : v & 0x7F800000u;
         }
         break;
     case NV_CLASS_M2MF:
@@ -1056,8 +1104,37 @@ static void consume_pass(void)
                     hle_host_gpu_reg(NV_PFIFO_CACHE1_DMA_SUBROUTINE),
                     (unsigned long long)g_pb.sub_writes);
         }
+        if (g_pb.faults <= 4) {
+            /* what the pusher read before it: the last headers and branches (XPSemu patch 192) */
+            uint32_t hg[48], hw[48];
+            const unsigned hn = hle_pb_pusher_history(hg, hw, 48);
+            for (unsigned i = 0; i < hn; i += 6) {
+                char line[400];
+                int o = 0;
+                for (unsigned j = i; j < hn && j < i + 6; j++) {
+                    o += snprintf(line + o, sizeof(line) - (size_t)o, " %08x:%08x", hg[j], hw[j]);
+                }
+                hle_log("hakuX-hle-pb", "  before the fault:%s", line);
+            }
+        }
+        const uint32_t fault_get = p->error_get;                /* (the reset below clears it) */
         hle_pb_pusher_init(p, base, limit);                     /* the spike goes on */
         p->get = put;
+        if (e == HLE_PB_ERR_LIMIT && g_xog_ring_start && put < fault_get && getenv("NC_CHIHIRO")) {
+            /* the ring's end without a jump (Sega Chihiro's SEGABOOT): on from the ring's start to PUT, the new
+             * lap, instead of skipping it (its semaphore releases among it) (patch 193) */
+            hle_log("hakuX-hle-pb", "ring end at %08x: on from the ring's start %08x to PUT %08x", fault_get,
+                    g_xog_ring_start, put);
+            p->get = g_xog_ring_start;
+            g_pb.in_run = true;
+            e = hle_pb_pusher_run(p, put, fetch, NULL, &k_count);
+            g_pb.in_run = false;
+            if (e) {
+                hle_log("hakuX-hle-pb", "  then: %s at GET %08x (word %08x)", hle_pb_error_name(e), p->error_get, p->error_word);
+                hle_pb_pusher_init(p, base, limit);
+                p->get = put;
+            }
+        }
     }
     hle_pbd_idle();
     publish_get();

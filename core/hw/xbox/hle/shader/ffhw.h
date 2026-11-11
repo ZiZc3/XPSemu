@@ -44,7 +44,10 @@ typedef struct HleFfhwKey {
     uint8_t texgen[4][4];               /* stage, S T R Q: HLE_FFHW_TG_* */
     uint8_t texmat;                     /* SET_TEXTURE_MATRIX_ENABLE, a bit per stage */
     uint8_t points;                     /* SET_POINT_PARAMS_ENABLE */
-    uint8_t pad[6];
+    uint8_t infinite;                   /* patch 345: SET_TEXGEN_VIEW_MODEL INFINITE_VIEWER,
+                                           set only where a stage generates a sphere or
+                                           reflection map (else 0: keys as before) */
+    uint8_t pad[5];
 } HleFfhwKey;                           /* 48 bytes: three program slots */
 
 #define HLE_FFHW_SLOTS (sizeof(HleFfhwKey) / 16)

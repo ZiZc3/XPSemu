@@ -18,6 +18,7 @@
 //
 #pragma once
 #include <stdint.h>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,17 @@ bool CoverHttpGet(const std::string &url, std::string *body);
 // A JSON POST (e.g. to a local API); short timeouts. true: a 2xx reply.
 bool CoverHttpPost(const std::string &url, const std::string &json,
                    std::string *body);
+
+// A GET for the updater (blocking: call it on a thread of its own).
+// Redirects are followed host by host (each one looked up the PS5's way).
+// path: the reply saved there, else into *body. progress(got, total) as it
+// comes (total 0: not known yet). connect_s: to connect; stall_s: no data
+// for that long ends it. true: HTTP 200 and, when the server said its size,
+// all of it; else why says what went wrong.
+bool CoverHttpFetch(const std::string &url, const std::string &path,
+                    std::string *body,
+                    const std::function<void(long long, long long)> &progress,
+                    long connect_s, long stall_s, std::string *why);
 
 // The LaunchBox Games Database's background art of a game with these
 // names (a URL), or "".

@@ -101,4 +101,6 @@ int hle_pb_pusher_run(HlePusher *p, uint32_t put, HlePbFetch fetch, void *fetch_
 
 const char *hle_pb_error_name(int e);
 
+unsigned hle_pb_pusher_history(uint32_t *gets, uint32_t *words, unsigned cap);   /* XPSemu patch 192 */
+
 #endif

@@ -30,6 +30,14 @@
 static bool g_apu_stats;
 static int g_apu_fifo_min = INT_MAX, g_apu_fifo_max;
 extern uint32_t g_vp_oob_clamps;
+/* XOG patch 253 (ps5/src/ff_ps5.c): the frames' pacing on the guest's clock, twice as fast while fast-forward is
+ * on; the output (apu_out_ps5.c) then drains twice as fast and plays silence */
+uint64_t nc_ff_now_ns(void);
+unsigned nc_ff_mul(void);
+static inline int64_t apu_pace_us(void)
+{
+    return (int64_t)(nc_ff_now_ns() / 1000);
+}
 extern uint32_t g_vp_held_skips, g_vp_held_waits, g_vp_held_wait_max_us, g_vp_held_run_max; /* vp.c voice_take */
 /* NC_APU_TRAP_PARK=1: the frames stop while the FE is trapped (frames_stopped) */
 static bool g_trap_park;
@@ -292,12 +300,12 @@ static void apu_mmio_write(void *opaque, uint32_t off, uint64_t value, unsigned 
 static void sleep_until(MCPXAPUState *d, int64_t deadline_us)
 {
     while (!apu_ld(&d->exiting)) {
-        int64_t remaining_us = deadline_us - apu_host_us();
+        int64_t remaining_us = deadline_us - apu_pace_us();
         if (remaining_us <= 50) {
             break;
         }
         pthread_mutex_unlock(&d->lock);
-        usleep((useconds_t)MIN(remaining_us, EP_FRAME_US));
+        usleep((useconds_t)(MIN(remaining_us, EP_FRAME_US) / nc_ff_mul()));
         pthread_mutex_lock(&d->lock);
     }
 }
@@ -311,10 +319,10 @@ static void throttle(MCPXAPUState *d)
      * CPU time in that spin). */
     if (d->ep_frame_div % 8) {
         if (d->pace_gp && d->monitor.fifo_capacity_bytes > 0) {
-            int64_t t0 = apu_host_us();
+            int64_t t0 = apu_pace_us();
             sleep_until(d, d->next_frame_time_us);
             d->next_frame_time_us += GP_FRAME_US;
-            d->sleep_acc_us += apu_host_us() - t0;
+            d->sleep_acc_us += apu_pace_us() - t0;
         }
         return;
     }
@@ -324,7 +332,7 @@ static void throttle(MCPXAPUState *d)
         return;
     }
 
-    int64_t start_us = apu_host_us();
+    int64_t start_us = apu_pace_us();
     int queued_bytes = apu_out_queued();
 
     while (!apu_ld(&d->exiting) && !nc_paused() &&
@@ -339,7 +347,7 @@ static void throttle(MCPXAPUState *d)
     /* Above the low watermark, frames are paced in real time (one GP frame
      * per GP_FRAME_US). */
     if (queued_bytes > d->monitor.queued_bytes_low) {
-        int64_t now_us = apu_host_us();
+        int64_t now_us = apu_pace_us();
         if (d->next_frame_time_us == 0 ||
             now_us - d->next_frame_time_us > EP_FRAME_US) {
             d->next_frame_time_us = now_us;
@@ -357,7 +365,7 @@ static void throttle(MCPXAPUState *d)
         d->next_frame_time_us = start_us;
     }
 
-    d->sleep_acc_us += apu_host_us() - start_us;
+    d->sleep_acc_us += apu_pace_us() - start_us;
 }
 
 /* Once a second, from the frame thread: states of the guest's that last,

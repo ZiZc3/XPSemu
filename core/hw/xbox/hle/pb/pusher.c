@@ -8,6 +8,29 @@
 /* Branches in a row without a method before the stream counts as lost. */
 #define BRANCH_MAX 65536u
 
+/* The last headers and branches read (GET, word): logged with a fault (XPSemu patch 192). */
+#define HIST 48u
+static uint32_t g_hist_get[HIST], g_hist_word[HIST];
+static unsigned g_hist_at;
+
+static void hist(uint32_t get, uint32_t word)
+{
+    g_hist_get[g_hist_at % HIST] = get;
+    g_hist_word[g_hist_at % HIST] = word;
+    g_hist_at++;
+}
+
+unsigned hle_pb_pusher_history(uint32_t *gets, uint32_t *words, unsigned cap)
+{
+    const unsigned n = g_hist_at < HIST ? g_hist_at : HIST;
+    unsigned k = 0;
+    for (unsigned i = g_hist_at - n; i < g_hist_at && k < cap; i++, k++) {
+        gets[k] = g_hist_get[i % HIST];
+        words[k] = g_hist_word[i % HIST];
+    }
+    return k;
+}
+
 void hle_pb_pusher_init(HlePusher *p, uint32_t dma_base, uint32_t dma_limit)
 {
     memset(p, 0, sizeof(*p));
@@ -125,6 +148,7 @@ int hle_pb_pusher_run(HlePusher *p, uint32_t put, HlePbFetch fetch, void *fetch_
             }
             p->branches++;
             p->words++;
+            hist(p->get, w);
             if ((w & 0xE0000003u) == 0x20000000u) {        /* old jump */
                 p->get = w & 0x1FFFFFFCu;
             } else if ((w & 3) == 1) {                      /* jump */
@@ -156,6 +180,7 @@ int hle_pb_pusher_run(HlePusher *p, uint32_t put, HlePbFetch fetch, void *fetch_
             return fail(p, HLE_PB_ERR_INVALID, w);
         }
         branches = 0;
+        hist(p->get, w);
         p->get += 4;
         p->words++;
         p->headers++;

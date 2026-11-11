@@ -63,6 +63,9 @@ typedef struct HleCmdOverlay {
     uint32_t on, arena_off, w, h;
     int32_t src[4], dst[4];     /* left, top, right, bottom */
     uint32_t fb_w, fb_h;
+    /* patch 337: PVIDEO_FORMAT DISPLAY colour key: the overlay shows only
+     * where the frame's pixel is key (0x00RRGGBB, alpha ignored); 0 off */
+    uint32_t key_on, key;
 } HleCmdOverlay;
 
 /* SetGammaRamp: D3DGAMMARAMP (red, green, blue [256] bytes); applied from
@@ -155,6 +158,13 @@ typedef struct HleCmdViewport {
      * instead of the viewport (the NV2A surface clip); clip 0 = the viewport */
     uint32_t clip;
     int32_t cx1, cy1, cx2, cy2;
+    /* patch 339: the NV2A window clip (8 rectangles, inclusive or exclusive)
+     * as nclip > 1 disjoint rectangles (x1, y1, x2, y2: target pixels, inside
+     * the clip above, their bounding box), each draw drawn once per one under
+     * its scissor; 0 or 1: the clip above alone (as before) */
+#define HLE_VP_CLIP_RECTS 16
+    uint32_t nclip;
+    int32_t crect[HLE_VP_CLIP_RECTS][4];
 } HleCmdViewport;
 
 typedef struct HleRect {
@@ -238,6 +248,22 @@ typedef struct HleCmdReadback {
 #define HLE_TSS_STAGES 4
 #define HLE_TSS_COUNT  32       /* per stage */
 
+/* Push-buffer mode's NV2A state in places D3D's tables have that it never
+ * fills (pb/kelvin.c; 0, a register never written, is the state as before):
+ * patch 338: SET_CLIP_MIN / MAX (float bits, depth-buffer units), the
+ * control: bit 0 either written, bit 1 SET_ZMIN_MAX_CONTROL ZCLAMP_EN CULL
+ * (else CLAMP); patch 341: raster: bits 0-1 the front faces' polygon mode,
+ * 2-3 the back faces' (0 fill, 1 point, 2 line), bit 4 SET_PROVOKING_VERTEX
+ * written LAST. Per texture stage: patch 340 SET_COLOR_KEY_COLOR; patch
+ * 342/343 bits: 0 the convolution filter (MIN 7: quincunx, gaussian), 16-19
+ * MAX_LOD_CLAMP + 1 where below 15 (0: none). */
+#define HLE_RS_X_ZCTL    160
+#define HLE_RS_X_CLIPMIN 161
+#define HLE_RS_X_CLIPMAX 162
+#define HLE_RS_X_RASTER  163
+#define HLE_TSS_X_KEYCOLOR 30
+#define HLE_TSS_X_EXT      31
+
 typedef struct HleCmdState {
     uint32_t rs[HLE_RS_COUNT];
     uint32_t tss[HLE_TSS_STAGES][HLE_TSS_COUNT];
@@ -264,7 +290,13 @@ typedef struct HleCmdTex {
     uint32_t xfmt;              /* X_D3DFORMAT code */
     uint32_t w, h, d, levels, faces;
     uint32_t arena_off, arena_len;
-    uint32_t pad;
+    uint8_t sign;               /* patch 334: colour sign bits its texels were converted
+                                   for, those 8-bit channels offset binary (tex/xdk_res.h
+                                   hle_fmt_sign_xor); 0 none */
+    uint8_t gfmt;               /* patch 334/335: the guest's format code the texels came
+                                   from (xfmt is a conversion's for P8, YUV, DXT, 4444
+                                   and depth) */
+    uint16_t pad;
 } HleCmdTex;
 
 #define HLE_DRAW_MAX_BIND 16

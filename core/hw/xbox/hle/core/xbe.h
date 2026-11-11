@@ -12,6 +12,9 @@
 #define HLE_XBE_ENTRY_KEY_DEBUG  0x94859D4Bu
 #define HLE_XBE_THUNK_KEY_RETAIL 0x5B6D40B6u
 #define HLE_XBE_THUNK_KEY_DEBUG  0xEFB1F152u
+/* Sega Chihiro (XPSemu patch 185; values from Cxbx-Reloaded) */
+#define HLE_XBE_ENTRY_KEY_CHIHIRO 0x40B5C16Eu
+#define HLE_XBE_THUNK_KEY_CHIHIRO 0x2290059Du
 
 #define HLE_XBE_SEC_WRITABLE   0x01u
 #define HLE_XBE_SEC_PRELOAD    0x02u
@@ -44,6 +47,7 @@ typedef struct HleXbeInfo {
     uint32_t entry;          /* decoded */
     uint32_t kernel_thunk;   /* decoded */
     bool     debug_keys;
+    bool     chihiro_keys;   /* a Sega Chihiro XBE (SEGABOOT, the games) */
     bool     plain_entry;    /* stored unencoded (guest-memory header) */
     uint32_t title_id;
     unsigned nsections;

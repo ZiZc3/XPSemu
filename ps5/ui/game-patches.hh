@@ -72,6 +72,9 @@ std::string PatchGroupId(const PatchFile &file, const PatchGroup &group);
 
 // The CRC32 of a game's default.xbe (what patch files name on their
 // version= line); false if it can't be read.
+// Patch 244: a frame rate mod (/app0/mods/.../mod.txt) fits this disc's default.xbe: every checked line of its
+// [default.xbe] part finds the bytes it expects (at least one line)
+bool PatchModFits(const std::string &mod_txt, const std::string &iso_path, uint64_t xbe_offset, uint32_t xbe_size);
 bool PatchXbeCrc(const std::string &iso_path, uint64_t xbe_offset,
                  uint32_t xbe_size, uint32_t *crc);
 

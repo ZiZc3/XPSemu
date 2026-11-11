@@ -27,6 +27,7 @@ static struct {
     pthread_cond_t *wake;
     int handle;
     volatile bool paused;
+    volatile bool ff;       /* patch 253: fast-forward: two blocks taken a block's time, silence played */
     uint32_t callbacks, short_callbacks;
 } g_out;
 
@@ -77,6 +78,13 @@ static void *out_thread(void *arg)
             if (got < RX_BYTES) {
                 __atomic_add_fetch(&g_out.short_callbacks, 1, __ATOMIC_RELAXED);
             }
+            if (g_out.ff) {
+                /* patch 253: the APU makes its frames twice as fast: a second block taken too, both muted */
+                const uint64_t t2 = g_out.tail;
+                const uint64_t more = __atomic_load_n(&g_out.head, __ATOMIC_ACQUIRE) - t2;
+                __atomic_store_n(&g_out.tail, t2 + (more < RX_BYTES ? more : RX_BYTES), __ATOMIC_RELEASE);
+                got = 0;
+            }
         }
         memset(block + got, 0, (size_t)(RX_BYTES - got));
         if (g_out.wake) {
@@ -117,4 +125,11 @@ int apu_out_open(int capacity_bytes, int samples, pthread_cond_t *wake)
 void nc_audio_set_paused(bool on)
 {
     g_out.paused = on;
+}
+
+/* patch 253: fast-forward: the game's sound muted (the quick menu's pause stops the output; this drains it at
+ * the APU's x2 pace instead, so the APU isn't held to real time) */
+void nc_audio_set_ff(bool on)
+{
+    g_out.ff = on;
 }

@@ -20,13 +20,26 @@
 #include "game-patches.hh"
 #include "xiso.hh"
 #include "xog_ui.h"
+#include "trainers.hh"
 
 #include "data/RobotoCondensed-Regular.ttf.h"
 #include "blades-art.h"
 #include <stb_image.h>
 #include <math.h>
 
+extern "C" void hle_draw_psframe_after(unsigned delay, unsigned count);   // patch 358 (debug)
+
 extern "C" {
+// patch 234: the controller's rumble on or off (main_ps5.c reads it), from Settings, for every game
+volatile int g_rx_vibration = 1;
+// patch 266: the adaptive triggers on or off (main_ps5.c reads it), from Settings, for every game
+volatile int g_rx_triggers = 1;     // patch 303: On by default (user)
+// main_ps5.c: this game's trigger kind now (0 off, 1 heavy/driving, 2 trigger/shooter), as its start line set it
+void xog_set_trigger_kind(int kind);
+void xog_set_turbo(int mask);     /* patch 324: turbo buttons, at once */
+void xog_set_msaa(int samples);   /* patch 326: MSAA, at once (between the renderer's passes) */
+void xog_set_a2c(int on);         /* patch 354: MSAA smooth cut-outs, at once */
+void xog_set_ssao(int level);     /* patch 363: ambient occlusion, at once (the next frame) */
 // qm_glue_ps5.c: the game's Vulkan, as the menu needs it
 void xog_qm_vk(VkInstance *inst, VkPhysicalDevice *phys, VkDevice *dev, VkQueue *queue, uint32_t *family, VkFormat *fmt);
 void hle_vk_queue_lock(void);
@@ -37,6 +50,9 @@ void nc_pause_set(bool on);
 void nc_audio_set_paused(bool on);
 void nc_present_set_aspect(int mode);
 void nc_present_set_upscale(int mode);
+void nc_present_set_cas(int level);         // patch 247: these three live
+void nc_present_set_crt(int mode);
+void hle_vk_set_texsharp(int level);
 void nc_present_set_fxaa(bool on);
 void nc_present_set_smaa(bool on);
 void hle_pb_set_fps_cap(int fps);
@@ -54,6 +70,18 @@ void nc_present_stats(float *fps, float *avg_ms, float *last_ms);
 int sceKernelAvailableFlexibleMemorySize(size_t *available);
 const char *nc_state_save(const char *path);
 bool hle_present_current(VkImage *img, uint32_t *w, uint32_t *h);
+// patch 252: trainer options live (native/core/trainer.c)
+int nc_trainer_live(char *why, size_t n);
+int nc_trainer_live_bits(char *out, size_t n);
+int nc_trainer_live_overlap(unsigned i, unsigned j);
+unsigned nc_trainer_live_bytes(unsigned i);
+int nc_trainer_live_set(unsigned i, int on, char *msg, size_t n);
+// patch 253: fast-forward (ps5/src/ff_ps5.c)
+extern volatile int g_xog_ff;
+void nc_ff_off(const char *why);
+void nc_ff_set(bool on, const char *why);
+bool nc_ff_allowed(void);
+volatile int g_qm_ff_dirty;         // fast-forward switched: the list again, with or without the badge
 
 volatile int g_qm_open;             // the picture's thread looks at this each refresh
 volatile int g_qm_overlay;          // side art or the counter: it looks for them too
@@ -66,13 +94,26 @@ volatile int g_qm_stick_y, g_qm_stick_x;
 
 namespace {
 
-enum Row { R_RESUME, R_SAVE, R_LOAD, R_RENAME, R_DELETE, R_VOLUME, R_FPS, R_SHAPE, R_UPSCALE, R_AA, R_FG, R_CAP, R_PAL60, R_UNLOCK60, R_RESTART, R_SAVEHOME, R_HOME, R__COUNT,
-           R_G_STATES = 100, R_G_SETTINGS, R_G_PERF, R_G_LEAVE };
-static const struct { const char *name; int rows[6], count; } kGroups[] = {
+enum Row { R_RESUME, R_SAVE, R_LOAD, R_RENAME, R_DELETE, R_VOLUME, R_FPS, R_SHAPE, R_UPSCALE, R_AA, R_FG, R_CAP, R_PAL60, R_UNLOCK60, R_RESTART, R_SAVEHOME, R_HOME, R_VIBRATION, R_AF,
+           R_CAS, R_TEXSHARP, R_CRT,    // patch 247
+           R_FF,                        // patch 255: fast-forward (was a touchpad swipe)
+           R_TRIGGERS,                  // patch 266: adaptive triggers, for every game (Settings)
+           R_TURBO,                     // patch 324: this game's turbo buttons (Settings), live
+           R_MSAA,                      // patch 326: this game's MSAA (Picture), live
+           R_A2C,                       // patch 354: this game's MSAA smooth cut-outs (Picture), live
+           R_SSAO,                      // patch 363: this game's ambient occlusion (Picture), live
+           R__COUNT,
+           R_TOPT = 40,     // a trainer's options: R_TOPT + i, up to R_TOPT_MAX (patch 246)
+           R_G_STATES = 100, R_G_SETTINGS, R_G_PERF, R_G_LEAVE, R_G_TRAINER, R_G_PICTURE };
+enum { R_TOPT_MAX = 60 };
+// patch 247: the picture's rows in a group of their own; shown in kOrder's order (VisibleRows)
+static const struct { const char *name; int rows[8], count; } kGroups[] = {
     { "Save states", { R_SAVE, R_LOAD, R_RENAME, R_DELETE }, 4 },
-    { "Settings", { R_VOLUME, R_FPS, R_SHAPE, R_UPSCALE }, 4 },
-    { "Performance", { R_UNLOCK60, R_FG, R_CAP, R_AA, R_PAL60 }, 5 },
+    { "Settings", { R_VOLUME, R_FPS, R_VIBRATION, R_TRIGGERS, R_TURBO, R_FF, R_CRT }, 7 },   // patch 366: CRT here (user)
+    { "Performance", { R_UNLOCK60, R_FG, R_CAP, R_PAL60 }, 4 },
     { "Leave the game", { R_RESTART, R_SAVEHOME, R_HOME }, 3 },
+    { "Trainer", { 0 }, 0 },    // patch 246: its rows are the trainer's options (VisibleRows)
+    { "Picture", { R_SHAPE, R_UPSCALE, R_AA, R_MSAA, R_AF, R_SSAO }, 6 },   // patch 366: smooth cut-outs always on, no row; CRT to Settings (user)   // patch 326: MSAA; 354: its smooth cut-outs; 363: ambient occlusion   // patch 251: no texture sharpness; 277: no CAS sharpness (user: it stays at 1.00)
 };
 enum { SLOTS = 10, THUMB_W = 480, THUMB_H = 270 };
 enum { B_OPTIONS = 0x8, B_TRIANGLE = 0x1000, B_SQUARE = 0x8000, B_UP = 0x10, B_RIGHT = 0x20, B_DOWN = 0x40, B_LEFT = 0x80, B_CIRCLE = 0x2000, B_CROSS = 0x4000, B_TOUCH = 0x00100000 };
@@ -101,11 +142,30 @@ struct Menu {
     std::vector<std::string> lines;
     std::string name, key;
     int aa = 0;     // 0 off, 1 FXAA, 2 SMAA, 3 SSAA
+    bool ff_want = false;       // patch 255: fast-forward chosen in Settings (on again each time the menu closes)
     bool fg_started = false;    // this start has frame generation
     int cap = 0;                // the FPS cap, 0: none
     int cap_started = 0;        // the one this start runs with
+    int af = 0, af_started = 0; // anisotropic filtering (0 off, 2 to 16), and this start's: samplers are made once (patch 241)
+    // patch 246: this run's trainer (trainer=), its option names, and the options as started and as now
+    std::string tr_path, tr_opts, tr_opts_started;
+    std::vector<std::string> tr_names;
+    bool tr_dirty = false;
     bool kb_cap = false;        // the keyboard is typing it
-    int volume = 10, fps = 1, shape = 0, upscale = 1;   // shape: 0 auto, 1 4:3, 2 16:9, 3 stretch
+    int volume = 10, fps = 1, shape = 0, upscale = 1;   // shape: 0 auto, 1 4:3, 2 16:9, 3 stretch; upscale: 0 smooth, 1 sharp, 2 CAS
+    int cas = 2, texsharp = 0, crt = 0;                 // patch 247: CAS's sharpness 0-4, texture sharpness 0-3, CRT filter 0-2
+    // this game's own adaptive triggers (GAME_DEFAULT: Auto), the same value as its game settings' Controller row
+    int trig = GAME_DEFAULT;
+    bool trig_read = false;
+    int turbo = GAME_DEFAULT;   // patch 324: this game's turbo buttons (GAME_DEFAULT = Off), as its game settings
+    bool turbo_read = false;
+    int msaa = GAME_DEFAULT;    // patch 326: this game's MSAA (GAME_DEFAULT = Off), as its game settings
+    bool msaa_read = false;
+    int a2c = GAME_DEFAULT;     // patch 354: this game's MSAA smooth cut-outs (GAME_DEFAULT = On), as its game settings
+    bool a2c_read = false;
+    int ssao = GAME_DEFAULT;    // patch 363: this game's ambient occlusion (GAME_DEFAULT = Off), as its game settings
+    bool ssao_read = false;
+    bool chihiro = false;       // a Chihiro run: the triggers row stays Settings' on/off
     ImFont *font = nullptr;
     // states
     int slot = 1;
@@ -132,6 +192,82 @@ struct Menu {
     double note_until = 0;
 } g;
 
+// This game's own adaptive triggers choice (GAME_DEFAULT: Auto), read once from its game settings: the
+// quick menu's row and the game settings' Controller row are the same value.
+// patch 324: this game's turbo buttons, read once from its game settings (the same value as its Controller row)
+static int TurboChoice()
+{
+    if (!g.turbo_read && !g.key.empty()) {
+        g.turbo_read = true;
+        g.turbo = GameProfileLoad(g.key).value[GO_TURBO];
+    }
+    return g.turbo;
+}
+
+// patch 326: this game's MSAA, read once from its game settings (the same value as its Picture row)
+static int MsaaChoice()
+{
+    if (!g.msaa_read && !g.key.empty()) {
+        g.msaa_read = true;
+        g.msaa = GameProfileLoad(g.key).value[GO_MSAA];
+    }
+    return g.msaa;
+}
+
+// patch 354: this game's MSAA smooth cut-outs, read once from its game settings (the same value as its Picture row)
+static int A2cChoice()
+{
+    if (!g.a2c_read && !g.key.empty()) {
+        g.a2c_read = true;
+        g.a2c = GameProfileLoad(g.key).value[GO_A2C];
+    }
+    return g.a2c;
+}
+
+// patch 363: this game's ambient occlusion, read once from its game settings (the same value as its Picture row)
+static int SsaoChoice()
+{
+    if (!g.ssao_read && !g.key.empty()) {
+        g.ssao_read = true;
+        g.ssao = GameProfileLoad(g.key).value[GO_SSAO];
+    }
+    return g.ssao;
+}
+
+static int TrigChoice()
+{
+    if (!g.trig_read && !g.key.empty()) {
+        g.trig_read = true;
+        g.trig = GameProfileLoad(g.key).value[GO_TRIGGERS];
+    }
+    return g.trig;
+}
+
+// What keeps the overlay pass on over a running game: side art, the counter, a Chihiro run (its crosshair),
+// fast-forward's badge (patch 253)
+int OverlayWanted()
+{
+    return g.fps || g.sides || getenv("NC_CHIHIRO") != nullptr || g_xog_ff;
+}
+
+// patch 253: fast-forward's badge, top right: two triangles and "x2" (the font has no fast-forward glyph)
+void DrawFastForward(ImDrawList *dl, float W, float s)
+{
+    ImFont *f = g.font;
+    const float size = 34 * s, pad = 14 * s, tri = 26 * s;
+    const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0, "x2");
+    const float w = pad + 2 * tri * 0.8f + 10 * s + ts.x + pad, h = pad + std::max(ts.y, tri) + pad - 6 * s;
+    const ImVec2 p1(W - 30 * s, 30 * s + h), p0(p1.x - w, 30 * s);
+    dl->AddRectFilled(p0, p1, IM_COL32(0, 20, 0, 153), 10 * s);
+    const ImU32 col = IM_COL32(205, 245, 45, 255);
+    const float cy = (p0.y + p1.y) / 2, tx = p0.x + pad;
+    for (int i = 0; i < 2; i++) {
+        const float x = tx + i * tri * 0.8f;
+        dl->AddTriangleFilled(ImVec2(x, cy - tri / 2), ImVec2(x + tri * 0.8f, cy), ImVec2(x, cy + tri / 2), col);
+    }
+    dl->AddText(f, size, ImVec2(tx + 2 * tri * 0.8f + 10 * s, cy - ts.y / 2), col, "x2");
+}
+
 // Off to on, or on to Off: the 120 Hz mode is taken at the start.
 bool FgRestartDue()
 {
@@ -149,12 +285,83 @@ std::string ModAvail()
     return "";
 }
 
+bool TrainerActive()
+{
+    return !g.tr_path.empty() && !g.tr_names.empty();
+}
+
+bool IsTrainerRow(int row)
+{
+    return row >= R_TOPT && row < R_TOPT + R_TOPT_MAX && row - R_TOPT < (int)g.tr_names.size();
+}
+
+// patch 252: this run's trainer switches live (else its options apply on restart, why says why)
+bool TrainerLive(std::string *why = nullptr)
+{
+    char w[200] = "";
+    const bool live = nc_trainer_live(w, sizeof(w)) == 1;
+    if (why) {
+        *why = w;
+    }
+    return live;
+}
+
+// patch 252: the help line under the list for a trainer's option row
+std::string TrainerHelp(int k)
+{
+    std::string why;
+    if (!TrainerLive(&why)) {
+        return "Applies when the game restarts (Leave the game > Restart).";
+    }
+    std::string others;
+    for (int j = 0; j < (int)g.tr_names.size(); j++) {
+        if (j != k && nc_trainer_live_overlap((unsigned)k, (unsigned)j)) {
+            others += (others.empty() ? "" : ", ") + g.tr_names[j];
+        }
+    }
+    std::string s = nc_trainer_live_bytes((unsigned)k) ? "Cross: On/Off now (writes the game's code)" : "Cross: On/Off now";
+    if (!others.empty()) {
+        s += ". Same bytes as: " + others + " (one on turns it off)";
+    }
+    return s;
+}
+
 std::vector<int> VisibleRows()
 {
     std::vector<int> rows = { R_RESUME };
-    for (int i = 0; i < 4; i++) {
+    if (getenv("XOG_XBOX_DASH")) {
+        rows.push_back(R_HOME);     // patch 259 (user): the Xbox dashboard isn't a game: Resume and Back to home only
+        return rows;
+    }
+    // Sega Chihiro (patch 210, the user's): no save states, the safer way: the group and "Save and go home" hidden
+    static const bool chihiro = getenv("NC_CHIHIRO") != nullptr;
+    static const int kOrder[6] = { 0, 1, 5, 2, 4, 3 };  // Picture (patch 247) after Settings; Trainer (patch 246) before Leave the game
+    for (int oi = 0; oi < 6; oi++) {
+        const int i = kOrder[oi];
+        if (i == 4) {   // only when this run has a trainer
+            if (TrainerActive()) {
+                rows.push_back(R_G_TRAINER);
+                for (int k = 0; g.group == 4 && k < (int)g.tr_names.size() && k < R_TOPT_MAX; k++) {
+                    rows.push_back(R_TOPT + k);
+                }
+            }
+            continue;
+        }
+        if (chihiro && i == 0) {
+            continue;
+        }
         rows.push_back(R_G_STATES + i);
         for (int k = 0; i == g.group && k < kGroups[i].count; k++) {
+            if (chihiro && (kGroups[i].rows[k] == R_SAVEHOME || kGroups[i].rows[k] == R_FG ||
+                            kGroups[i].rows[k] == R_MSAA || kGroups[i].rows[k] == R_A2C)) {     // patch 326: no MSAA row for Chihiro either   // + no Frame Generation for Chihiro (patch 231)
+                continue;
+            }
+            if (kGroups[i].rows[k] == R_FF && !nc_ff_allowed()) {     // patch 255: Settings > Advanced > Fast-forward on (never Chihiro)
+                continue;
+            }
+            if (kGroups[i].rows[k] == R_CAS && g.upscale != 2) {     // CAS's sharpness only with CAS
+                continue;
+            }
             if ((kGroups[i].rows[k] != R_PAL60 || rx_game_is_pal()) &&
                 (kGroups[i].rows[k] != R_UNLOCK60 || Unlock60Known(g.key) || !ModAvail().empty())) {
                 rows.push_back(kGroups[i].rows[k]);
@@ -677,11 +884,27 @@ const char *ShapeOption(int s)
 void Remember()
 {
     SetLine("aspect=", ShapeOption(g.shape));
-    SetLine("upscale=", g.upscale ? "sgsr" : "bilinear");
-    SetLine("aa=", g.aa == 1 ? "fxaa" : g.aa == 2 ? "smaa" : g.aa == 3 ? "ssaa" : "off");
+    SetLine("upscale=", g.upscale == 2 ? "cas" : g.upscale ? "sgsr" : "bilinear");
+    SetLine("cas=", std::to_string(g.cas));
+    SetLine("texsharp=", std::to_string(g.texsharp));
+    SetLine("crt=", std::to_string(g.crt));
+    SetLine("aa=", g.aa == 1 ? "fxaa" : g.aa == 2 ? "smaa" : g.aa == 3 ? "ssaa" : g.aa == 4 ? "ssaa+smaa" : "off");
+    SetLine("af=", std::to_string(g.af));
     SetLine("fpscap=", std::to_string(g.cap));
     SetLine("volume=", std::to_string(g.volume));
     SetLine("fps=", std::to_string(g.fps));
+    if (TrainerActive()) {      // patch 246: the options as set here, for a restart and the next start
+        SetLine("trainer_opts=", g.tr_opts);
+        if (g.tr_dirty && !g.key.empty()) {
+            TrainerChoice c = TrainerChoiceLoad(g.key);
+            c.file = g.tr_path;
+            c.on = true;
+            c.opts = g.tr_opts;
+            TrainerChoiceSave(g.key, c);
+            nc_log("xog-qm", "trainer options saved: %s", g.tr_opts.c_str());
+        }
+        g.tr_dirty = false;
+    }
     if (!g.changed || g.key.empty()) {
         return;
     }
@@ -696,13 +919,40 @@ void Remember()
         p.value[GO_OVERLAY] = g.fps;
     }
     if (d(R_UPSCALE)) {
-        p.value[GO_FILTER] = g.upscale ? CONFIG_UPSCALE_SHARP : CONFIG_UPSCALE_SMOOTH;
+        p.value[GO_FILTER] = g.upscale == 2 ? CONFIG_UPSCALE_CAS : g.upscale ? CONFIG_UPSCALE_SHARP : CONFIG_UPSCALE_SMOOTH;
+    }
+    if (d(R_CAS)) {
+        p.value[GO_CAS] = g.cas;
+    }
+    if (d(R_TEXSHARP)) {
+        p.value[GO_TEXSHARP] = g.texsharp;
+    }
+    if (d(R_CRT)) {
+        p.value[GO_CRT] = g.crt;
     }
     if (d(R_AA)) {
         p.value[GO_AA] = g.aa;
     }
     if (d(R_CAP)) {
         p.value[GO_FPS_CAP] = g.cap;
+    }
+    if (d(R_AF)) {
+        p.value[GO_AF] = g.af;
+    }
+    if (d(R_TRIGGERS)) {
+        p.value[GO_TRIGGERS] = g.trig;      // the game settings' Controller row shows the same
+    }
+    if (d(R_TURBO)) {
+        p.value[GO_TURBO] = g.turbo;        // patch 324: so does its Turbo buttons row
+    }
+    if (d(R_MSAA)) {
+        p.value[GO_MSAA] = g.msaa;          // patch 326: and its MSAA row (the next start's too)
+    }
+    if (d(R_A2C)) {
+        p.value[GO_A2C] = g.a2c;            // patch 354: and its MSAA smooth cut-outs row
+    }
+    if (d(R_SSAO)) {
+        p.value[GO_SSAO] = g.ssao;          // patch 363: and its ambient occlusion row
     }
     if (d(R_SHAPE)) {
         p.value[GO_FIT] = g.shape == 3 ? CONFIG_DISPLAY_UI_FIT_STRETCH : CONFIG_DISPLAY_UI_FIT_SCALE;
@@ -722,6 +972,9 @@ void Close()
     g.closing = true;
     g.closed = Now();
     nc_log("xog-qm", "closed");
+    if (getenv("XOG_PSF_QM")) {        // patch 358 (debug): the next frames' draws, the ones a player saw flicker
+        hle_draw_psframe_after(60, 4);
+    }
     if (getenv("XOG_DUMP")) {
         hle_back_rtdump_next();
         hle_draw_psframe_next();
@@ -731,6 +984,39 @@ void Close()
 
 void Change(int dir)
 {
+    if (IsTrainerRow(g.row)) {      // patch 246: an option On/Off (used from a restart)
+        (void)dir;
+        const int k = g.row - R_TOPT;
+        g.tr_opts.resize(g.tr_names.size(), '0');
+        if (TrainerLive()) {        // patch 252: written into the game now, no restart
+            const bool on = g.tr_opts[k] != '1';
+            char msg[200] = "";
+            const int r = nc_trainer_live_set((unsigned)k, on ? 1 : 0, msg, sizeof(msg));
+            if (r == 1) {
+                char bits[128] = "";
+                if (nc_trainer_live_bits(bits, sizeof(bits)) > 0) {
+                    g.tr_opts = bits;
+                    g.tr_opts.resize(g.tr_names.size(), '0');
+                }
+                g.tr_opts_started = g.tr_opts;  // the running game has them: nothing to restart for
+                g.tr_dirty = true;
+                g.armed_row = -1;
+                Note(g.tr_names[k] + (on ? ": On" : ": Off") + (msg[0] ? std::string(". ") + msg : std::string()), Now());
+                nc_log("xog-qm", "trainer option %d %s live: %s", k + 1, on ? "on" : "off", g.tr_opts.c_str());
+                return;
+            }
+            if (r < 0) {
+                Note(std::string("Not switched: ") + msg, Now());
+                nc_log("xog-qm", "trainer option %d not switched: %s", k + 1, msg);
+                return;
+            }
+            // r == 0: not live after all, the restart way below
+        }
+        g.tr_opts[k] = g.tr_opts[k] == '1' ? '0' : '1';
+        g.tr_dirty = true;
+        g.armed_row = -1;
+        return;
+    }
     switch (g.row) {
     case R_SAVE:
     case R_LOAD:
@@ -744,10 +1030,115 @@ void Change(int dir)
         g.volume = std::clamp(g.volume + dir, 0, 10);
         rx_audio_volume(g.volume);
         break;
+    case R_FF:
+        // patch 255: on when the menu closes (the menu turns it off while open), off right away
+        g.ff_want = !g.ff_want;
+        nc_log("xog-qm", "fast-forward %s (from the menu)", g.ff_want ? "on at close" : "off");
+        break;
+    case R_VIBRATION:
+        // patch 234: one setting for all games: straight into Settings, not this game's own
+        xemu_settings_load();
+        g_cfg.vibration = !g_cfg.vibration;
+        xemu_settings_save();
+        g_rx_vibration = g_cfg.vibration;
+        nc_log("xog-qm", "vibration %s", g_rx_vibration ? "on" : "off");
+        break;
+    case R_TRIGGERS:
+        if (g.chihiro || g.key.empty()) {
+            // patch 266: a Chihiro game (its own kind, by board): Settings' on/off, as before
+            xemu_settings_load();
+            g_cfg.triggers = !g_cfg.triggers;
+            xemu_settings_save();
+            g_rx_triggers = g_cfg.triggers;
+            nc_log("xog-qm", "adaptive triggers %s", g_rx_triggers ? "on" : "off");
+            break;
+        }
+        // This game's own choice (Auto, Off, Heavy, Trigger): the value its game settings show, saved there
+        // at close (Remember) and felt at once (the menu's own "off while open" ends when it closes)
+        {
+            static const int order[4] = { GAME_DEFAULT, TRIGGERS_OFF, TRIGGERS_DRIVING, TRIGGERS_SHOOTER };
+            int at = 0;
+            for (int i = 0; i < 4; i++) {
+                at = order[i] == TrigChoice() ? i : at;
+            }
+            g.trig = order[(at + 4 + dir) % 4];
+            g.dirty |= 1u << R_TRIGGERS;
+            const int kind = TriggersFor(g.key, g.name, g.trig);
+            xog_set_trigger_kind(kind);
+            nc_log("xog-qm", "adaptive triggers for this game: %s (kind %d)",
+                   g.trig == GAME_DEFAULT ? "Auto" : GameOptionValueName(GO_TRIGGERS, g.trig), kind);
+        }
+        break;
+    case R_TURBO: {
+        // patch 324: Off, then the game settings' choices; felt at once (main_ps5.c reads it every poll)
+        static const int order[] = { GAME_DEFAULT, TURBO_A, TURBO_B, TURBO_X, TURBO_Y, TURBO_RT, TURBO_A | TURBO_X,
+                                     TURBO_A | TURBO_B | TURBO_X | TURBO_Y,
+                                     TURBO_A | TURBO_B | TURBO_X | TURBO_Y | TURBO_RT | TURBO_LT };
+        const int n = (int)(sizeof(order) / sizeof(order[0]));
+        int at = 0;
+        for (int i = 0; i < n; i++) {
+            at = order[i] == TurboChoice() ? i : at;
+        }
+        g.turbo = order[(at + n + dir) % n];
+        if (!g.key.empty()) {
+            g.dirty |= 1u << R_TURBO;
+        }
+        xog_set_turbo(g.turbo == GAME_DEFAULT ? 0 : g.turbo);
+        nc_log("xog-qm", "turbo buttons: %s", GameOptionValueName(GO_TURBO, g.turbo));
+        break;
+    }
+    case R_MSAA: {
+        // patch 326: Off, 2x, 4x, 8x; seen at once (the renderer takes it before its next pass)
+        if (g.chihiro) {
+            break;
+        }
+        static const int order[] = { GAME_DEFAULT, 2, 4, 8 };
+        const int n = (int)(sizeof(order) / sizeof(order[0]));
+        int at = 0;
+        for (int i = 0; i < n; i++) {
+            at = order[i] == MsaaChoice() ? i : at;
+        }
+        g.msaa = order[(at + n + dir) % n];
+        if (!g.key.empty()) {
+            g.dirty |= 1u << R_MSAA;
+        }
+        xog_set_msaa(g.msaa == GAME_DEFAULT ? 1 : g.msaa);
+        nc_log("xog-qm", "MSAA: %s", GameOptionValueName(GO_MSAA, g.msaa));
+        break;
+    }
+    case R_A2C: {
+        // patch 354: On (the default) or Off; seen at once (the next draws)
+        if (g.chihiro) {
+            break;
+        }
+        g.a2c = A2cChoice() == GAME_DEFAULT ? 0 : GAME_DEFAULT;
+        if (!g.key.empty()) {
+            g.dirty |= 1u << R_A2C;
+        }
+        xog_set_a2c(g.a2c == GAME_DEFAULT ? 1 : g.a2c);
+        nc_log("xog-qm", "MSAA smooth cut-outs: %s", GameOptionValueName(GO_A2C, g.a2c));
+        break;
+    }
+    case R_SSAO: {
+        // patch 363: Off (the default), Low, High; seen at once (the next frame)
+        static const int order[] = { GAME_DEFAULT, 0, 1, 2 };     // patch 367: Default is the Video setting
+        const int n = (int)(sizeof(order) / sizeof(order[0]));
+        int at = 0;
+        for (int i = 0; i < n; i++) {
+            at = order[i] == SsaoChoice() ? i : at;
+        }
+        g.ssao = order[(at + n + dir) % n];
+        if (!g.key.empty()) {
+            g.dirty |= 1u << R_SSAO;
+        }
+        xog_set_ssao(g.ssao == GAME_DEFAULT ? g_cfg.ssao : g.ssao);
+        nc_log("xog-qm", "ambient occlusion: %s", GameOptionValueName(GO_SSAO, g.ssao));
+        break;
+    }
     case R_FPS:
         g.dirty |= 1u << R_FPS;
         g.fps = (g.fps + 3 + dir) % 3;
-        g_qm_overlay = g.fps || g.sides;
+        g_qm_overlay = OverlayWanted();
         break;
     case R_SHAPE:
         g.dirty |= 1u << R_SHAPE;
@@ -756,8 +1147,24 @@ void Change(int dir)
         break;
     case R_UPSCALE:
         g.dirty |= 1u << R_UPSCALE;
-        g.upscale = !g.upscale;
-        nc_present_set_upscale(g.upscale ? 1 : 0);
+        g.upscale = (g.upscale + 3 + dir) % 3;      // Smooth, Sharp, CAS (patch 247)
+        nc_present_set_upscale(g.upscale);          // app.h's NC_UPSCALE_*: the same order
+        break;
+    case R_CAS:
+        g.dirty |= 1u << R_CAS;
+        g.cas = (g.cas + 5 + dir) % 5;
+        nc_present_set_cas(g.cas);
+        break;
+    case R_TEXSHARP:      // live: the samplers' key has it, new ones are made as the game draws
+        g.dirty |= 1u << R_TEXSHARP;
+        g.texsharp = (g.texsharp + 4 + dir) % 4;
+        hle_vk_set_texsharp(g.texsharp);
+        nc_log("xog-qm", "texture sharpness %d, upscaling %d, CAS %d", g.texsharp, g.upscale, g.cas);   /* patch 249: a tool */
+        break;
+    case R_CRT:
+        g.dirty |= 1u << R_CRT;
+        g.crt = (g.crt + 3 + dir) % 3;
+        nc_present_set_crt(g.crt);
         break;
     case R_CAP: {
         g.dirty |= 1u << R_CAP;
@@ -787,10 +1194,20 @@ void Change(int dir)
     }
     case R_AA:
         g.dirty |= 1u << R_AA;
-        g.aa = (g.aa + 4 + dir) % 4;
+        g.aa = (g.aa + 5 + dir) % 5;
         nc_present_set_fxaa(g.aa == 1);
-        nc_present_set_smaa(g.aa == 2);
+        nc_present_set_smaa(g.aa == 2 || g.aa == 4);
         break;
+    case R_AF: {      // used from the restart (Choose)
+        g.dirty |= 1u << R_AF;
+        static const int kAf[5] = { 0, 2, 4, 8, 16 };
+        int at = 0;
+        for (int i = 0; i < 5; i++) {
+            at = kAf[i] == g.af ? i : at;
+        }
+        g.af = kAf[(at + 5 + dir) % 5];
+        break;
+    }
     default:
         return;
     }
@@ -836,7 +1253,8 @@ void Choose(double now)
             Note("Save " + std::to_string(g.slot) + " deleted", now);
         }
     } else if (g.row == R_RESTART || g.row == R_HOME || g.row == R_LOAD || g.row == R_PAL60 || g.row == R_UNLOCK60 || (g.row == R_FG && FgRestartDue()) ||
-               (g.row == R_CAP && g.cap != g.cap_started)) {
+               (g.row == R_CAP && g.cap != g.cap_started) || (g.row == R_AF && g.af != g.af_started) ||
+               (IsTrainerRow(g.row) && g.tr_opts != g.tr_opts_started)) {
         struct stat st;
         if (g.row == R_LOAD && stat((StatePath(g.slot) + ".state").c_str(), &st) != 0) {
             Note("Save " + std::to_string(g.slot) + " is empty", now);
@@ -849,7 +1267,8 @@ void Choose(double now)
             return;
         }
         Remember();
-        if (g.row == R_RESTART || g.row == R_LOAD || g.row == R_PAL60 || g.row == R_UNLOCK60 || g.row == R_FG || g.row == R_CAP) {
+        if (g.row == R_RESTART || g.row == R_LOAD || g.row == R_PAL60 || g.row == R_UNLOCK60 || g.row == R_FG || g.row == R_CAP || g.row == R_AF ||
+            IsTrainerRow(g.row)) {
             std::string all;
             if (g.row == R_UNLOCK60) {
                 Unlock60Toggle(g.key);
@@ -871,13 +1290,27 @@ void Choose(double now)
                     all += l + "\n";
                 }
             }
-            all += FrameGenLine(g.key);
+            if (!getenv("NC_CHIHIRO")) {
+                all += FrameGenLine(g.key);     // patch 231: never for Chihiro
+            }
             if (g.row == R_LOAD) {
                 all += "loadstate=" + StatePath(g.slot) + ".state\n";
             }
             if (g.row == R_UNLOCK60 && Fps60Wanted(g.key)) {
                 const std::string mod = ModAvail();
                 all += mod.empty() ? std::string("unlock60\n") : "mod=" + mod + "\n";
+            }
+            // Sega Chihiro (patch 215): a restart keeps the quick start: SEGABOOT's kept hand-over page again
+            // (the Sega boot showed up after a Frame Generation restart)
+            if (const char *cfs = getenv("NC_CHIHIRO_FS")) {
+                std::ifstream in(std::string(cfs) + ".launch.bin", std::ios::binary);
+                std::string page((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                if (page.size() == 0x1000) {
+                    unlink("/data/xpsemu/kept.bin");
+                    std::ofstream("/data/xpsemu/relaunch.bin", std::ios::binary | std::ios::trunc).write(page.data(), page.size());
+                    all += "relaunch\n";
+                    nc_log("xog-qm", "restart: the quick start (no SEGABOOT)");
+                }
             }
             const std::string tmp = "/data/xpsemu/launch.tmp", file = "/data/xpsemu/launch.txt";
             {
@@ -1109,7 +1542,10 @@ void DrawCounter(ImDrawList *dl, float s, double now)
             snprintf(buf, sizeof(buf), "Free memory  %ld MB", g.free_mb);
             lines.push_back(buf);
         }
-        snprintf(buf, sizeof(buf), "Xbox 64 MB  -  x%d resolution", g.scale);
+        // the console's memory as it runs (patch 213): a Sega Chihiro has 128 MB (NC_RAM_MB=128), an Xbox 64
+        snprintf(buf, sizeof(buf), "%s  -  x%d resolution",
+                 getenv("NC_CHIHIRO") ? "Sega Chihiro 128 MB"
+                 : (getenv("NC_RAM_MB") && atoi(getenv("NC_RAM_MB")) == 128) ? "Xbox 128 MB" : "Xbox 64 MB", g.scale);
         lines.push_back(buf);
     }
     ImFont *f = g.font;
@@ -1140,7 +1576,18 @@ void Draw(double now, float k)
     const bool states = g.group == 0;
     const float grow = 0.86f + 0.14f * ease, al = ease;
     const float u = s * grow;
-    const float want_w = states ? 1240.0f : 760.0f, want_h = 106.0f + rows.size() * 74.0f + 62.0f;
+    // patch 246: more rows than fit (a trainer's options): a window around the chosen one
+    const int kMaxRows = 11, nrows = (int)rows.size();
+    int top = 0;
+    if (nrows > kMaxRows) {
+        int at = 0;
+        for (int j = 0; j < nrows; j++) {
+            at = rows[j] == g.row ? j : at;
+        }
+        top = std::clamp(at - kMaxRows / 2, 0, nrows - kMaxRows);
+    }
+    const int shown = std::min(nrows, kMaxRows);
+    const float want_w = states ? 1240.0f : 760.0f, want_h = 106.0f + shown * 74.0f + 62.0f;
     if (!g.panel_w) {
         g.panel_w = want_w;
         g.panel_h = want_h;
@@ -1166,7 +1613,8 @@ void Draw(double now, float k)
 
     char value[48];
     const float bh = 62 * u, gap = 74 * u, bw = 680 * u, indent = 34 * u;
-    for (int i : rows) {
+    for (int ri = top; ri < top + shown; ri++) {
+        const int i = rows[ri];
         const char *name = "";
         value[0] = 0;
         const bool armed = g.armed_row == i && now <= g.armed_until;
@@ -1175,6 +1623,19 @@ void Draw(double now, float k)
             name = kGroups[i - R_G_STATES].name;
             snprintf(value, sizeof(value), "%s", i - R_G_STATES == g.group ? "v" : ">");
         }
+        static std::string tr_name;     // patch 246: an option of the trainer
+        if (IsTrainerRow(i)) {
+            const int k = i - R_TOPT;
+            tr_name = g.tr_names[k];
+            if (tr_name.size() > 26) {
+                tr_name = tr_name.substr(0, 24) + "...";
+            }
+            name = armed ? "Press again: the game restarts" : tr_name.c_str();
+            const bool on = k < (int)g.tr_opts.size() && g.tr_opts[k] == '1';
+            // patch 252: a live trainer's row just flips; the restart note only for restart-only ones
+            snprintf(value, sizeof(value), "%s%s", on ? "On" : "Off",
+                     g.tr_opts != g.tr_opts_started && !armed && !TrainerLive() ? " (Cross: restart)" : "");
+        }
         switch (i) {
         case R_RESUME: name = "Resume"; break;
         case R_SAVE: name = "Save state"; snprintf(value, sizeof(value), "%s", SlotLabel(g.slot).c_str()); break;
@@ -1182,6 +1643,38 @@ void Draw(double now, float k)
         case R_RENAME: name = "Name this save"; snprintf(value, sizeof(value), "%s", SlotLabel(g.slot).c_str()); break;
         case R_DELETE: name = armed ? "Press again to delete" : "Delete state"; snprintf(value, sizeof(value), "%s", SlotLabel(g.slot).c_str()); break;
         case R_VOLUME: name = "Volume"; snprintf(value, sizeof(value), "%d%%", g.volume * 10); break;
+        case R_FF: name = "Fast-forward"; snprintf(value, sizeof(value), "%s", g.ff_want ? "On (x2)" : "Off"); break;
+        case R_VIBRATION: name = "Vibration"; snprintf(value, sizeof(value), "%s", g_rx_vibration ? "On" : "Off"); break;
+        case R_TRIGGERS:
+            name = "Adaptive triggers";
+            if (g.chihiro || g.key.empty()) {
+                snprintf(value, sizeof(value), "%s", g_rx_triggers ? "On" : "Off");
+            } else {
+                // this game's own choice, as its game settings show it; and whether Settings has them off
+                const int c = TrigChoice();
+                const std::string v = c == GAME_DEFAULT
+                    ? std::string("Auto (") + GameOptionValueName(GO_TRIGGERS, TriggersBuiltIn(g.key, g.name)) + ")"
+                    : std::string(GameOptionValueName(GO_TRIGGERS, c));
+                snprintf(value, sizeof(value), "%s%s", v.c_str(), g_rx_triggers ? "" : " - off in Settings");
+            }
+            break;
+        case R_TURBO:
+            name = "Turbo buttons";
+            snprintf(value, sizeof(value), "%s", GameOptionValueName(GO_TURBO, TurboChoice()));
+            break;
+        case R_MSAA:
+            name = "MSAA";
+            snprintf(value, sizeof(value), "%s", GameOptionValueName(GO_MSAA, MsaaChoice()));
+            break;
+        case R_A2C:
+            name = "MSAA smooth cut-outs";      // patch 354
+            snprintf(value, sizeof(value), "%s%s", GameOptionValueName(GO_A2C, A2cChoice()),
+                     MsaaChoice() == GAME_DEFAULT && A2cChoice() == GAME_DEFAULT ? " (needs MSAA)" : "");
+            break;
+        case R_SSAO:
+            name = "Ambient occlusion";         // patch 363
+            snprintf(value, sizeof(value), "%s", GameOptionValueName(GO_SSAO, SsaoChoice()));
+            break;
         case R_FPS: name = "FPS counter"; snprintf(value, sizeof(value), "%s", g.fps == 2 ? "Full" : g.fps ? "FPS" : "Off"); break;
         case R_SHAPE: {
             static const char *const shapes[] = { "Auto", "4:3", "16:9", "Stretch" };
@@ -1189,11 +1682,24 @@ void Draw(double now, float k)
             snprintf(value, sizeof(value), "%s", shapes[g.shape]);
             break;
         }
-        case R_UPSCALE: name = "Upscaling"; snprintf(value, sizeof(value), "%s", g.upscale ? "Sharp" : "Smooth"); break;
+        case R_UPSCALE: name = "Upscaling"; snprintf(value, sizeof(value), "%s", g.upscale == 2 ? "AMD CAS" : g.upscale ? "Sharp" : "Smooth"); break;
+        case R_CAS: {
+            static const char *const k[5] = { "0.0", "0.25", "0.5", "0.75", "1.0" };
+            name = "AMD CAS sharpness";
+            snprintf(value, sizeof(value), "%s", k[std::clamp(g.cas, 0, 4)]);
+            break;
+        }
+        case R_TEXSHARP: {
+            static const char *const k[4] = { "Off", "Low", "Medium", "High" };
+            name = "Texture sharpness";
+            snprintf(value, sizeof(value), "%s", k[std::clamp(g.texsharp, 0, 3)]);
+            break;
+        }
+        case R_CRT: name = "CRT filter"; snprintf(value, sizeof(value), "%s", g.crt == 2 ? "CRT" : g.crt ? "Scanlines" : "Off"); break;
         case R_AA:
             name = "Anti-aliasing";
-            snprintf(value, sizeof(value), "%s", g.aa == 1 ? "FXAA" : g.aa == 2 ? "SMAA" : g.aa != 3 ? "Off" :
-                     g.scale < 6 ? "SSAA (next start)" : "SSAA");
+            snprintf(value, sizeof(value), "%s", g.aa == 1 ? "FXAA" : g.aa == 2 ? "SMAA" : g.aa == 3 ? (g.scale < 6 ? "SSAA (next start)" : "SSAA") :
+                     g.aa == 4 ? (g.scale < 6 ? "SSAA + SMAA (next start)" : "SSAA + SMAA") : "Off");
             break;
         case R_CAP:
             name = armed ? "Press again: the game restarts" : "FPS cap";
@@ -1201,6 +1707,14 @@ void Draw(double now, float k)
                      g.cap != g.cap_started && !armed ? " (Cross: restart)" : "");
             if (g.cap <= 0) {
                 snprintf(value, sizeof(value), "Off%s", g.cap != g.cap_started && !armed ? " (Cross: restart)" : "");
+            }
+            break;
+        case R_AF:
+            name = armed ? "Press again: the game restarts" : "Anisotropic filtering";
+            if (g.af > 1) {
+                snprintf(value, sizeof(value), "%dx%s", g.af, g.af != g.af_started && !armed ? " (Cross: restart)" : "");
+            } else {
+                snprintf(value, sizeof(value), "Off%s", g.af != g.af_started && !armed ? " (Cross: restart)" : "");
             }
             break;
         case R_FG:
@@ -1237,7 +1751,14 @@ void Draw(double now, float k)
         }
         y += gap;
     }
-    dl->AddText(f, 26 * u, ImVec2(px + m, py + ph - 48 * u), Col(255, 255, 255, 0.65f * al), "Cross: choose     Circle: back     Touchpad: resume");
+    {   // patch 252: on a trainer's option, its help (live or restart, and why; options sharing its bytes)
+        static std::string help;
+        help = IsTrainerRow(g.row) ? TrainerHelp(g.row - R_TOPT) : std::string("Cross: choose     Circle: back     Touchpad: resume");
+        if (help.size() > 96) {
+            help = help.substr(0, 93) + "...";
+        }
+        dl->AddText(f, 26 * u, ImVec2(px + m, py + ph - 48 * u), Col(255, 255, 255, 0.65f * al), help.c_str(), NULL);
+    }
 
     // The slot's card beside the list, with the save states open.
     if (states && g.panel_w > 1100) {
@@ -1347,6 +1868,9 @@ void xog_qm_start_line(const char *line)
 {
     std::string l = line;
     if (g.lines.empty()) {
+        xemu_settings_load();                   // patch 234: Settings' vibration for this run
+        g_rx_vibration = g_cfg.vibration;
+        g_rx_triggers = g_cfg.triggers;         // patch 266
         const size_t slash = l.find_last_of('/');
         g.name = slash == std::string::npos ? l : l.substr(slash + 1);
         const size_t dot = g.name.find_last_of('.');
@@ -1362,20 +1886,44 @@ void xog_qm_start_line(const char *line)
         g.volume = std::clamp(atoi(l.c_str() + 7), 0, 10);
     } else if (l.rfind("fps=", 0) == 0) {
         g.fps = std::clamp(atoi(l.c_str() + 4), 0, 2);
-        g_qm_overlay = g.fps || g.sides;
+        g_qm_overlay = OverlayWanted();
+    } else if (l.rfind("chihiro=", 0) == 0) {
+        g.chihiro = true;
+        g_qm_overlay = 1;       // patch 220: the overlay pass on in a Chihiro run (the gun games' crosshair)
     } else if (l.rfind("sides=", 0) == 0) {
         g.sides = std::clamp(atoi(l.c_str() + 6), 0, 2);
-        g_qm_overlay = g.fps || g.sides;
+        g_qm_overlay = OverlayWanted();
     } else if (l.rfind("scale=", 0) == 0) {
         g.scale = atoi(l.c_str() + 6);
     } else if (l.rfind("fpscap=", 0) == 0) {
         g.cap = g.cap_started = atoi(l.c_str() + 7);
     } else if (l.rfind("framegen=", 0) == 0) {
         g.fg_started = true;
+    } else if (l.rfind("af=", 0) == 0) {
+        g.af = g.af_started = atoi(l.c_str() + 3);
+    } else if (l.rfind("trainer=", 0) == 0) {      // patch 246: its option names for the Trainer group
+        g.tr_path = l.substr(8);
+        TrainerEntry e;
+        g.tr_names.clear();
+        if (TrainerReadOne(g.tr_path, &e)) {
+            g.tr_names = e.options;
+        }
+        g.tr_opts.resize(g.tr_names.size(), '0');
+        g.tr_opts_started = g.tr_opts;
+    } else if (l.rfind("trainer_opts=", 0) == 0) {
+        g.tr_opts = l.substr(13);
+        g.tr_opts.resize(g.tr_names.size(), '0');
+        g.tr_opts_started = g.tr_opts;
     } else if (l.rfind("aa=", 0) == 0) {
-        g.aa = l == "aa=fxaa" ? 1 : l == "aa=smaa" ? 2 : l == "aa=ssaa" ? 3 : 0;
+        g.aa = l == "aa=fxaa" ? 1 : l == "aa=smaa" ? 2 : l == "aa=ssaa" ? 3 : l == "aa=ssaa+smaa" ? 4 : 0;
     } else if (l.rfind("upscale=", 0) == 0) {
-        g.upscale = l == "upscale=sgsr";
+        g.upscale = l == "upscale=sgsr" ? 1 : l == "upscale=cas" ? 2 : 0;
+    } else if (l.rfind("cas=", 0) == 0) {          // patch 247
+        g.cas = std::clamp(atoi(l.c_str() + 4), 0, 4);
+    } else if (l.rfind("texsharp=", 0) == 0) {
+        g.texsharp = std::clamp(atoi(l.c_str() + 9), 0, 3);
+    } else if (l.rfind("crt=", 0) == 0) {
+        g.crt = std::clamp(atoi(l.c_str() + 4), 0, 2);
     } else if (l.rfind("aspect=", 0) == 0) {
         const std::string v = l.substr(7);
         g.shape = v == "16:9" ? 2 : v == "4:3" ? 1 : v == "stretch" ? 3 : 0;
@@ -1386,16 +1934,25 @@ void xog_qm_start_line(const char *line)
 // The controller's thread: the touchpad, over a running game.
 void xog_qm_request(void)
 {
+    nc_ff_off("the quick menu");    // patch 253
     if (!g_qm_open) {
         g.opening = true;
         g_qm_open = 1;
     }
 }
 
+// patch 253: fast-forward switched (the controller's thread): the overlay on until the list is made again
+void xog_qm_ff_changed(void)
+{
+    g_qm_ff_dirty = 1;
+    g_qm_overlay = 1;
+}
+
 // The picture's thread, each refresh while open, before the frame is drawn.
 void xog_qm_frame(void)
 {
     const double now = Now();
+    const bool ff_dirty = __atomic_exchange_n(&g_qm_ff_dirty, 0, __ATOMIC_ACQ_REL) != 0;
     if (g.opening) {
         g.opening = false;
         g_qm_paused_ms = rx_now_ms();
@@ -1440,6 +1997,9 @@ void xog_qm_frame(void)
         if (g.closing && now - g.closed >= 0.10) {
             nc_pause_set(false);
             nc_audio_set_paused(false);
+            if (g.ff_want) {
+                nc_ff_set(true, "the quick menu");      // patch 255
+            }
             g.closing = false;
             g_qm_open = 0;
             open = false;
@@ -1467,7 +2027,12 @@ void xog_qm_frame(void)
         k = g.closing ? std::clamp((float)(1 - (now - g.closed) / 0.10), 0.0f, 1.0f)
                       : std::clamp((float)((now - g.opened) / 0.12), 0.0f, 1.0f);
     }
-    if (!open && !closed_now && now < g.next_list) {
+    // patch 238: a Chihiro gun game's crosshair is drawn again every frame. The list was made twice a second
+    // (side art, the counter), so the crosshair moved in 0.5 s steps however smooth the aim was
+    extern bool nc_chihiro_crosshair(float *x, float *y);
+    float aim_x, aim_y;
+    const bool aim_live = getenv("NC_CHIHIRO") && nc_chihiro_crosshair(&aim_x, &aim_y);
+    if (!open && !closed_now && !aim_live && !ff_dirty && now < g.next_list) {
         return;     // the list as it is: side art and the counter change twice a second at most
     }
     g.next_list = now + 0.5;
@@ -1485,13 +2050,53 @@ void xog_qm_frame(void)
         if (g.fps) {
             DrawCounter(dl, s, now);
         }
+        if (g_xog_ff) {
+            DrawFastForward(dl, io.DisplaySize.x, s);
+        }
+        {
+            // Sega Chihiro's gun games (patch 220): the crosshair over the 4:3 picture, as the fork draws it
+            const float cx = aim_x, cy = aim_y;
+            if (aim_live) {
+                const float H = io.DisplaySize.y, W = io.DisplaySize.x, pw = H * 4.0f / 3.0f;
+                const ImVec2 c((W - pw) / 2 + cx * pw, cy * H);
+                {
+                    // a tool (patch 232): each draw while the crosshair moves: the time since the last draw and
+                    // where (the first 600), to tell steps in the drawing from steps in the aim
+                    static float lx = -1, ly = -1;
+                    static double last;
+                    static unsigned logged;
+                    const double t = Now();
+                    if ((c.x != lx || c.y != ly) && logged < 600) {
+                        logged++;
+                        nc_log("xog-qm", "crosshair: drawn after %.1f ms at %.1f %.1f (moved %.1f px)", last ? (t - last) * 1000 : 0.0,
+                               c.x, c.y, lx < 0 ? 0.0f : sqrtf((c.x - lx) * (c.x - lx) + (c.y - ly) * (c.y - ly)));
+                    }
+                    lx = c.x;
+                    ly = c.y;
+                    last = t;
+                }
+                const float r = 22 * s;
+                for (int pass = 0; pass < 2; pass++) {
+                    const ImU32 col = pass ? IM_COL32(205, 245, 45, 235) : IM_COL32(0, 0, 0, 170);
+                    const float th = pass ? 2.5f * s : 5.5f * s;
+                    dl->AddCircle(c, r, col, 32, th);
+                    dl->AddLine(ImVec2(c.x - r * 1.6f, c.y), ImVec2(c.x - r * 0.5f, c.y), col, th);
+                    dl->AddLine(ImVec2(c.x + r * 0.5f, c.y), ImVec2(c.x + r * 1.6f, c.y), col, th);
+                    dl->AddLine(ImVec2(c.x, c.y - r * 1.6f), ImVec2(c.x, c.y - r * 0.5f), col, th);
+                    dl->AddLine(ImVec2(c.x, c.y + r * 0.5f), ImVec2(c.x, c.y + r * 1.6f), col, th);
+                }
+            }
+        }
     }
     if (open) {
         Draw(now, k);
     }
     ImGui::Render();
     g_qm_serial = g_qm_serial + 1;
-    if (closed_now && !g_qm_overlay) {
+    if (ff_dirty) {
+        g_qm_overlay = OverlayWanted();     // patch 253: the badge's list made: off again if nothing else wants it
+    }
+    if ((closed_now || ff_dirty) && !open && !g_qm_overlay) {
         hle_present_overlay = nullptr;
     }
 }

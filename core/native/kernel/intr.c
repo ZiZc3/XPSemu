@@ -19,6 +19,7 @@
 #include "native/core/irq.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define KI_ROUTINE   0x00
@@ -34,6 +35,18 @@
 static uint8_t *irql(NcKernel *k)
 {
     return (uint8_t *)nc_vm_host(k->vm, k->kpcr_va + PCR_IRQL);
+}
+
+/* XPSemu patch 197 (Sega Chihiro only): SEGABOOT connects the media board's IRQ 10 Latched (Mode 1, an edge);
+ * its ISR doesn't quiet the board until its library hooks a routine in. Served as a level line, it ran again
+ * and again at IRQL 16: nothing else ran, a black screen. A latched line's edge is taken when its ISR goes. */
+static bool chihiro_latched_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("NC_CHIHIRO") != NULL;
+    }
+    return on;
 }
 
 /* HalGetInterruptVector(BusInterruptLevel, Irql) -> vector */
@@ -202,6 +215,13 @@ bool nc_intr_dispatch(NcKernel *k, bool cpu_enabled)
             continue;
         }
         hold_report(level);
+        if (chihiro_latched_on() && ((const uint8_t *)nc_vm_host(k->vm, obj))[0x12] == 1) {
+            static unsigned logged;
+            if (logged++ < 20) {
+                nc_log("hakuX-native-irq", "line %u is latched: its edge taken, the ISR runs once (patch 197)", level);
+            }
+            nc_irq_set(level, false);
+        }
         g_isr_line = (uint8_t)level;
         if (!k->isr_thread) {
             k->isr_thread = nc_ps_kernel_thread(k, ISR_STACK, ISR_PRIORITY);

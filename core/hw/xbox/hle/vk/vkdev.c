@@ -289,6 +289,14 @@ int hle_vk_init(void)
     vkEnumerateDeviceExtensionProperties(v->phys, NULL, &ne, NULL);
     g_autofree VkExtensionProperties *ext = g_new(VkExtensionProperties, ne);
     vkEnumerateDeviceExtensionProperties(v->phys, NULL, &ne, ext);
+    /* MSAA groundwork (log only): what the device offers multisampled targets */
+    hle_log("hakuX-hle-back", "vk: msaa: colour samples %#x, depth %#x, stencil %#x; "
+            "multisampled_render_to_single_sampled=%d, mixed_attachment_samples=%d",
+            (unsigned)v->props.limits.framebufferColorSampleCounts,
+            (unsigned)v->props.limits.framebufferDepthSampleCounts,
+            (unsigned)v->props.limits.framebufferStencilSampleCounts,
+            has_ext(ext, ne, "VK_EXT_multisampled_render_to_single_sampled"),
+            has_ext(ext, ne, "VK_AMD_mixed_attachment_samples"));
     bool e_vids = has_ext(ext, ne, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     bool e_eds2 = has_ext(ext, ne, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
     bool e_cbc = has_ext(ext, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
@@ -509,6 +517,7 @@ int hle_vk_init(void)
     c->bda = v13 ? q12.bufferDeviceAddress : e_bda && q_bda.bufferDeviceAddress;
     c->ahb = e_ahb;
     c->max_lod_bias = v->props.limits.maxSamplerLodBias;
+    c->max_aniso = v->props.limits.maxSamplerAnisotropy;
     /* (unused, enabled where present: on 1.3 only) */
     c->gpl = v13 && e_gpl && q_gpl.graphicsPipelineLibrary;
     c->eds3 = v13 && e_eds3 && q_eds3.extendedDynamicState3ColorBlendEnable &&
@@ -526,6 +535,9 @@ int hle_vk_init(void)
     c->cache_control = v13 ? q13.pipelineCreationCacheControl
                            : e_pcc && q_pcc.pipelineCreationCacheControl;
     c->occl_precise = q.features.occlusionQueryPrecise;
+    /* patch 341: polygon modes other than fill, the last provoking vertex */
+    c->fill_nonsolid = q.features.fillModeNonSolid;
+    c->pv_last = e_pv && q_pv.provokingVertexLast;
     c->swapchain = nix && has_ext(ext, ne, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(v->phys, VK_FORMAT_R16G16_SSCALED, &fp);
@@ -623,6 +635,7 @@ int hle_vk_init(void)
     f.features.textureCompressionBC = q.features.textureCompressionBC;
     f.features.samplerAnisotropy = c->aniso;
     f.features.occlusionQueryPrecise = c->occl_precise;
+    f.features.fillModeNonSolid = c->fill_nonsolid;     /* patch 341 */
     f_vids.pNext = NULL;
     f_vids.vertexInputDynamicState = VK_TRUE;
     tail = v13 ? (VkBaseOutStructure *)&f13 : (VkBaseOutStructure *)&f;

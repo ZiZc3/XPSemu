@@ -10,7 +10,57 @@
 #include "native/kernel/kernel.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+/* A monotonic nanosecond clock for the contiguous-allocator timing log below
+ * (patch 295). A clock read is ~130 ns on the console: two a contiguous call,
+ * negligible beside the calls it measures (milliseconds). */
+static uint64_t mm_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* patch 295 (xogfix=mmhole): a game whose in-game contiguous allocations stall
+ * because the top allocator relocates GPU-tracked pages and waits on their
+ * fence (Half-Life 2 45410091: ~10 ms a block at a level load). */
+/* xogfix=mmbudget (patch 317, per game: SSX On Tour). Its heap sizing asks XPhysicalAlloc for 64 MiB, then 4 KiB
+ * less until one fits, frees it and takes that less 1408 KiB, the rest left for everything else (thread stacks).
+ * Our gate counted only the 64 MiB guest window's free pages, but on the PS5 the title's committed virtual memory
+ * (stacks, NtAllocateVirtualMemory) is charged to the same 64 MiB budget outside it: the probe found ~4 MiB more
+ * than a console would, the heap took the reserve, the next thread's 68 KiB stack failed ("the title's 64 MiB are
+ * used up") and the game waited for that thread forever on a black screen. With it: the console's accounting. */
+static bool mm_budget_fix(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XOG_FIX");
+        on = e && strstr(e, "mmbudget") ? 1 : 0;
+        if (on) {
+            nc_log("hakuX-native-mm", "mmbudget: contiguous allocations see the title's whole 64 MiB budget, virtual "
+                                      "memory included, as a console (xogfix=mmbudget, patch 317)");
+        }
+    }
+    return on;
+}
+
+static bool mm_hole_fix(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XOG_FIX");
+        on = e && strstr(e, "mmhole") ? 1 : 0;
+        if (on) {
+            nc_log("hakuX-native-mm", "mmhole: small contiguous blocks land in a free hole first, no page moved "
+                                      "(xogfix=mmhole, patch 295)");
+        }
+    }
+    return on == 1;
+}
 
 #define MEM_COMMIT   0x1000u
 #define MEM_RESERVE  0x2000u
@@ -300,7 +350,6 @@ static uint64_t NtAllocateVirtualMemory(NcKernel *k, NcFrame *f, const uint32_t 
     }
     if ((type & MEM_COMMIT) && !commit(k, base, size, !(type & MEM_NOZERO))) {
         nc_log("hakuX-native-mm", "commit %08x+%x: out of physical memory", base, size);
-        log_holders(k, "out of memory");
         return NC_STATUS_NO_MEMORY;
     }
     nc_vm_wr32(k->vm, a[0], base);
@@ -542,19 +591,71 @@ static void log_phys_map(NcKernel *k)
     nc_log("hakuX-native", "%s", line);
 }
 
+/* patch 320: the pages contiguous blocks took above themselves for their alignment (slack): a console packs the
+ * blocks, those pages aren't the title's; rx_free_pages leaves them out of the budget's used count. */
+uint32_t nc_mm_slack_bytes(void)
+{
+    uint32_t n = 0;
+    for (unsigned i = 0; i < g_ncontig; i++) {
+        n += g_contig[i].slack;
+    }
+    return n;
+}
+
 static uint32_t contig_alloc(NcKernel *k, uint32_t size, uint32_t lo, uint32_t hi, uint32_t align,
                              uint32_t protect, uint32_t ra)
 {
     size = nc_align_up(size ? size : 1, NC_PAGE);
+    if (k->vm->guest_size > NC_RAM_RETAIL) {
+        /* 128 MB (Sega Chihiro, XPSemu patch 194): as the kernel keeps the top pages from boot on (its PFN
+         * database at page 0x7FD0, the GPU's instance memory at 0x7FF0: Cxbx-Reloaded CxbxKrnl.h), a contiguous
+         * block ends below 0x7FD0. SEGABOOT's D3D got its push buffer up to 0x07FFC000 before it claimed the
+         * instance memory, past its push buffer object's limit (0x07FFAFFF): the GPU couldn't read its end. */
+        const uint32_t limit = k->vm->guest_size - 0x30000u;
+        if (!hi || hi > limit) {
+            hi = limit;
+        }
+    }
     /* The top of RAM, virtual pages moved out of the way (vm.c), then the
      * window needing the fewest moves; neither when there are fewer free
      * pages than asked for. */
     uint32_t pa = UINT32_MAX, moved = 0;
     static unsigned s_failed;           /* failures since the last success (reports below) */
-    if (nc_vm_free_bytes(k->vm) >= size) {
+    /* patch 295 (xogfix=mmhole): first an existing free run that already holds
+     * the block (best fit, nothing relocated), so the top allocator never moves
+     * a GPU-tracked virtual page and waits on its fence -- the ~10 ms stalls at
+     * Half-Life 2's level loads, over tiny blocks (96 B to 40 KiB). Best fit
+     * takes the smallest run that fits and leaves the large runs whole for a
+     * big MmAllocateContiguousMemory, as nc_vm_alloc_phys is meant to; only when
+     * no hole fits does it fall back to the relocating allocator below (so a
+     * block that would have fit never fails). Sub-page alignment only: the hole
+     * allocator is page-granular, which already meets align <= NC_PAGE. */
+    /* patch 299: gate on FREE GUEST-PHYSICAL RAM, not nc_vm_free_bytes. On PS5
+     * the latter is the title's shared budget and reads 0 once committed virtual
+     * memory fills the 2x backing, even with tens of MiB of guest RAM free -- so
+     * a contiguous allocation that physically fits was pre-failed, the title got
+     * a null, and HL2 hung spinning in its allocator (and the failure report's
+     * O(pages x blocks) map scan was itself the residual ~10 ms). The physical
+     * allocators below still clamp to the guest window and fail gracefully when
+     * there is genuinely no run. */
+    /* patch 320: and the title's whole 64 MiB budget, virtual memory counted, alignment slack not (vmblocks_ps5.inc
+     * rx_free_pages), for every title, as a console: one count for contiguous and virtual memory alike. Two counts
+     * gave SSX On Tour's heap probe ~4 MiB a console hasn't, its own reserve went and a thread's stack failed. */
+    uint32_t guest_free = nc_vm_free_guest_bytes(k->vm);
+    {
+        const uint32_t budget = nc_vm_free_bytes(k->vm);
+        if (budget < guest_free) {
+            guest_free = budget;
+        }
+    }
+    if (mm_hole_fix() && align <= NC_PAGE && guest_free >= size) {
+        const uint32_t hole_hi = hi ? hi : k->vm->ram_size;     /* clamped to the guest window inside */
+        pa = nc_vm_alloc_phys(k->vm, size, lo, hole_hi);
+    }
+    if (pa == UINT32_MAX && guest_free >= size) {
         pa = nc_vm_alloc_phys_top(k->vm, size, lo, hi, align, &moved);
     }
-    if (pa == UINT32_MAX && g_ncontig < MAX_CONTIG && nc_vm_free_bytes(k->vm) >= size) {
+    if (pa == UINT32_MAX && g_ncontig < MAX_CONTIG && guest_free >= size) {
         pa = nc_vm_alloc_phys_compact(k->vm, size, lo, hi, align, &moved);
     }
     if (pa != UINT32_MAX && moved) {
@@ -574,14 +675,18 @@ static uint32_t contig_alloc(NcKernel *k, uint32_t size, uint32_t lo, uint32_t h
          * reported: a run's own failure later (Amped 2's 1.4 MiB at a level's
          * load, after ~2500 sizing its heap at boot) is reported whole. */
         const unsigned n = ++s_failed;
+        if (size >= (1u << 20)) {       /* patch 371: a big block refused: what stands in the windows, once */
+            static bool s_mapped;
+            if (!s_mapped) {
+                s_mapped = true;
+                log_holders(k, "a big contiguous block refused");
+                log_phys_map(k);
+            }
+        }
         if (n <= 4 || !(n & (n - 1))) {
-            char runs[400];
-            nc_vm_free_runs(k->vm, runs, sizeof(runs));
-            nc_log("hakuX-native", "mm: contiguous allocation of %u KiB failed (#%u; free %u KiB:%s)", size >> 10, n,
-                   nc_vm_free_bytes(k->vm) >> 10, runs);
-            log_splitters(k);
-            log_phys_map(k);
-            log_holders(k, "contiguous allocation failed");
+            nc_log("hakuX-native", "mm: contiguous allocation of %u KiB failed (#%u; guest free %u KiB; "
+                   "asked lo %08x hi %08x align %x, from %08x, %u blocks)",
+                   size >> 10, n, guest_free >> 10, lo, hi, align, ra, g_ncontig);
         }
         return 0;
     }
@@ -597,7 +702,9 @@ static uint32_t contig_alloc(NcKernel *k, uint32_t size, uint32_t lo, uint32_t h
      * pages, and the front end died on a null buffer at car select. */
     uint32_t slack = 0;
     const uint32_t top = pa + size;
-    while (align > NC_PAGE && slack + NC_PAGE < align && top + slack < k->vm->ram_size &&
+    /* patch 319: within the title's 64 MiB (guest_size): the slack of a block ending at the window's top must not
+     * take backing pages above it */
+    while (align > NC_PAGE && slack + NC_PAGE < align && top + slack < k->vm->guest_size &&
            nc_vm_claim_phys(k->vm, top + slack, NC_PAGE)) {
         slack += NC_PAGE;
     }
@@ -1021,7 +1128,10 @@ static uint64_t MmQueryStatistics(NcKernel *k, NcFrame *f, const uint32_t *a)
             }
         }
     }
-    const uint32_t s[9] = {0x24, total, total - used, committed, reserved, 0, k->pool_len / NC_PAGE, 0, image};
+    /* patch 319: on the PS5 used counts all 128 MiB (the backing too): past the title's 64 MiB, total - used
+     * wrapped to ~4 billion pages free; a title sizing itself from it would see that. None free then, as a console. */
+    const uint32_t avail = used < total ? total - used : 0;
+    const uint32_t s[9] = {0x24, total, avail, committed, reserved, 0, k->pool_len / NC_PAGE, 0, image};
     memcpy(nc_vm_host(k->vm, a[0]), s, sizeof(s));
     return NC_STATUS_SUCCESS;
 }

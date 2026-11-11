@@ -504,6 +504,77 @@ static bool FoundOnce(const PatchGroup &group)
     return true;
 }
 
+// The disc's regions (the certificate's game region: 1 North America, 2 Japan, 4 the rest of the world: PAL)
+static uint32_t XbeRegions()
+{
+    const auto &x = g_xbe.data;
+    if (x.size() < 0x120) {
+        return 0;
+    }
+    uint32_t base, cert, regions = 0;
+    memcpy(&base, &x[0x104], 4);
+    memcpy(&cert, &x[0x118], 4);
+    if (cert < base || cert - base + 0xA4 > x.size()) {
+        return 0;
+    }
+    memcpy(&regions, &x[cert - base + 0xA0], 4);
+    return regions;
+}
+
+// The disc's version (the certificate's), 0 when unreadable
+static uint32_t XbeVersion()
+{
+    const auto &x = g_xbe.data;
+    if (x.size() < 0x120) {
+        return 0;
+    }
+    uint32_t base, cert, version = 0;
+    memcpy(&base, &x[0x104], 4);
+    memcpy(&cert, &x[0x118], 4);
+    if (cert < base || cert - base + 0xB0 > x.size()) {
+        return 0;
+    }
+    memcpy(&version, &x[cert - base + 0xAC], 4);
+    return version;
+}
+
+// Patch 322: the file's "version=45410049 (EA-073) [NTSC 00000001]": made for version 1 of the game. Another version
+// (its CRC not listed) is another build: Def Jam: Fight for NY's European disc is version 2.
+static bool OtherVersion(const PatchFile &file)
+{
+    const size_t open = file.version.find('['), close = file.version.find(']', open);
+    if (open == std::string::npos || close == std::string::npos) {
+        return false;
+    }
+    const std::string inside = file.version.substr(open + 1, close - open - 1);
+    const size_t sp = inside.find_last_of(' ');
+    const std::string hex = sp == std::string::npos ? inside : inside.substr(sp + 1);
+    if (hex.size() != 8 || hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+        return false;
+    }
+    if (std::find(file.crcs.begin(), file.crcs.end(), g_xbe.crc) != file.crcs.end()) {
+        return false;   // this very disc is named
+    }
+    const uint32_t want = (uint32_t)strtoul(hex.c_str(), nullptr, 16), have = XbeVersion();
+    return have && want != have;
+}
+
+// Patch 321: a patch made for NTSC only, on a PAL-only disc its list of CRCs doesn't name: another build of the game
+// (other addresses, other code), whatever a search finds in it. Def Jam: Fight for NY's widescreen patch (NTSC) found
+// its 8 bytes in the European disc too, rewrote a jump there and the game crashed 2 s in (a write to 0 at 0x1a6ac).
+static bool OtherRegion(const PatchFile &file)
+{
+    if (file.region.empty() || file.region.find("PAL") != std::string::npos ||
+        file.region.find("NTSC") == std::string::npos) {
+        return false;   // made for PAL too, or no region named
+    }
+    if (std::find(file.crcs.begin(), file.crcs.end(), g_xbe.crc) != file.crcs.end()) {
+        return false;   // this very disc is named
+    }
+    const uint32_t regions = XbeRegions();
+    return regions && !(regions & 3);   // a PAL-only disc (no North America, no Japan)
+}
+
 std::string PatchGroupProblem(const PatchFile &file, const PatchGroup &group,
                               const std::string &iso_path,
                               uint64_t xbe_offset, uint32_t xbe_size)
@@ -519,6 +590,12 @@ std::string PatchGroupProblem(const PatchFile &file, const PatchGroup &group,
     }
     if (group.title_id && group.title_id != XbeTitleId()) {
         return "Other version"; // For another of the file's releases
+    }
+    if (OtherRegion(file)) {
+        return "Other region (an NTSC patch, a PAL disc)";
+    }
+    if (OtherVersion(file)) {
+        return "Other version (the patch names another version of the game)";
     }
     if (!file.crcs.empty() &&
         std::find(file.crcs.begin(), file.crcs.end(), g_xbe.crc) ==
@@ -591,6 +668,77 @@ static bool XbeVa(uint32_t pos, uint32_t *va)
     return false;
 }
 
+// An address of the game as default.xbe's offset (XbeVa backwards): a section's, or the header's
+static bool XbePos(uint32_t va, uint32_t *pos)
+{
+    const auto &x = g_xbe.data;
+    uint32_t base, count, table, headers;
+    if (x.size() < 0x124) {
+        return false;
+    }
+    memcpy(&base, &x[0x104], 4);
+    memcpy(&headers, &x[0x108], 4);
+    memcpy(&count, &x[0x11C], 4);
+    memcpy(&table, &x[0x120], 4);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint64_t h = (uint64_t)table - base + i * 56ull;
+        if (h + 56 > x.size()) {
+            return false;
+        }
+        uint32_t vaddr, raw, size;
+        memcpy(&vaddr, &x[h + 4], 4);
+        memcpy(&raw, &x[h + 12], 4);
+        memcpy(&size, &x[h + 16], 4);
+        if (va >= vaddr && va - vaddr < size) {
+            *pos = raw + (va - vaddr);
+            return true;
+        }
+    }
+    if (va >= base && va - base < headers) {
+        *pos = va - base;
+        return true;
+    }
+    return false;
+}
+
+bool PatchModFits(const std::string &mod_txt, const std::string &iso_path, uint64_t xbe_offset, uint32_t xbe_size)
+{
+    std::ifstream in(mod_txt);
+    if (!in || !ReadXbe(iso_path, xbe_offset, xbe_size)) {
+        return false;
+    }
+    std::string line;
+    bool in_default = false;
+    unsigned checked = 0;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line[0] == '[') {
+            in_default = line.find("[default.xbe]") == 0;
+            continue;
+        }
+        if (!in_default || line.rfind("0x", 0) != 0) {
+            continue;
+        }
+        const size_t colon = line.find(':'), arrow = line.find("->");
+        if (colon == std::string::npos || arrow == std::string::npos || arrow < colon) {
+            continue;   // nothing to check it against
+        }
+        const uint32_t va = (uint32_t)strtoul(line.c_str() + 2, nullptr, 16);
+        std::vector<uint8_t> old;
+        std::istringstream hex(line.substr(colon + 1, arrow - colon - 1));
+        std::string byte;
+        while (hex >> byte) {
+            old.push_back((uint8_t)strtoul(byte.c_str(), nullptr, 16));
+        }
+        uint32_t pos;
+        if (old.empty() || !XbePos(va, &pos) || (uint64_t)pos + old.size() > g_xbe.data.size() ||
+            memcmp(&g_xbe.data[pos], old.data(), old.size())) {
+            return false;
+        }
+        checked++;
+    }
+    return checked > 0;
+}
+
 std::string PatchesForStart(const std::string &iso_path, uint64_t xbe_offset, uint32_t xbe_size, uint32_t title_id,
                             bool widescreen, bool fps60, std::string *pokes, bool *widescreen_on)
 {
@@ -603,11 +751,40 @@ std::string PatchesForStart(const std::string &iso_path, uint64_t xbe_offset, ui
         if (!title_id || std::find(file.title_ids.begin(), file.title_ids.end(), title_id) == file.title_ids.end()) {
             continue;
         }
+        // Patch 240 (issue #30, per game): a patch by address only (nothing to check it against) that crashed
+        // Conker's European disc in its first cutscene; the app's own 60 FPS mod (checked) is used instead
+        if (file.file_name.find("Conker - Live & Reloaded {Misc}") != std::string::npos) {
+            snprintf(buf, sizeof(buf), "  %s: skipped: by address only, crashed a version (issue #30)\n", file.file_name.c_str());
+            log += buf;
+            continue;
+        }
         // A patch can be both; it needs both switches on.
         const bool is_wide = strcmp(g_kinds[f], "60fps") != 0, is_fps = strcmp(g_kinds[f], "widescreen") != 0;
         // One of a kind for a game: two authors' patches of the same thing can fight.
         if ((is_wide && (!widescreen || done_wide)) || (is_fps && (!fps60 || done_fps))) {
             continue;
+        }
+        // Patch 322: all or nothing. A part of the file made for this release (not one marked for another of its
+        // releases) that isn't in the disc means another build of the game: none of the file goes on. Def Jam's NTSC
+        // file: its Cutscene Fix wasn't in the European disc, its Widescreen part found its bytes in other code there.
+        {
+            std::string missing;
+            for (const auto &g : file.groups) {
+                if (g.info || !g.default_on || (g.title_id && g.title_id != XbeTitleId())) {
+                    continue;
+                }
+                const std::string why = PatchGroupProblem(file, g, iso_path, xbe_offset, xbe_size);
+                if (why == "Not in this game") {
+                    missing = g.name;
+                    break;
+                }
+            }
+            if (!missing.empty()) {
+                snprintf(buf, sizeof(buf), "  %s: skipped whole: its part \"%s\" isn't in this disc (another build)\n",
+                         file.file_name.c_str(), missing.c_str());
+                log += buf;
+                continue;
+            }
         }
         std::string lines;
         size_t changes = 0;

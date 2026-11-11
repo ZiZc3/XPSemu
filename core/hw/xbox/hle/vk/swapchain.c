@@ -13,8 +13,15 @@
  *    screen's) is averaged down, each window pixel the mean of the frame
  *    pixels it covers, where a bilinear sample would skip most of them and
  *    keep the edges' stairs;
- *  - a smaller one is scaled up bilinearly, or by Snapdragon Game Super
- *    Resolution 1, which rebuilds its edges.
+ *  - a smaller one is scaled up bilinearly, by Snapdragon Game Super
+ *    Resolution 1, which rebuilds its edges, or by AMD FidelityFX CAS,
+ *    which scales and sharpens in one pass (CAS also sharpens a frame at
+ *    its place's size);
+ *  - the CRT filter last, in the same window pass (patch 247): scanlines
+ *    from the game's own lines, and for "CRT" a slight curve, a vignette
+ *    and a light shadow mask.
+ * CAS is our own GLSL of the upscaling path of AMD's ffx_cas.h (MIT,
+ * licenses/FidelityFX-CAS.txt); the CRT filter is our own.
  * FXAA is FXAA 3.11 Quality (Timothy Lottes) as PCSX2's fxaa.fx tunes it
  * (GPL-3.0-or-later); SGSR is Qualcomm's sgsr1_shader_mobile.frag
  * (BSD-3-Clause, licenses/snapdragon-gsr.license.txt).
@@ -42,7 +49,7 @@
 #define PS_FRAMES 3             /* the presenter's submits in flight */
 #define PS_RAMP 1024            /* a frame's share of the ramp buffer (768 used) */
 
-enum { P_BILINEAR, P_AREA, P_SGSR, P_FXAA, P_COUNT };
+enum { P_BILINEAR, P_AREA, P_SGSR, P_CAS, P_FXAA, P_COUNT };   /* the window's before P_FXAA */
 
 typedef struct PsFrame {
     VkCommandPool pool;
@@ -123,6 +130,15 @@ static const char k_vs[] =
     "}\n";
 /* every fragment shader's start: its inputs and the gamma ramp (768 bytes,
  * a channel's 256 after another's, as gamma.c's) */
+#define FS_RAMP \
+    "uint lut(uint i) {\n" \
+    "  uint word = g.w[i >> 4][(i >> 2) & 3u];\n" \
+    "  return (word >> ((i & 3u) * 8u)) & 0xFFu;\n" \
+    "}\n" \
+    "vec4 ramp(vec3 c) {\n" \
+    "  uvec3 v = uvec3(clamp(c, 0.0, 1.0) * 255.0 + 0.5);\n" \
+    "  return vec4(float(lut(v.r)), float(lut(256u + v.g)), float(lut(512u + v.b)), 255.0) / 255.0;\n" \
+    "}\n"
 static const char k_fs_head[] =
     "#version 450\n"
     "layout(push_constant) uniform P { vec4 rect; vec4 extra; vec4 rot; } pc;\n"
@@ -130,13 +146,57 @@ static const char k_fs_head[] =
     "layout(set = 0, binding = 1, std140) uniform G { uvec4 w[48]; } g;\n"
     "layout(location = 0) in vec2 v_uv;\n"
     "layout(location = 0) out vec4 o;\n"
-    "uint lut(uint i) {\n"
-    "  uint word = g.w[i >> 4][(i >> 2) & 3u];\n"
-    "  return (word >> ((i & 3u) * 8u)) & 0xFFu;\n"
-    "}\n"
-    "vec4 ramp(vec3 c) {\n"
-    "  uvec3 v = uvec3(clamp(c, 0.0, 1.0) * 255.0 + 0.5);\n"
-    "  return vec4(float(lut(v.r)), float(lut(256u + v.g)), float(lut(512u + v.b)), 255.0) / 255.0;\n"
+    FS_RAMP;
+/* The window pass's (patch 247): the same, with post (x: the CRT filter, y:
+ * the game's lines, z: the picture's height in window pixels); the body's
+ * main is body_main, run by k_fs_win_tail's between the CRT curve and the
+ * rest of the filter. v_uv is the body's, curved. */
+static const char k_fs_win_head[] =
+    "#version 450\n"
+    "layout(push_constant) uniform P { vec4 rect; vec4 extra; vec4 rot; vec4 post; } pc;\n"
+    "layout(set = 0, binding = 0) uniform sampler2D u_tex;\n"
+    "layout(set = 0, binding = 1, std140) uniform G { uvec4 w[48]; } g;\n"
+    "layout(location = 0) in vec2 v_uv_in;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "vec2 v_uv;\n"
+    FS_RAMP
+    "#define main body_main\n";
+/* The CRT filter (our own): scanlines, dark between the game's lines, as a
+ * cosine averaged over the window pixel (no moire where a line is only 2 or
+ * 3 pixels tall), brightness made up; CRT adds a slight barrel curve (black
+ * outside), a vignette and an aperture-grille mask every 3 pixels. */
+static const char k_fs_win_tail[] =
+    "#undef main\n"
+    "void main() {\n"
+    "  v_uv = v_uv_in;\n"
+    "  int crt = int(pc.post.x + 0.5);\n"
+    "  if (crt == 2) {\n"
+    "    vec2 c = v_uv * 2.0 - 1.0;\n"
+    "    c *= 1.0 + vec2(0.03, 0.045) * (c.yx * c.yx);\n"
+    "    v_uv = c * 0.5 + 0.5;\n"
+    "    if (any(lessThan(v_uv, vec2(0.0))) || any(greaterThan(v_uv, vec2(1.0)))) {\n"
+    "      o = vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "      return;\n"
+    "    }\n"
+    "  }\n"
+    "  body_main();\n"
+    "  if (crt > 0) {\n"
+    "    float k = crt == 2 ? 0.45 : 0.35;\n"
+    "    float lines = max(pc.post.y, 1.0);\n"
+    "    float w = lines / max(pc.post.z, 1.0);\n"     /* a window pixel, in lines */
+    "    float att = w > 0.001 ? max(sin(3.14159265 * w) / (3.14159265 * w), 0.0) : 1.0;\n"
+    "    float scan = 1.0 - k * (0.5 + 0.5 * cos(6.28318531 * v_uv.y * lines) * att);\n"
+    "    vec3 col = o.rgb * scan * (1.0 + 0.5 * k);\n"
+    "    if (crt == 2) {\n"
+    "      vec3 mask = vec3(0.9);\n"
+    "      int m = int(mod(gl_FragCoord.x, 3.0));\n"
+    "      if (m == 0) mask.r = 1.1; else if (m == 1) mask.g = 1.1; else mask.b = 1.1;\n"
+    "      col *= mask;\n"
+    "      vec2 e = v_uv * (1.0 - v_uv.yx);\n"
+    "      col *= min(pow(max(e.x * e.y * 16.0, 0.0), 0.15), 1.0);\n"
+    "    }\n"
+    "    o = vec4(clamp(col, 0.0, 1.0), 1.0);\n"
+    "  }\n"
     "}\n";
 static const char k_fs_bilinear[] =
     "void main() {\n"
@@ -307,6 +367,55 @@ static const char k_fs_sgsr[] =
     "  o = ramp(color.xyz);\n"
     "}\n";
 
+/* AMD FidelityFX CAS (Contrast Adaptive Sharpening), the upscaling path of
+ * ffx_cas.h (MIT, Copyright (c) 2019 Advanced Micro Devices, Inc.;
+ * licenses/FidelityFX-CAS.txt), written again in our own GLSL: for each
+ * window pixel the 2x2 frame pixels around it (f g / j k), each sharpened by
+ * its cross of 5 (a weight per channel from how far its min and max are from
+ * 0 and 1: less where the contrast is already high), the four blended
+ * bilinearly, each weighted down by its own contrast (thin edges). One pass:
+ * scaled and sharpened. extra.x: the peak, -1 / mix(8, 5, sharpness). */
+static const char k_fs_cas[] =
+    "vec3 cas_t(ivec2 p, ivec2 top) { return texelFetch(u_tex, clamp(p, ivec2(0), top), 0).rgb; }\n"
+    "vec3 cas_amp(vec3 mn, vec3 mx) { return sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1.0 / 65536.0)), 0.0, 1.0)); }\n"
+    "void main() {\n"
+    "  ivec2 size = textureSize(u_tex, 0), top = size - 1;\n"
+    "  vec2 pp = v_uv * vec2(size) - 0.5;\n"
+    "  vec2 fp = floor(pp);\n"
+    "  pp -= fp;\n"
+    "  ivec2 sp = ivec2(fp);\n"
+    /*  b c      the frame pixels read
+     *e f g h
+     *i j k l
+     *  n p     */
+    "  vec3 cb = cas_t(sp + ivec2(0, -1), top), cc = cas_t(sp + ivec2(1, -1), top);\n"
+    "  vec3 ce = cas_t(sp + ivec2(-1, 0), top), cf = cas_t(sp, top);\n"
+    "  vec3 cg = cas_t(sp + ivec2(1, 0), top), ch = cas_t(sp + ivec2(2, 0), top);\n"
+    "  vec3 ci = cas_t(sp + ivec2(-1, 1), top), cj = cas_t(sp + ivec2(0, 1), top);\n"
+    "  vec3 ck = cas_t(sp + ivec2(1, 1), top), cl = cas_t(sp + ivec2(2, 1), top);\n"
+    "  vec3 cn = cas_t(sp + ivec2(0, 2), top), cp = cas_t(sp + ivec2(1, 2), top);\n"
+    "  vec3 mnf = min(min(min(cb, ce), min(cf, cg)), cj), mxf = max(max(max(cb, ce), max(cf, cg)), cj);\n"
+    "  vec3 mng = min(min(min(cc, cf), min(cg, ch)), ck), mxg = max(max(max(cc, cf), max(cg, ch)), ck);\n"
+    "  vec3 mnj = min(min(min(cf, ci), min(cj, ck)), cn), mxj = max(max(max(cf, ci), max(cj, ck)), cn);\n"
+    "  vec3 mnk = min(min(min(cg, cj), min(ck, cl)), cp), mxk = max(max(max(cg, cj), max(ck, cl)), cp);\n"
+    "  float peak = pc.extra.x;\n"
+    "  vec3 wf = cas_amp(mnf, mxf) * peak, wg = cas_amp(mng, mxg) * peak;\n"
+    "  vec3 wj = cas_amp(mnj, mxj) * peak, wk = cas_amp(mnk, mxk) * peak;\n"
+    "  float s = (1.0 - pp.x) * (1.0 - pp.y), t = pp.x * (1.0 - pp.y);\n"
+    "  float u = (1.0 - pp.x) * pp.y, v = pp.x * pp.y;\n"
+    "  s /= 1.0 / 32.0 + mxf.g - mnf.g;\n"
+    "  t /= 1.0 / 32.0 + mxg.g - mng.g;\n"
+    "  u /= 1.0 / 32.0 + mxj.g - mnj.g;\n"
+    "  v /= 1.0 / 32.0 + mxk.g - mnk.g;\n"
+    "  vec3 qbe = wf * s, qch = wg * t, qin = wj * u, qlp = wk * v;\n"
+    "  vec3 qf = wg * t + wj * u + s, qg = wf * s + wk * v + t;\n"
+    "  vec3 qj = wf * s + wk * v + u, qk = wg * t + wj * u + v;\n"
+    "  vec3 sum = (cb + ce) * qbe + (cc + ch) * qch + (ci + cn) * qin + (cl + cp) * qlp +\n"
+    "             cf * qf + cg * qg + cj * qj + ck * qk;\n"
+    "  vec3 wsum = 4.0 * (wf * s + wg * t + wj * u + wk * v) + (s + t + u + v);\n"
+    "  o = ramp(clamp(sum / wsum, 0.0, 1.0));\n"
+    "}\n";
+
 static VkShaderModule module(HleShaderStage stage, const char *head, const char *body)
 {
     g_autofree char *src = g_strdup_printf("%s%s", head, body);
@@ -395,7 +504,8 @@ static bool init(void)
         T.vkCreateDescriptorSetLayout(g_hvk.dev, &dci, NULL, &g_ps.dsl) != VK_SUCCESS) {
         return false;
     }
-    VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48 };
+    /* 64: the window pass's post (patch 247) after rect, extra and rot */
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64 };
     VkPipelineLayoutCreateInfo lci = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
         .pSetLayouts = &g_ps.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
@@ -449,14 +559,23 @@ static bool init(void)
         f->ramp_stale = true;
     }
     g_ps.vs = module(HLE_SHADER_VERTEX, k_vs, "");
-    static const char *const body[P_COUNT] = { k_fs_bilinear, k_fs_area, k_fs_sgsr, k_fs_fxaa };
+    static const char *const body[P_COUNT] = { k_fs_bilinear, k_fs_area, k_fs_sgsr, k_fs_cas, k_fs_fxaa };
     for (unsigned i = 0; i < P_COUNT; i++) {
-        g_ps.fs[i] = module(HLE_SHADER_FRAGMENT, k_fs_head, body[i]);
+        if (i < P_FXAA) {               /* the window's: with the CRT filter after (patch 247) */
+            g_autofree char *b = g_strdup_printf("%s%s", body[i], k_fs_win_tail);
+            g_ps.fs[i] = module(HLE_SHADER_FRAGMENT, k_fs_win_head, b);
+            if (!g_ps.fs[i]) {          /* never no picture: without the filter */
+                hle_log("hakuX-hle-back", "present: window shader %u with the CRT filter didn't compile", i);
+                g_ps.fs[i] = module(HLE_SHADER_FRAGMENT, k_fs_head, body[i]);
+            }
+        } else {
+            g_ps.fs[i] = module(HLE_SHADER_FRAGMENT, k_fs_head, body[i]);
+        }
     }
     g_ps.pipe[P_FXAA] = pipeline(g_ps.fs[P_FXAA], VK_FORMAT_R8G8B8A8_UNORM);
-    hle_log("hakuX-hle-back", "present: ready (shaders: bilinear %d, averaging %d, SGSR %d, FXAA %d)",
+    hle_log("hakuX-hle-back", "present: ready (shaders: bilinear %d, averaging %d, SGSR %d, CAS %d, FXAA %d)",
             g_ps.fs[P_BILINEAR] != VK_NULL_HANDLE, g_ps.fs[P_AREA] != VK_NULL_HANDLE,
-            g_ps.fs[P_SGSR] != VK_NULL_HANDLE, g_ps.pipe[P_FXAA] != VK_NULL_HANDLE);
+            g_ps.fs[P_SGSR] != VK_NULL_HANDLE, g_ps.fs[P_CAS] != VK_NULL_HANDLE, g_ps.pipe[P_FXAA] != VK_NULL_HANDLE);
     return g_ps.fs[P_BILINEAR] != VK_NULL_HANDLE;
 }
 
@@ -844,7 +963,7 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
 
 /* A quad of pipeline p over rect (clip space) into the rendering open. */
 static void quad(VkCommandBuffer cb, PsFrame *f, unsigned set, VkPipeline p, VkImageView src,
-                 const float pc[12], uint32_t w, uint32_t h)
+                 const float pc[16], uint32_t w, uint32_t h)
 {
     VkDescriptorImageInfo ii = { g_ps.smp, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorBufferInfo bi = { g_ps.ubo, (VkDeviceSize)(f - g_ps.fr) * PS_RAMP, 768 };
@@ -860,7 +979,7 @@ static void quad(VkCommandBuffer cb, PsFrame *f, unsigned set, VkPipeline p, VkI
     T.vkCmdSetViewport(cb, 0, 1, &vp);
     T.vkCmdSetScissor(cb, 0, 1, &sc);
     T.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ps.pl, 0, 1, &f->set[set], 0, NULL);
-    T.vkCmdPushConstants(cb, g_ps.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+    T.vkCmdPushConstants(cb, g_ps.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, pc);
     T.vkCmdDraw(cb, 4, 1, 0, 0);
 }
 
@@ -877,22 +996,40 @@ static void rendering(VkCommandBuffer cb, VkImageView v, uint32_t w, uint32_t h,
 }
 
 /* How the frame meets the window, logged when that changes. */
+static int g_crt;                       /* the CRT filter: 0 off, 1 scanlines, 2 CRT (patch 247) */
+static float g_cas_peak = -1.0f / 6.5f; /* CAS's: -1 / mix(8, 5, sharpness), 0.5 */
+
+void hle_present_set_cas(int level)
+{
+    static const float k_sharp[5] = { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f };
+    const float s = k_sharp[level < 0 ? 0 : level > 4 ? 4 : level];
+    g_cas_peak = -1.0f / (8.0f + (5.0f - 8.0f) * s);
+}
+
+void hle_present_set_crt(int mode)
+{
+    g_crt = mode < 0 ? 0 : mode > 2 ? 2 : mode;
+}
+
 static void log_path(unsigned p, bool fxaa, uint32_t vw, uint32_t vh)
 {
     static unsigned s_p = ~0u;
     static bool s_fxaa;
+    static int s_crt = -1;
     static uint32_t s_w, s_h, s_vw, s_vh;
-    if (p == s_p && fxaa == s_fxaa && g_ps.f.w == s_w && g_ps.f.h == s_h && vw == s_vw && vh == s_vh) {
+    if (p == s_p && fxaa == s_fxaa && g_crt == s_crt && g_ps.f.w == s_w && g_ps.f.h == s_h && vw == s_vw && vh == s_vh) {
         return;
     }
     s_p = p;
     s_fxaa = fxaa;
+    s_crt = g_crt;
     s_w = g_ps.f.w;
     s_h = g_ps.f.h;
     s_vw = vw;
     s_vh = vh;
-    hle_log("hakuX-hle-back", "present: %ux%u%s into %ux%u: %s", s_w, s_h, fxaa ? " after FXAA" : "", vw, vh,
-            p == P_AREA ? "averaged down" : p == P_SGSR ? "scaled up by SGSR" : "bilinear");
+    hle_log("hakuX-hle-back", "present: %ux%u%s into %ux%u: %s%s", s_w, s_h, fxaa ? " after FXAA" : "", vw, vh,
+            p == P_AREA ? "averaged down" : p == P_SGSR ? "scaled up by SGSR" : p == P_CAS ? "CAS" : "bilinear",
+            g_crt == 2 ? ", then the CRT filter" : g_crt == 1 ? ", then scanlines" : "");
 }
 
 /* The counter's number; below 0, nothing shown (nc_present_frame). */
@@ -1687,7 +1824,7 @@ static VkImageView fg_frame(VkCommandBuffer cb, PsFrame *f, VkImageView src, uin
                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
             rendering(cb, g_fg.img[to].view, vw, vh, false);
-            const float pc[12] = { -1.0f, -1.0f, 1.0f, 1.0f, 1.0f / (float)vw, 1.0f / (float)vh, 0, 0, 1.0f, 0, 0, 1.0f };
+            const float pc[16] = { -1.0f, -1.0f, 1.0f, 1.0f, 1.0f / (float)vw, 1.0f / (float)vh, 0, 0, 1.0f, 0, 0, 1.0f, 0, 0, 0, 0 };
             quad(cb, f, 2, g_fg.copy, src, pc, vw, vh);
             T.vkCmdEndRendering(cb);
             barrier(cb, g_fg.img[to].img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -1806,7 +1943,7 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
                 rendering(cb, g_ps.fx_view, g_ps.f.w, g_ps.f.h, false);
-                static const float whole[12] = { -1.0f, -1.0f, 1.0f, 1.0f, 0, 0, 0, 0, 1.0f, 0, 0, 1.0f };
+                static const float whole[16] = { -1.0f, -1.0f, 1.0f, 1.0f, 0, 0, 0, 0, 1.0f, 0, 0, 1.0f, 0, 0, 0, 0 };
                 quad(cb, f, 1, g_ps.pipe[P_FXAA], g_ps.f.view, whole, g_ps.f.w, g_ps.f.h);
                 T.vkCmdEndRendering(cb);
                 barrier(cb, g_ps.fx_img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1837,9 +1974,20 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
         const float vw = sx * (float)ww, vh = sy * (float)wh;
         const float rx = (float)g_ps.f.w / vw, ry = (float)g_ps.f.h / vh;
         unsigned p = P_BILINEAR;
-        float pc[12] = { -sx, -sy, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f, g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
+        /* post (patch 247): the CRT filter, the game's own lines (the frame's over the render scale), the
+         * picture's height in window pixels */
+        extern int hle_host_render_scale(void);
+        const int rscale = MIN(MAX(hle_host_render_scale(), 1), 10);   /* patch 328 */
+        const float lines = (float)MAX(g_ps.f.h / (uint32_t)rscale, 1u);
+        float pc[16] = { -sx, -sy, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f, g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3],
+                         (float)g_crt, lines, vh, 0.0f };
+        const bool cas = upscale == HLE_UPSCALE_CAS && g_ps.pipe[P_CAS];
         if (fg_out) {
-            /* the picture's size already */
+            /* the picture's size already: CAS only sharpens it */
+            if (cas) {
+                p = P_CAS;
+                pc[4] = g_cas_peak;
+            }
         } else if ((rx > 1.01f || ry > 1.01f) && average && g_ps.pipe[P_AREA]) {
             p = P_AREA;
             pc[4] = rx;
@@ -1850,6 +1998,9 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
             pc[5] = 1.0f / (float)g_ps.f.h;
             pc[6] = (float)g_ps.f.w;
             pc[7] = (float)g_ps.f.h;
+        } else if (cas) {
+            p = P_CAS;                  /* scaled and sharpened, or sharpened at its own size */
+            pc[4] = g_cas_peak;
         }
         quad(cb, f, 0, g_ps.pipe[p], src, pc, iw, ih);
         log_path(p, fxaa_done, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f));

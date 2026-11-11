@@ -87,6 +87,9 @@ bool hle_pbd_blit_images(uint32_t sbase, uint32_t sp, uint32_t dbase, uint32_t d
 uint64_t hle_pbd_copy_begin(uint32_t slo, uint32_t sp, uint32_t dlo, uint32_t dp, uint32_t row,
                             uint32_t rows, uint32_t dbase);
 void hle_pbd_copy_done(uint32_t dlo, uint32_t dp, uint32_t row, uint32_t rows, uint64_t dep);
+/* patch 344: the next hle_pbd_copy_begin waits for the landings it needs
+ * (returns 0) instead of queuing the copy: its caller does more than copy */
+void hle_pbd_copy_sync_next(void);
 /* Counters: targets' images landed, copies queued, decoder waits for them */
 void hle_pbd_coh_counts(uint64_t *lands, uint64_t *copies, uint64_t *waits);
 /* After a blit's copy in memory (dep: queued, hle_pbd_copy_begin): the

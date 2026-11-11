@@ -42,7 +42,9 @@
 #include "bc7-encode.h"
 #include "cover-download.hh"
 #include "ui-sounds.hh"
+#include "updater.hh"
 #include "xiso.hh"
+#include "trainers.hh"
 #include <fpng.h>
 
 DashboardScene g_dashboard;
@@ -51,6 +53,10 @@ DashboardScene g_dashboard;
 static const char *const kGamesDir = "/data/xpsemu/games";
 // Alpha 2's games folder: still read, so games already there stay (patch 170).
 static const char *const kOldGamesDir = "/data/xemu/games";
+// Downloaded covers (issue #35): in XPSemu's own folder since 3.3. Alpha 2's /data/xemu/covers is still read,
+// but nothing is written there: /data/xemu only exists for players who had Alpha 2.
+static const char *const kCoversDir = "/data/xpsemu/covers";
+static const char *const kOldCoversDir = "/data/xemu/covers";
 static inline bool runstate_is_running() { return false; }
 enum { RUN_STATE_PAUSED };
 static inline void vm_stop(int) {}
@@ -492,6 +498,10 @@ static std::string CleanName(const std::string &stem)
     while (!out.empty() && (out.back() == ' ' || out.back() == '-')) {
         out.pop_back();
     }
+    // "Game.1.cso" / "Game.1.cci" (a first part) leaves ".1" behind (patch 174).
+    if (out.size() > 2 && out[out.size() - 2] == '.' && out.back() == '1') {
+        out.resize(out.size() - 2);
+    }
     // "Game (Europe).xiso.iso" leaves ".xiso" behind.
     if (out.size() > 5 && !strcasecmp(out.c_str() + out.size() - 5, ".xiso")) {
         out.resize(out.size() - 5);
@@ -524,7 +534,8 @@ static void ListCovers()
     for (const auto &games : GameDirs()) { // Each one's covers folder, first
         dirs.push_back(games + "/covers");
     }
-    dirs.push_back("/data/xemu/covers");
+    dirs.push_back(kCoversDir);
+    dirs.push_back(kOldCoversDir);     // Alpha 2's, still read
     std::error_code ec;
     for (const auto &dir : dirs) {
         if (!std::filesystem::is_directory(dir, ec)) {
@@ -591,28 +602,384 @@ static XemuTexture GameCover(const DashboardScene::Game &game)
 
 //
 // As the core chooses a game's region: PAL only if it isn't also for America or Japan.
+// A game's frame rate mod (hakuX's, in /app0/mods/<title>.<version>/<kind>/mod.txt), "" none. Patch 244: one
+// frame rate patch a game: the mod made for this disc's version; else another version's mod of the title when
+// every byte it changes is what it expects on this disc (checked here, and again by the core); only with no mod
+// that fits does a Jay's 60 FPS patch go on (PatchesForStart)
+static std::string FpsModFor(const DashboardScene::Game &game, bool want_120)
+{
+    static std::map<std::string, std::string> cache;
+    const std::string ckey = game.path + (want_120 ? "|120" : "|60");
+    const auto hit = cache.find(ckey);
+    if (hit != cache.end()) {
+        return hit->second;
+    }
+    const XisoInfo &xiso = Art(game.path).info;
+    if (!xiso.title_id) {
+        return "";          // not read yet: asked again later
+    }
+    std::string &answer = cache[ckey];
+    const char *const kinds[2] = { want_120 ? "120fps" : "60fps", want_120 ? "60fps" : "120fps" };
+    char dir[64];
+    snprintf(dir, sizeof(dir), "%08X.%u", xiso.title_id, xiso.version);
+    struct stat st;
+    for (const char *kind : kinds) {
+        const std::string f = std::string("/app0/mods/") + dir + "/" + kind + "/mod.txt";
+        if (stat(f.c_str(), &st) == 0) {
+            return answer = f;
+        }
+    }
+    char prefix[16];
+    snprintf(prefix, sizeof(prefix), "%08X.", xiso.title_id);
+    std::vector<std::string> others;
+    std::error_code ec;
+    for (const auto &e : std::filesystem::directory_iterator("/app0/mods", ec)) {
+        const std::string n = e.path().filename().string();
+        if (xiso.title_id && n.size() > 9 && !strncasecmp(n.c_str(), prefix, 9)) {
+            others.push_back(e.path().string());
+        }
+    }
+    std::sort(others.begin(), others.end());
+    const std::string xbe = xiso.xbe_file.empty() ? game.path : xiso.xbe_file;
+    for (const char *kind : kinds) {
+        for (const std::string &d : others) {
+            const std::string f = d + "/" + kind + "/mod.txt";
+            if (stat(f.c_str(), &st) == 0 && PatchModFits(f, xbe, xiso.xbe_offset, xiso.xbe_size)) {
+                xog_ui_log("frame rate mod: %s fits this disc (version %u)", f.c_str(), xiso.version);
+                return answer = f;
+            }
+        }
+    }
+    return "";
+}
+
 // The game has an FPS Patch: our own unlock, or a frame rate mod made for this very disc (patch 163).
 static bool GameFpsPatchAvail(const DashboardScene::Game &game)
 {
     if (Unlock60Known(KeyOf(game))) {
         return true;
     }
-    const XisoInfo &xiso = Art(game.path).info;
-    char dir[64];
-    snprintf(dir, sizeof(dir), "%08X.%u", xiso.title_id, xiso.version);
-    for (const char *kind : { "60fps", "120fps" }) {
-        const std::string f = std::string("/app0/mods/") + dir + "/" + kind + "/mod.txt";
-        struct stat st;
-        if (stat(f.c_str(), &st) == 0) {
-            return true;
+    return !FpsModFor(game, false).empty();
+}
+
+// Versions of this title that have a frame rate mod (/app0/mods/<title>.<version>), for the FPS Patch row
+// when this disc's version has none (patch 179).
+static std::string ModVersionsText(uint32_t title_id)
+{
+    std::vector<unsigned> versions;
+    char prefix[16];
+    snprintf(prefix, sizeof(prefix), "%08X.", title_id);
+    std::error_code ec;
+    for (const auto &e : std::filesystem::directory_iterator("/app0/mods", ec)) {
+        const std::string n = e.path().filename().string();
+        if (title_id && n.size() > 9 && !strncasecmp(n.c_str(), prefix, 9)) {
+            versions.push_back((unsigned)strtoul(n.c_str() + 9, nullptr, 10));
         }
     }
-    return false;
+    std::sort(versions.begin(), versions.end());
+    std::string out;
+    for (size_t i = 0; i < versions.size(); i++) {
+        out += (i ? ", v" : "v") + std::to_string(versions[i]);
+    }
+    return out;
+}
+
+// ---- Duplicates (patch 180): two files of one disc (same title ID, version, region and XBE size,
+// so a game's other discs aren't one), e.g. the ISO and a CHD of it. The newer file is the duplicate
+// (patch 181); it's marked, never hidden or removed.
+static std::map<std::string, std::vector<std::string>> g_duplicates;   // a duplicate's path -> the game it copies
+
+// ---- A game's own saves (patch 182): hdd/Partition1/UDATA/<title ID>, a folder a save. "Deleted" =
+// moved to /data/xpsemu/deleted-saves/<title ID>-<time>, so a mistake can be undone. ----
+static std::string GameSavesDir(uint32_t title_id)
+{
+    if (!title_id) {
+        return "";
+    }
+    char id[16];
+    std::error_code ec;
+    for (const char *fmt : { "%08x", "%08X" }) {
+        snprintf(id, sizeof(id), fmt, title_id);
+        const std::string dir = std::string("/data/xpsemu/hdd/Partition1/UDATA/") + id;
+        if (std::filesystem::is_directory(dir, ec)) {
+            return dir;
+        }
+    }
+    return "";
+}
+
+static int GameSavesCount(const std::string &dir)
+{
+    int n = 0;
+    std::error_code ec;
+    for (const auto &e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.is_directory(ec)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+// Moves them aside; "" when done, else why not.
+static std::string GameSavesDelete(const std::string &dir, uint32_t title_id)
+{
+    std::error_code ec;
+    const std::string bin = "/data/xpsemu/deleted-saves";
+    std::filesystem::create_directories(bin, ec);
+    char name[64];
+    const time_t now = time(nullptr);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    snprintf(name, sizeof(name), "%08X-%04d%02d%02d-%02d%02d%02d", title_id, tm.tm_year + 1900, tm.tm_mon + 1,
+             tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    const std::string to = bin + "/" + name;
+    if (rename(dir.c_str(), to.c_str()) != 0) {
+        return std::string("couldn't move them (") + strerror(errno) + ")";
+    }
+    fprintf(stderr, "XPSemu: game saves %s moved to %s\n", dir.c_str(), to.c_str());
+    return "";
 }
 
 static bool RegionIsPal(uint32_t region)
 {
     return (region & 4) && !(region & 3);
+}
+
+// ---- The disc in Redump's list (libretro-database, CC BY-SA 4.0; redump-index.h, patch 176): its
+// region, languages and revision. Found by title ID, then the file's own name if it is the Redump
+// name, else the discs whose region fits the XBE's region bits (1 America, 2 Japan and Asia, 4 the
+// rest of the world). ----
+#include "redump-index.h"
+
+struct DiscFacts {
+    std::string region, languages, revision;    // "" when not known for sure
+    std::string redump_name;                    // when one disc matched exactly
+};
+
+static uint32_t RedumpRegionBits(const char *region)
+{
+    uint32_t bits = 0;
+    std::string r(region);
+    size_t at = 0;
+    while (at <= r.size()) {
+        size_t end = r.find(", ", at);
+        std::string one = r.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        if (one == "World") {
+            bits |= 7;
+        } else if (one == "USA" || one == "Canada" || one == "Brazil" || one == "Latin America" || one == "Mexico") {
+            bits |= 1;
+        } else if (one == "Japan" || one == "Asia" || one == "Korea" || one == "Taiwan" || one == "China" ||
+                   one == "Hong Kong") {
+            bits |= 2;
+        } else if (!one.empty()) {
+            bits |= 4;      // Europe, Australia, Germany, France, Spain, Italy, UK, Russia...
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        at = end + 2;
+    }
+    return bits;
+}
+
+static std::string RedumpKey(std::string s)
+{
+    std::string out;
+    for (char ch : s) {
+        if (isalnum((unsigned char)ch)) {
+            out += (char)tolower((unsigned char)ch);
+        }
+    }
+    return out;
+}
+
+static const DiscFacts &DiscFactsOf(const std::string &path, uint32_t title_id, uint32_t region_bits,
+                                    const std::string &stem)
+{
+    static std::map<std::string, DiscFacts> cache;
+    static const DiscFacts none;
+    if (!title_id) {
+        return none;        // the disc not read yet: asked again later
+    }
+    auto hit = cache.find(path);
+    if (hit != cache.end()) {
+        return hit->second;
+    }
+    DiscFacts &f = cache[path];
+    const RedumpDisc *lo = std::lower_bound(std::begin(kRedumpDiscs), std::end(kRedumpDiscs), title_id,
+                                            [](const RedumpDisc &d, uint32_t id) { return d.title_id < id; });
+    std::vector<const RedumpDisc *> all;
+    for (const RedumpDisc *d = lo; d != std::end(kRedumpDiscs) && d->title_id == title_id; d++) {
+        all.push_back(d);
+    }
+    if (!title_id || all.empty()) {
+        return f;
+    }
+    // The file named as Redump names the disc: that one ("Game (Europe) (En,Fr).xiso.iso" too)
+    std::string file = stem;
+    for (const char *tail : { ".xiso", ".1" }) {
+        if (file.size() > strlen(tail) && !strcasecmp(file.c_str() + file.size() - strlen(tail), tail)) {
+            file.resize(file.size() - strlen(tail));
+        }
+    }
+    const std::string key = RedumpKey(file);
+    std::vector<const RedumpDisc *> fit;
+    for (const RedumpDisc *d : all) {
+        if (RedumpKey(d->name) == key) {
+            fit.assign(1, d);
+            break;
+        }
+    }
+    if (fit.empty()) {
+        for (const RedumpDisc *d : all) {
+            if (!region_bits || (RedumpRegionBits(d->region) & region_bits)) {
+                fit.push_back(d);
+            }
+        }
+    }
+    if (fit.empty()) {
+        return f;
+    }
+    // Shown only what every disc left agrees on (regions together)
+    std::vector<std::string> regions;
+    bool same_lang = true, same_rev = true;
+    for (const RedumpDisc *d : fit) {
+        if (std::find(regions.begin(), regions.end(), d->region) == regions.end() && d->region[0]) {
+            regions.push_back(d->region);
+        }
+        same_lang &= !strcmp(d->languages, fit[0]->languages);
+        same_rev &= !strcmp(d->revision, fit[0]->revision);
+    }
+    for (size_t i = 0; i < regions.size() && i < 3; i++) {
+        f.region += (i ? ", " : "") + regions[i];
+    }
+    if (same_lang) {
+        for (const char *p = fit[0]->languages; *p; p++) {
+            f.languages += *p;
+            if (*p == ',') {
+                f.languages += ' ';
+            }
+        }
+    }
+    if (same_rev) {
+        f.revision = fit[0]->revision;
+    }
+    if (fit.size() == 1) {
+        f.redump_name = fit[0]->name;
+    }
+    return f;
+}
+
+static const DiscFacts &DiscFactsOf(const DashboardScene::Game &game)
+{
+    const GameArt &art = Art(game.path);
+    return DiscFactsOf(game.path, game.title_id ? game.title_id : art.info.title_id, art.info.region, art.stem);
+}
+
+// ---- Game language Auto (patch 178): the PS5's own language when the disc has it (Redump's list of
+// its languages), else English when it has that, else the disc's first; with nothing known, the
+// PS5's (a game without it falls back by itself). ----
+extern "C" int sceSystemServiceParamGetInt(int param, int *value);
+
+struct LangPick { uint32_t xbox; const char *code; const char *name; };
+
+static LangPick Ps5Language()
+{
+    int v = 1;
+#ifdef __PROSPERO__
+    if (sceSystemServiceParamGetInt(1, &v) != 0) {      // SCE_SYSTEM_SERVICE_PARAM_ID_LANG
+        v = 1;
+    }
+#endif
+    switch (v) {
+    case 0: return { 2, "Ja", "Japanese" };
+    case 2: case 22: return { 4, "Fr", "French" };
+    case 3: case 20: return { 5, "Es", "Spanish" };
+    case 4: return { 3, "De", "German" };
+    case 5: return { 6, "It", "Italian" };
+    case 7: case 17: return { 9, "Pt", "Portuguese" };
+    case 9: return { 7, "Ko", "Korean" };
+    case 10: case 11: return { 8, "Zh", "Chinese" };
+    default: return { 1, "En", "English" };            // English, and languages the Xbox doesn't have
+    }
+}
+
+static LangPick LangOfCode(const std::string &code)
+{
+    static const LangPick all[] = { { 1, "En", "English" }, { 2, "Ja", "Japanese" }, { 3, "De", "German" },
+                                    { 4, "Fr", "French" }, { 5, "Es", "Spanish" }, { 6, "It", "Italian" },
+                                    { 7, "Ko", "Korean" }, { 8, "Zh", "Chinese" }, { 9, "Pt", "Portuguese" } };
+    for (const LangPick &l : all) {
+        if (code == l.code) {
+            return l;
+        }
+    }
+    return { 0, "", "" };
+}
+
+// The disc's languages: Redump's list, else what its one region says
+static std::vector<std::string> DiscLanguages(const DiscFacts &f)
+{
+    std::vector<std::string> out;
+    std::string l = f.languages;
+    size_t at = 0;
+    while (at < l.size()) {
+        size_t end = l.find(',', at);
+        std::string one = l.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        while (!one.empty() && one[0] == ' ') {
+            one.erase(0, 1);
+        }
+        if (one.size() >= 2) {
+            out.push_back(one.substr(0, 2));
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        at = end + 1;
+    }
+    if (out.empty()) {
+        static const struct { const char *region, *code; } one_lang[] = {
+            { "USA", "En" }, { "Europe", "En" }, { "UK", "En" }, { "Australia", "En" }, { "Japan", "Ja" },
+            { "Germany", "De" }, { "France", "Fr" }, { "Spain", "Es" }, { "Italy", "It" }, { "Korea", "Ko" },
+            { "China", "Zh" }, { "Taiwan", "Zh" }, { "Brazil", "Pt" } };
+        for (const auto &r : one_lang) {
+            if (f.region == r.region) {
+                out.push_back(r.code);
+            }
+        }
+    }
+    return out;
+}
+
+static uint32_t GameLanguageFor(const DashboardScene::Game *game, std::string *why)
+{
+    if (g_cfg.language != 0) {
+        *why = "set in Settings";
+        return (uint32_t)g_cfg.language;
+    }
+    const LangPick want = Ps5Language();
+    if (!game) {
+        *why = std::string("Auto: the PS5's, ") + want.name;
+        return want.xbox;
+    }
+    const std::vector<std::string> has = DiscLanguages(DiscFactsOf(*game));
+    if (has.empty() || std::find(has.begin(), has.end(), want.code) != has.end()) {
+        *why = std::string("Auto: the PS5's, ") + want.name + (has.empty() ? " (the disc's languages unknown)" : "");
+        return want.xbox;
+    }
+    if (std::find(has.begin(), has.end(), "En") != has.end()) {
+        *why = std::string("Auto: English (the disc has no ") + want.name + ")";
+        return 1;
+    }
+    for (const std::string &code : has) {
+        const LangPick l = LangOfCode(code);
+        if (l.xbox) {
+            *why = std::string("Auto: ") + l.name + ", the disc's own";
+            return l.xbox;
+        }
+    }
+    *why = std::string("Auto: the PS5's, ") + want.name;
+    return want.xbox;
 }
 
 // Games' own names (Game settings > Name): /data/xemu/game-names.txt, one
@@ -965,8 +1332,8 @@ void DashboardScene::ScanGames()
         std::string ext = path.extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
         const bool folder = is_dir && XisoIsGameFolder(path.string());
-        if (folder || (!is_dir && (ext == ".iso" || ext == ".xiso" ||
-                                   (ext == ".cci" && !rx_cci_is_later_part(path.string().c_str()))))) {
+        if (folder || (!is_dir && !rx_cci_is_later_part(path.string().c_str()) &&
+                       (ext == ".iso" || ext == ".xiso" || ext == ".chd" || ext == ".cci" || ext == ".cso"))) {
             GameArt &art = Art(path.string());
             if (!art.read) {
                 art.read = true;
@@ -1008,6 +1375,38 @@ void DashboardScene::ScanGames()
     std::sort(m_games.begin(), m_games.end(), [](const Game &a, const Game &b) {
         return strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
     });
+    // The same disc twice: each copy names the others (patch 180)
+    g_duplicates.clear();
+    {
+        std::map<std::string, std::vector<std::string>> by_disc;
+        for (const Game &g : m_games) {
+            const XisoInfo &info = Art(g.path).info;
+            if (!info.title_id || !info.xbe_size) {
+                continue;
+            }
+            char key[64];
+            snprintf(key, sizeof(key), "%08X.%u.%X.%u", info.title_id, info.version, info.region, info.xbe_size);
+            by_disc[key].push_back(g.path);
+        }
+        // The oldest file is the game; each newer one is the duplicate, and names it (patch 181)
+        auto made = [](const std::string &path) {
+            struct stat st;
+            return stat(path.c_str(), &st) == 0 ? (int64_t)st.st_mtime : INT64_MAX;
+        };
+        for (auto &d : by_disc) {
+            if (d.second.size() < 2) {
+                continue;
+            }
+            std::stable_sort(d.second.begin(), d.second.end(),
+                             [&](const std::string &x, const std::string &y) { return made(x) < made(y); });
+            for (size_t i = 1; i < d.second.size(); i++) {
+                g_duplicates[d.second[i]].push_back(d.second[0]);
+            }
+        }
+        if (!g_duplicates.empty()) {
+            fprintf(stderr, "XPSemu: %zu duplicate game file(s)\n", g_duplicates.size());
+        }
+    }
 
     // Start on the game that's in the drive, if it's one of these.
     const char *dvd = "";
@@ -1058,7 +1457,7 @@ void DashboardScene::RequestMissingCovers()
                               COVER_FRONT });
         }
     }
-    CoverDownloadRequest(wants, "/data/xemu/covers");
+    CoverDownloadRequest(wants, kCoversDir);
 }
 
 static bool SetupRecheck(int games); // First run, below
@@ -1789,6 +2188,23 @@ void DashboardScene::Show()
                 m_in_page = true;
                 m_page_anim = 1;
             }
+            // Back from a Chihiro game: its own page, on that game (patch 186)
+            std::string chihiro = ReadSmallFile("/data/xpsemu/chihiro-start.txt");
+            while (!chihiro.empty() && (chihiro.back() == '\n' || chihiro.back() == '\r')) {
+                chihiro.pop_back();
+            }
+            if (!chihiro.empty()) {
+                unlink("/data/xpsemu/chihiro-start.txt");
+                ScanChihiro();
+                for (size_t i = 0; i < m_chihiro.size(); i++) {
+                    if (m_chihiro[i].path == chihiro) {
+                        m_chihiro_sel = (int)i;
+                    }
+                }
+                m_page = PAGE_CHIHIRO;
+                m_in_page = true;
+                m_page_anim = 1;
+            }
             m_startup_black = 1;
             m_startup_settled = true;
         }
@@ -1800,6 +2216,9 @@ void DashboardScene::Show()
             }
         }
         RemoveOldShortcuts();
+        if (!back_from_game) {
+            UpdaterStartup();   // a newer XPSemu on GitHub? the last update's leftovers (patch 230)
+        }
         std::thread(UiMusicPrepare).detach();   // aside: the page doesn't wait for it
         // The logo first (the music after it), else the music a little in.
         // Not until the Xbox's files are there: the checklist first.
@@ -1871,19 +2290,15 @@ void DashboardScene::LaunchNow(const Game &game, bool quiet)
     // A frame rate mod made for this very disc: 60 fps first.
     std::string fps_mod;
     {
-        char dir[64];
-        snprintf(dir, sizeof(dir), "%08X.%u", xiso.title_id, xiso.version);
         const bool want_120 = KeyOf(game) == "4D530064" || KeyOf(game) == "4D530004";    // Halo 2, Halo 1
-        for (const char *kind : { want_120 ? "120fps" : "60fps", want_120 ? "60fps" : "120fps" }) {
-            const std::string f = std::string("/app0/mods/") + dir + "/" + kind + "/mod.txt";
-            struct stat st;
-            if (fps_mod.empty() && stat(f.c_str(), &st) == 0) {
-                fps_mod = f;
-            }
-        }
+        fps_mod = FpsModFor(game, want_120);
     }
+    // Patch 353: Dead or Alive Ultimate's widescreen patch is for its DOA 1 disc; on the DOA 2 disc (same title ID,
+    // XBE version 6, doa2.xbe) it stays off (user).
+    const bool doa2u = KeyOf(game) == "54430006" &&
+                       (xiso.version == 6 || xiso.title.find('2') != std::string::npos);
     const std::string log = PatchesForStart(xiso.xbe_file.empty() ? game.path : xiso.xbe_file, xiso.xbe_offset, xiso.xbe_size, game.title_id,
-                                            g_cfg.autopatch_widescreen, g_cfg.autopatch_60fps && fps_mod.empty(), &pokes,
+                                            g_cfg.autopatch_widescreen && !doa2u, g_cfg.autopatch_60fps && fps_mod.empty(), &pokes,
                                             &widescreen_patch);
     if (!log.empty()) {
         xog_ui_log("patches:\n%s", log.c_str());
@@ -1891,8 +2306,11 @@ void DashboardScene::LaunchNow(const Game &game, bool quiet)
     static const char *const kAvpackOption[] = { "hdtv", "standard", "svideo", "scart", "vga", "standard" };
     int aspect = value(GO_ASPECT);
     // Games with widescreen of their own and no patch: the console's setting turns it on.
+    // Patch 272: Dead or Alive 3 PAL (4D53002D) reads XGetVideoFlags & 1 at boot (VA 0x17c218): 9/16 projection
+    // (0x3F100000 at 0x252018, Hor+) and its 2D drawn at 0.75 width. Esppiral's 21:9 JMP narrows that same constant.
     if (aspect == CONFIG_DISPLAY_UI_ASPECT_RATIO_AUTO &&
-        (KeyOf(game) == "4D530064" || KeyOf(game) == "4541005B")) {   // Halo 2, Burnout 3
+        (KeyOf(game) == "4D530064" ||   // Halo 2 (patch 263, user: Burnout 3 and Revenge start 4:3; 16:9 by hand)
+         KeyOf(game) == "4D53002D")) {  // Dead or Alive 3 (Europe, Australia) (patch 272)
         aspect = CONFIG_DISPLAY_UI_ASPECT_RATIO_16X9;
     }
     const bool picked_16_9 = aspect == CONFIG_DISPLAY_UI_ASPECT_RATIO_16X9;
@@ -1918,34 +2336,101 @@ void DashboardScene::LaunchNow(const Game &game, bool quiet)
         lines += "unlock60\n";
     }
     // SSAA: the top scale, averaged down to the screen as any larger picture is.
-    lines += "scale=" + std::to_string(value(GO_AA) == 3 ? 6 : value(GO_SCALE)) + "\n";
-    lines += value(GO_AA) == 1 ? "aa=fxaa\n" : value(GO_AA) == 2 ? "aa=smaa\n" : value(GO_AA) == 3 ? "aa=ssaa\n" : "aa=off\n";
-    lines += value(GO_FILTER) == CONFIG_UPSCALE_SHARP ? "upscale=sgsr\n" : "upscale=bilinear\n";
+    lines += "scale=" + std::to_string(value(GO_AA) >= 3 ? std::max(6, value(GO_SCALE)) : value(GO_SCALE)) + "\n";
+    lines += value(GO_AA) == 1 ? "aa=fxaa\n" : value(GO_AA) == 2 ? "aa=smaa\n" : value(GO_AA) == 3 ? "aa=ssaa\n" : value(GO_AA) == 4 ? "aa=ssaa+smaa\n" : "aa=off\n";
+    lines += "af=" + std::to_string(value(GO_AF)) + "\n";      // anisotropic filtering (patch 241)
+    lines += value(GO_FILTER) == CONFIG_UPSCALE_SHARP ? "upscale=sgsr\n" :
+             value(GO_FILTER) == CONFIG_UPSCALE_CAS ? "upscale=cas\n" : "upscale=bilinear\n";
+    // patch 247: CAS sharpness, texture sharpness, the CRT filter
+    lines += "cas=" + std::to_string(value(GO_CAS)) + "\ntexsharp=" + std::string("0") +
+             "\ncrt=" + std::to_string(value(GO_CRT)) + "\n";
     lines += value(GO_FIT) == CONFIG_DISPLAY_UI_FIT_STRETCH ? "aspect=stretch\n" :
              aspect == CONFIG_DISPLAY_UI_ASPECT_RATIO_16X9 ? "aspect=16:9\n" :
              aspect == CONFIG_DISPLAY_UI_ASPECT_RATIO_4X3 ? "aspect=4:3\n" : "aspect=auto\n";
     lines += FrameGenLine(KeyOf(game));
-    // Fixes only these games get (XOG_FIX): FIFA 07 and Shadow the Hedgehog yield to a lower-priority thread
-    if (KeyOf(game) == "454100A6" || KeyOf(game) == "53450086" || KeyOf(game) == "4B4E001E") {   // + Yu-Gi-Oh! The Dawn of Destiny (patch 152)
-        lines += "xogfix=yield\n";
+    if (g_cfg.fastforward) {
+        lines += "ff=1\n";        // patch 253: swipe right = x2 (never in Chihiro starts)
     }
-    if (KeyOf(game) == "5553003B") {        // Warrior Within: + a target sampled by its own draw reads a copy (patch 143)
+    // Fixes only these games get (XOG_FIX): FIFA 07 and Shadow the Hedgehog yield to a lower-priority thread
+    // FIFA 07 (454100A6) is off this list for patch 316's test: the yield watch must catch it by itself
+    if (KeyOf(game) == "53450086" || KeyOf(game) == "4B4E001E" ||   // + Yu-Gi-Oh! The Dawn of Destiny (patch 152)
+        KeyOf(game) == "454100A6") {                                // FIFA 07: its own yield fix back (patch 370, user)
+        // patch 374: Shadow also gets the wait quantum from the start - without it a worker thread waited behind the
+        // main one and the game ran at 30 until the automatic watch turned it on (user: "back to its old problem")
+        lines += KeyOf(game) == "53450086" ? "xogfix=yield,waitquantum\n" : "xogfix=yield\n";
+    }
+    // Prince of Persia Sands-of-Time engine (Warrior Within 5553003B, The Sands of Time 5553001D,
+    // The Two Thrones 55530058): rect keeps the glow's down-sampled blur inside its own targets, and
+    // snapself makes a stage that samples its own target read a pre-draw copy -- so the colour-grade
+    // dependent-texture lookup isn't fed the target's stale memory (leftover FMV green) and the menu
+    // background stops washing out to white / green-yellow. snapself was root-caused and confirmed on
+    // Warrior Within (patch 143); patch 289 extends it to the two sibling titles (same engine).
+    if (KeyOf(game) == "5553003B" || KeyOf(game) == "5553001D" || KeyOf(game) == "55530058") {
         lines += "xogfix=rect,snapself\n";
-    } else if (KeyOf(game) == "5553001D") {        // Prince of Persia: The Sands of Time, its glow's blur kept inside its targets
-        lines += "xogfix=rect\n";
     }
     if (KeyOf(game) == "4C410013") {        // Republic Commando: the words after a trap as CACHE1 has them (patch 156)
         lines += "xogfix=prefetch\n";
     }
     if (KeyOf(game) == "54540079") {        // Midnight Club 3 DUB Remix: layers at one depth stored exactly (patch 158)
-        lines += "xogfix=zexact,snapself\n";     // + its reflection map's draws that read it copy it first (patch 160)
-    }
-    if (KeyOf(game) == "42530001") {        // Morrowind: its music pause on a stream still being made (patch 135)
-        lines += "xogfix=dsnull\n";
-    }
+        lines += "xogfix=zexact,snapself,coh16k\n";     // + its reflection map's draws that read it copy it first (patch 160)
+                                                        // + targets' edges by 16 KiB blocks (patch 265: the flicker, the white)
+    }                                       // 60 fps mod (patch 278) withdrawn in 278b: game sped up at 60
+    if (KeyOf(game) == "42530001") {        // Morrowind USA (the original build, not GOTY):
+        lines += "xogfix=dsnull,flippace\n"; // dsnull = music pause on a stream still being made (patch 135);
+    } else if (KeyOf(game) == "55530015") { // flippace = near-miss vsync rescue so open views hold ~60 instead of
+        lines += "xogfix=dsnull\n";         // snapping to 30 (patch 294). GOTY 42530005 finishes in the window, so no fix.
+    }                                       // (280: coh16k off again: slow + freezes. ARCHIVE attribute kept for every game since 282, io.c)
     if (KeyOf(game) == "45410028") {        // Need for Speed: Hot Pursuit 2, its float-to-integer helper as one instruction
         lines += "xogfix=ftol\n";
     }
+    if (KeyOf(game) == "4D530051") {        // Conker: Live & Reloaded: the decoder blocked ~100 ms a frame at its start,
+        lines += "xogfix=arena128\n";        // "upload arena full" (patch 242): Chihiro's 128 MB arena
+    }
+    if (KeyOf(game) == "55530008") {        // Far Cry Instincts: copies its sounds to Z: during the intro videos; each
+        lines += "xogfix=cachewrite\n";      // write held the CPU 9-15 ms, Bink at 20-26 fps (patch 261: written behind)
+    }
+    if (KeyOf(game) == "56550026") {        // Riddick: Escape from Butcher Bay caches level files on Z: while playing.
+        lines += "xogfix=ramcache\n";        // patch 288: keep the Z: FileCache in RAM so it never hits PS5 storage
+    }                                        // (the per-launch write cap made it crawl/freeze later in a session)
+    if (KeyOf(game) == "54540008") {         // Midnight Club II: its DirectSound checks the CPU family == 6 (Pentium III);
+        lines += "xogfix=cpuid\n";           // native PS5 cpuid (AMD) fails it. Per game (patch 302): general froze DOA3.
+    }
+    if (KeyOf(game) == "4D53002A") {         // Midtown Madness 3 (issue #34): its voice codec (DICE's, init at 0xa4fe0)
+        lines += "xogfix=cpuid\n";           // wants family 6 + SSE; on the PS5's cpuid it fails silently, the voice list
+    }                                        // stays NULL and the game crashes at 0xa17ac. Same fix as Midnight Club II.
+    // SSX On Tour (45410082): black screen - its heap sizing took the title's 64 MiB reserve (virtual memory uncounted),
+    // a thread stack failed (mm.c, patch 317). No xogfix=mmbudget line: mm.c turns the console budget on by itself
+    // while a title sizes its heap (patch 318).
+    // SSX 3 (issue #36): its THX intro froze - EA's 60 Hz movie clock (XAPI timeSetEvent thread) starved behind the
+    // render thread, which got a new slice on every wait (ps.c, patch 315). Its xogfix=waitquantum line is gone:
+    // the scheduler's watch turns that rule on by itself in a game that gets stuck (patch 316).
+    if (KeyOf(game) == "4B4F0002") {         // Crimson Sea: buffers rewritten every frame faulted ~1100 a second,
+        lines += "xogfix=hotpages\n";        // 60 -> 30 fps and slow motion (dirty.c, patch 352)
+    }
+    if (KeyOf(game) == "4E4D0009") {         // Breakdown (issue #37): crashed as its first level loaded - its file
+        lines += "xogfix=drivetime,hddqueue\n";  // server's read finished before the main thread stored the buffer pointer
+    }                                        // the completion uses (io.c, patch 329)
+    if (KeyOf(game) == "4D53000F") {         // RalliSport Challenge 1: Bink movies (own 30/15 fps clock) land right on
+        lines += "xogfix=flippace\n";        // the vblank; ~1 ms of render pushed 40 of 55 frames one vblank late
+    }                                        // (all within -2..+1 ms, inside flippace's 3 ms grace).
+    if (KeyOf(game) == "4D530039") {         // RalliSport Challenge 2 (issue #33): the same DICE voice codec (CPU check
+        lines += "xogfix=cpuid,rdtscret,yield,poolfit\n";   /* patch 372: the kernel pool's growth in the smallest hole (the memory map at the multiplayer exit); 371's mmhole / poolreserve crashed the app */  // its own yield fix (patch 357), as Shadow and Yu-Gi-Oh have theirs (user); patch 371: RAM kept whole for its 25 MiB block after a multiplayer race  // 0x891d0/0x89250) - crashed at 0x859b4 on 3.0 and 3.2; its CPU-type
+    }                                        // detector (0xa0f9d) picks its Intel family-6 code path with the trap.
+                                             // rdtscret: its frame clock "rdtsc; ret" at 0x12000 (start of .text) was
+                                             // left untrapped as data: frame times 2.2x long (PS5 1.6 GHz vs 733 MHz).
+                                             // yield: loading into a race, its main thread spins SwitchToThread
+                                             // (0x2360d0) until worker t36 empties a queue; without the yield fix
+                                             // the yielder kept its boost and t36 (ready) never ran: stuck forever.
+    // Fable (4D5300D1): NO ramcache (patch 293). Its ~600 MiB Z: install PERSISTS across launches
+    // (Partition5 is not reformatted; it reads the install, marker-gated) - so it is copied once and
+    // reused, not rewritten each launch. ramcache gave it no benefit and caused OOM + a 0-byte
+    // placeholder that hung it when ramcache was later off. It installs once (persistence 282/285) and runs.
+    if (KeyOf(game) == "4D53002D" || KeyOf(game) == "54430001") {   // Dead or Alive 3 PAL (patch 274) / USA+JPN (patch 275):
+        lines += "xogfix=edgecrop\n";        // its full-screen 2D starts at pixel (1, 1); the shown picture leaves guest
+    }                                        // row 0 / column 0 out (no line top and left)
+    if (KeyOf(game) == "45410091") {        // Half-Life 2: tiny contiguous blocks at a level load (96 B to 40 KiB)
+        lines += "xogfix=mmhole\n";          // took ~10 ms each -- the top allocator relocated a GPU-tracked page and
+    }                                        // waited on its fence (patch 295). mmhole lands them in a free hole, no move.
     // Games whose sound needs the full sound processor (their own DSP program): Marvel vs. Capcom 2, Capcom vs. SNK 2 EO
     if (KeyOf(game) == "43430007" || KeyOf(game) == "43430008") {
         lines += "apudsp\n";
@@ -1955,17 +2440,51 @@ void DashboardScene::LaunchNow(const Game &game, bool quiet)
     } else if (KeyOf(game) == "4C410013") {
         // Republic Commando draws its loading and menus unthrottled (~400 fps): capped at 60 unless the player sets a cap (patch 157)
         lines += "fpscap=60\n";
+    } else if (KeyOf(game) == "45530004" && profile.value[GO_FPS_CAP] == GAME_DEFAULT) {
+        // Thief: Deadly Shadows draws unthrottled (34-127 in play, thousands on loads): 60 by default (user,
+        // patch 314); Unreal times its play by real time. A cap the player picks for it wins.
+        lines += "fpscap=60\n";
     }
     lines += "volume=" + std::to_string(value(GO_VOLUME)) + "\n";
     lines += "fps=" + std::to_string(value(GO_OVERLAY)) + "\n";
-    lines += "sides=" + std::to_string(g_cfg.sides ? 1 + g_cfg.sides_style : 0) + "\n";
+    // patch 266: the adaptive triggers' kind (Settings' on/off is read by the game's run) and gyro aim
+    lines += "triggers=" + std::to_string(TriggersFor(KeyOf(game), game.name, profile.value[GO_TRIGGERS])) + "\n";
+    if (profile.value[GO_GYRO] > 0) {
+        lines += "gyro=" + std::to_string(profile.value[GO_GYRO]) + "\n";
+    }
+    if (!profile.padmap.empty()) {
+        lines += "padmap=" + profile.padmap + "\n";      // patch 269: the game's own button mapping
+    }
+    if (profile.value[GO_TURBO] > 0) {
+        lines += "turbo=" + std::to_string(profile.value[GO_TURBO]) + "\n";    // patch 317: turbo buttons
+    }
+    if (profile.value[GO_MSAA] > 1) {
+        lines += "msaa=" + std::to_string(profile.value[GO_MSAA]) + "\n";      // patch 325: MSAA, per game
+    }
+    if (profile.value[GO_A2C] == 0) {
+        lines += "a2c=0\n";        // patch 354: MSAA smooth cut-outs off (on by default)
+    }
+    if (profile.value[GO_MOVIEUP] == 0) {
+        lines += "movieup=0\n";    // patch 355: the movie upscaler off (on by default)
+    }
+    if (value(GO_SSAO) > 0) {   // patch 367: the game's own choice, else the Video setting
+        lines += "ssao=" + std::to_string(value(GO_SSAO)) + "\n";      // patch 363: ambient occlusion (off by default)
+    }
+    lines += "sides="+ std::to_string(g_cfg.sides ? 1 + g_cfg.sides_style : 0) + "\n";
     lines += std::string("avpack=") + kAvpackOption[std::clamp(g_cfg.avpack, 0, 5)] + "\n";
-    lines += "lang=" + std::to_string(g_cfg.language) + "\n";
+    {
+        std::string why;
+        const uint32_t lang = GameLanguageFor(&game, &why);
+        xog_ui_log("game language %u: %s", lang, why.c_str());
+        lines += "lang=" + std::to_string(lang) + "\n";
+    }
     lines += std::string(video) + "\n";
+    lines += TrainerStartLines(KeyOf(game), game.title_id ? game.title_id : xiso.title_id);     // patch 246
     lines += pokes;
     m_start_recent = game.path;     // the row reorders once the page has faded (StartTick)
     xemu_settings_save();
     std::ofstream("/data/xpsemu/play-start.txt") << KeyOf(game) << " " << (long long)time(NULL) << "\n";
+    unlink("/data/xpsemu/chihiro-start.txt");      // an Xbox game: back to Games after it (patch 186)
     if (!quiet) {
         UiSoundPlay(UI_SOUND_LAUNCH);
     }
@@ -2783,7 +3302,11 @@ enum SettingRow {
     SR_ASPECT,
     SR_FIT,
     SR_FILTER,
+    SR_SSAO,        // patch 375: ambient occlusion (was SR_CAS, patch 247)
     SR_AA,
+    SR_AF,
+    SR_TEXSHARP,    // patch 247
+    SR_CRT,         // patch 247
     SR_SIDES,
     SR_VOLUME,
     SR_SOUNDS,
@@ -2795,11 +3318,12 @@ enum SettingRow {
     SR_WIDE_PATCHES,
     SR_FPS_PATCHES,
     SR_LANGUAGE,
+    SR_VIBRATION,
     SR__COUNT
 };
 static const int kSettingOptions[SR__COUNT] = {
-    GO_SCALE,  GO_ASPECT, GO_FIT, GO_FILTER, GO_AA, -1,
-    GO_VOLUME, -1,        -1,     GO_OVERLAY, GO_FPS_CAP, -1, -1, -1, -1, -1,
+    GO_SCALE,  GO_ASPECT, GO_FIT, GO_FILTER, GO_SSAO, GO_AA, GO_AF, GO_TEXSHARP, GO_CRT, -1,   // patch 367/375: ambient occlusion
+    GO_VOLUME, -1,        -1,     GO_OVERLAY, GO_FPS_CAP, -1, -1, -1, -1, -1, -1,
 };
 
 // Settings comes in categories, each a page of its rows; Advanced is its
@@ -2808,15 +3332,15 @@ enum { CAT_VIDEO, CAT_SOUND, CAT_INTERFACE, CAT_CONTROLLER, CAT_PATCHES,
        CAT_ADVANCED, CAT__COUNT };
 static const struct {
     const char *name, *help;
-    int rows[6], count;
+    int rows[10], count;
 } kCategories[CAT__COUNT] = {
-    { "Video", "Resolution, screen shape, fit, upscaling, anti-aliasing and the side art.",
-      { SR_SCALE, SR_ASPECT, SR_FIT, SR_FILTER, SR_AA, SR_SIDES }, 6 },
+    { "Video", "Resolution, screen shape, fit, upscaling, anti-aliasing and texture filtering.",
+      { SR_SCALE, SR_ASPECT, SR_FIT, SR_FILTER, SR_SSAO, SR_AA, SR_AF }, 7 },   // patch 251: texture sharpness out (no effect at x2+)
     { "Sound", "How loud the games are, and the menu sounds.",
       { SR_VOLUME, SR_SOUNDS }, 2 },
-    { "Interface", "The FPS counter and cap, cover downloads and the games' language.",
-      { SR_OVERLAY, SR_FPS_CAP, SR_COVERS, SR_LANGUAGE }, 4 },
-    { "Controller", "Your own button layout.", {}, 0 },
+    { "Interface", "The FPS counter and cap, cover downloads, the games' language, the side art and the CRT filter.",
+      { SR_OVERLAY, SR_FPS_CAP, SR_COVERS, SR_LANGUAGE, SR_SIDES, SR_CRT }, 6 },   // patch 249: side art and CRT moved here (user)
+    { "Controller", "Your own button layout, vibration and adaptive triggers.", {}, 0 },
     { "Patches", "Widescreen and 60 FPS patches go on by themselves for the games that have them. "
                  "Turn either off here.",
       { SR_WIDE_PATCHES, SR_FPS_PATCHES }, 2 },
@@ -2829,6 +3353,7 @@ static const struct {
     uint32_t id;
     const char *name;
 } kLanguages[] = {
+    { 0, "Auto" },
     { 1, "English" }, { 5, "Spanish" },    { 4, "French" },
     { 3, "German" },  { 6, "Italian" },    { 9, "Portuguese" },
     { 2, "Japanese" }, { 7, "Korean" },    { 8, "Chinese" },
@@ -2889,6 +3414,7 @@ void DashboardScene::ChangeSetting(int step)
     }
     bool *toggle = m_setting == SR_COVERS ? &g_cfg.covers :
                    m_setting == SR_BOOT   ? &g_cfg.boot_logo :
+                   m_setting == SR_VIBRATION ? &g_cfg.vibration :
                                             nullptr;
     if (toggle) {
         *toggle = !*toggle;
@@ -3326,19 +3852,75 @@ void DashboardScene::DrawAllPatches(float s, float a)
 // The rows, in groups: one open at a time. A group's own row is GS__COUNT + its index.
 static const struct {
     const char *name, *help;
-    int rows[6], count;
+    int rows[10], count;      // patch 354/355: 10 (Picture)
 } kGameGroups[] = {
     // As the quick menu has them (patch 167), with this page's own rows added.
-    { "Save states", "Where you left off, and removing this game's states.",
-      { DashboardScene::GS_CONTINUE, DashboardScene::GS_DELETE_STATES }, 2 },
-    { "Settings", "This game's resolution, screen shape, fit, upscaling, volume and FPS counter.",
-      { GO_SCALE, GO_ASPECT, GO_FIT, GO_FILTER, GO_VOLUME, GO_OVERLAY }, 6 },
-    { "Performance", "The FPS Patch, frame generation, FPS cap, anti-aliasing and PAL 60 Hz, as in the quick menu.",
-      { DashboardScene::GS_FPSPATCH, DashboardScene::GS_FRAMEGEN, GO_FPS_CAP, GO_AA, DashboardScene::GS_PAL60 }, 5 },
+    { "Saves", "Where you left off, and removing this game's saved states or its own saves.",
+      { DashboardScene::GS_CONTINUE, DashboardScene::GS_DELETE_STATES, DashboardScene::GS_DELETE_SAVES }, 3 },
+    { "Settings", "This game's resolution, volume, FPS counter, CRT filter and ambient occlusion.",
+      { GO_SCALE, GO_VOLUME, GO_OVERLAY, GO_CRT, GO_SSAO }, 5 },   // patch 377: no movie upscaler row   // patch 359; 363: ambient occlusion here (user)
+    { "Picture", "Screen shape, fit, upscaling, anti-aliasing, MSAA and anisotropic filtering, as in the quick "
+                 "menu (MSAA here only, from the next start).",
+      { GO_ASPECT, GO_FIT, GO_FILTER, GO_AA, GO_MSAA, GO_AF }, 6 },   // patch 366: smooth cut-outs always on (user)   // patch 325: MSAA; 354; 365: no CAS row (user)
+    { "Performance", "The FPS Patch, frame generation, FPS cap and PAL 60 Hz, as in the quick menu.",
+      { DashboardScene::GS_FPSPATCH, DashboardScene::GS_FRAMEGEN, GO_FPS_CAP, DashboardScene::GS_PAL60 }, 4 },
+    // patch 266: this game's own controller options (a row each; more can go in this group)
+    { "Controller", "Gyro aim, the adaptive triggers, turbo buttons and the button mapping for this game. Used from the next start.",
+      { GO_GYRO, GO_TRIGGERS, GO_TURBO, DashboardScene::GS_PADMAP }, 4 },     // patch 269: Button mapping
+    { "Trainer", "Cheats from .etm trainer files in /data/xpsemu/trainers (or xpsemu/trainers on a USB drive). "
+                 "Only the ones made for this game show. Set before the game starts.",
+      { DashboardScene::GS_TRAINER }, 1 },
     { "This game", "Its name, its home screen shortcut, and going back to your settings.",
       { DashboardScene::GS_NAME, DashboardScene::GS_SHORTCUT, DashboardScene::GS_RESET }, 3 },
 };
 static const int kGameGroupCount = sizeof(kGameGroups) / sizeof(kGameGroups[0]);
+
+// The card's game's trainers (patch 246): made again when the index changes.
+static struct {
+    std::string key;
+    uint32_t tid = 0;
+    unsigned gen = ~0u;
+    std::vector<TrainerEntry> list;
+    TrainerChoice choice;
+    int pick = -1;      // the one shown in list, or -1
+} s_tr;
+
+static void TrainerCardRefresh(const std::string &key, uint32_t tid, bool force)
+{
+    TrainersScan(false);
+    const unsigned gen = TrainersGeneration();
+    if (!force && key == s_tr.key && gen == s_tr.gen) {
+        return;
+    }
+    s_tr.key = key;
+    s_tr.tid = tid;
+    s_tr.gen = gen;
+    s_tr.list = TrainersFor(tid);
+    s_tr.choice = TrainerChoiceLoad(key);
+    s_tr.pick = -1;
+    for (size_t i = 0; i < s_tr.list.size(); i++) {
+        if (s_tr.list[i].path == s_tr.choice.file) {
+            s_tr.pick = (int)i;
+        }
+    }
+    if (s_tr.pick < 0 && !s_tr.list.empty()) {
+        // none chosen yet (or its file is gone): the first, off until turned on
+        s_tr.pick = 0;
+        s_tr.choice.file = s_tr.list[0].path;
+        s_tr.choice.on = false;
+        s_tr.choice.opts.clear();
+    }
+    if (s_tr.pick >= 0) {
+        s_tr.choice.opts.resize(s_tr.list[s_tr.pick].options.size(), '0');
+    }
+}
+
+static const TrainerEntry *TrainerPicked()
+{
+    return s_tr.pick >= 0 && s_tr.pick < (int)s_tr.list.size() ? &s_tr.list[s_tr.pick] : nullptr;
+}
+
+static bool s_gs_chihiro;   // patch 269: the card's game is a Chihiro game: no Button mapping row
 
 static std::vector<int> GameRows(int open)
 {
@@ -3346,7 +3928,16 @@ static std::vector<int> GameRows(int open)
     for (int g = 0; g < kGameGroupCount; g++) {
         rows.push_back(DashboardScene::GS__COUNT + g);
         for (int i = 0; g == open && i < kGameGroups[g].count; i++) {
+            if (kGameGroups[g].rows[i] == DashboardScene::GS_PADMAP && s_gs_chihiro) {
+                continue;
+            }
             rows.push_back(kGameGroups[g].rows[i]);
+            if (kGameGroups[g].rows[i] == DashboardScene::GS_TRAINER) {
+                const TrainerEntry *t = TrainerPicked();
+                for (int k = 0; t && k < (int)t->options.size() && k < 100; k++) {
+                    rows.push_back(DashboardScene::GS_TOPT + k);
+                }
+            }
         }
     }
     return rows;
@@ -3370,12 +3961,18 @@ void DashboardScene::OpenGameSettings(const Game &game, bool from_shelf)
     m_gs_key = KeyOf(game);
     m_gs_shortcut = ShortcutDirFor(game.path);
     m_gs_profile = GameProfileLoad(m_gs_key);
+    m_gm_open = m_gm_capture = false;      // patch 269
+    s_gs_chihiro = false;
+    for (const ChihiroGame &c : m_chihiro) {
+        s_gs_chihiro = s_gs_chihiro || c.path == game.path;
+    }
     m_gs_group = -1;
     m_gs_row = GS__COUNT;
     m_gs_patches = false;
     m_patch_row = 0;
     m_gs_choices = PatchChoicesLoad(m_gs_key);
     BuildPatchItems();
+    TrainerCardRefresh(m_gs_key, game.title_id ? game.title_id : Art(game.path).info.title_id, true);   // patch 246
     m_in_page = true;
 }
 
@@ -3445,6 +4042,7 @@ void DashboardScene::ChangeGameSetting(int step)
 enum AdvancedRow {
     ADV_AVPACK,
     ADV_NOTIFICATIONS,
+    ADV_FASTFORWARD,    // patch 253
     ADV__COUNT
 };
 
@@ -3485,6 +4083,9 @@ void DashboardScene::ChangeAdvanced(int step)
     case ADV_NOTIFICATIONS:
         g_cfg.notifications = !g_cfg.notifications;
         break;
+    case ADV_FASTFORWARD:
+        g_cfg.fastforward = !g_cfg.fastforward;
+        break;
     default:
         return;
     }
@@ -3506,12 +4107,12 @@ void DashboardScene::HandleInput()
 {
     auto state = [this]() {
         return FocusState{ m_in_page + m_advanced + m_gs_open + m_gs_patches +
-                               (m_settings_cat >= 0) + m_view + m_pad_page +
+                               (m_settings_cat >= 0) + m_view + m_pad_page + m_gm_open +
                                m_kb_open + m_all_page,
                            { m_page, m_game, m_setting, m_adv_setting,
                              m_gs_row + 100 * m_patch_row, m_system_row,
                              m_shelf, m_shelf_sel,
-                             m_visible, m_np_focus, m_cat_sel, m_pad_sel,
+                             m_visible, m_np_focus, m_cat_sel, m_pad_sel + 1000 * m_gm_sel,
                              m_kb_row * 100 + m_kb_col + m_all_row * 10000 } };
     };
     FocusState before = state();
@@ -3729,6 +4330,14 @@ void DashboardScene::HandleInputInner()
         }
         return;
     }
+    if (m_gs_open && m_gm_open) { // Its button mapping (patch 269)
+        if (back) {
+            m_gm_open = false;
+            return;
+        }
+        GmInput(accept, left, right, up, down);
+        return;
+    }
     if (m_gs_open) { // A game's settings
         if (back) {
             if (m_gs_group >= 0) {  // the group closes first
@@ -3759,9 +4368,76 @@ void DashboardScene::HandleInputInner()
             }
             return;
         }
+        if (m_gs_row == GS_TRAINER) {      // patch 246: On/Off; L1/R1 another of this game's
+            const int n = (int)s_tr.list.size();
+            if (!n) {
+                if (accept || left || right || l1 || r1) {
+                    UiSoundPlay(UI_SOUND_ERROR);
+                }
+                return;
+            }
+            if (l1 || r1) {
+                s_tr.pick = ((s_tr.pick < 0 ? 0 : s_tr.pick) + n + (l1 ? -1 : 1)) % n;
+                s_tr.choice.file = s_tr.list[s_tr.pick].path;
+                s_tr.choice.opts.assign(s_tr.list[s_tr.pick].options.size(), '0');
+                TrainerChoiceSave(m_gs_key, s_tr.choice);
+                UiSoundPlay(UI_SOUND_CHANGE);
+            } else if (left || right || accept) {
+                s_tr.choice.on = !s_tr.choice.on;
+                TrainerChoiceSave(m_gs_key, s_tr.choice);
+                UiSoundPlay(UI_SOUND_CHANGE);
+            }
+            return;
+        }
+        if (m_gs_row >= GS_TOPT && m_gs_row < GS__COUNT) {     // one of its options
+            const TrainerEntry *t = TrainerPicked();
+            const int i = m_gs_row - GS_TOPT;
+            if (t && i < (int)t->options.size() && (left || right || accept)) {
+                s_tr.choice.opts.resize(t->options.size(), '0');
+                s_tr.choice.opts[i] = s_tr.choice.opts[i] == '1' ? '0' : '1';
+                if (s_tr.choice.opts[i] == '1') {
+                    s_tr.choice.on = true;      // patch 248: an option turned on turns the trainer on (user: options on, trainer row left Off)
+                }
+                s_tr.choice.file = t->path;
+                TrainerChoiceSave(m_gs_key, s_tr.choice);
+                UiSoundPlay(UI_SOUND_CHANGE);
+            }
+            return;
+        }
         if (m_gs_row == GS_NAME) {
             if (accept || right) {
                 OpenNameEditor();
+            }
+            return;
+        }
+        if (m_gs_row == GS_PADMAP) {       // patch 269: its own screen
+            if (accept || right) {
+                GmOpen();
+            }
+            return;
+        }
+        if (m_gs_row == GS_DELETE_SAVES) {
+            if (accept) {
+                const uint32_t tid = m_gs_game.title_id ? m_gs_game.title_id : Art(m_gs_game.path).info.title_id;
+                const std::string dir = GameSavesDir(tid);
+                if (GameIsRunning(m_gs_key)) {
+                    UiSoundPlay(UI_SOUND_ERROR);
+                    xemu_queue_notification("Close the game first: it may be saving");
+                } else if (dir.empty() || GameSavesCount(dir) == 0) {
+                    UiSoundPlay(UI_SOUND_ERROR);
+                } else if (ImGui::GetTime() > m_saves_armed) {
+                    m_saves_armed = ImGui::GetTime() + 3;      // twice
+                    UiSoundPlay(UI_SOUND_CHANGE);
+                } else {
+                    m_saves_armed = 0;
+                    const std::string why = GameSavesDelete(dir, tid);
+                    if (why.empty()) {
+                        m_saves_deleted_at = ImGui::GetTime();     // the row says so for a while (patch 183)
+                    }
+                    UiSoundPlay(why.empty() ? UI_SOUND_SELECT : UI_SOUND_ERROR);
+                    xemu_queue_notification(why.empty() ? "This game's saves are deleted (a copy is kept in /data/xpsemu/deleted-saves)"
+                                                        : ("Couldn't delete the saves: " + why).c_str());
+                }
             }
             return;
         }
@@ -3866,6 +4542,9 @@ void DashboardScene::HandleInputInner()
     case PAGE_BROWSER:
         BrowserInput(accept, up, down, l1, r1);
         break;
+    case PAGE_CHIHIRO:
+        ChihiroInput(accept, up, down, l1, r1, options);
+        break;
     case PAGE_GAMES: {
         int n = m_games.size();
         if (!n) {
@@ -3947,17 +4626,24 @@ void DashboardScene::HandleInputInner()
         break;
     }
     case PAGE_SYSTEM:
-        // Two buttons: Restart XPSemu, Eject the disc.
+        // Two buttons: Restart XPSemu, Eject the disc; under them Check for
+        // updates (patch 230).
 #if XPSEMU_DEV
         // Dev builds: a second row, the stress test and its minutes.
-        m_system_row = std::clamp(m_system_row, 0, 3);
-        if (left || right) {
+        m_system_row = std::clamp(m_system_row, 0, 4);
+        if ((left || right) && m_system_row < 4) {
             m_system_row ^= 1;
             m_sys_ask = -1;
         }
         if (up || down) {
-            m_system_row ^= 2;
+            int line = (m_system_row / 2 + (down ? 1 : 2)) % 3;
+            m_system_row = line == 2 ? 4 : line * 2 + (m_system_row < 4 ? (m_system_row & 1) : 0);
             m_sys_ask = -1;
+        }
+        if (accept && m_system_row == 4) {
+            UiSoundPlay(UI_SOUND_CHANGE);
+            UpdaterPress();
+            break;
         }
         if (accept && m_system_row >= 2) {
             DevStressButton(m_system_row == 2);
@@ -3967,10 +4653,19 @@ void DashboardScene::HandleInputInner()
             break;
         }
 #else
-        m_system_row = std::clamp(m_system_row, 0, 1);
-        if (up || left || down || right) {
+        m_system_row = std::clamp(m_system_row, 0, 2);
+        if ((left || right) && m_system_row < 2) {
             m_system_row ^= 1;
             m_sys_ask = -1;
+        }
+        if (up || down) {
+            m_system_row = m_system_row == 2 ? 0 : 2;
+            m_sys_ask = -1;
+        }
+        if (accept && m_system_row == 2) { // Check for updates (again: install it)
+            UiSoundPlay(UI_SOUND_CHANGE);
+            UpdaterPress();
+            break;
         }
 #endif
         if (accept && m_system_row == 0) { // Restart XPSemu
@@ -3993,11 +4688,21 @@ void DashboardScene::HandleInputInner()
                 snprintf(video, sizeof(video), "video=%x", 0x80000u);
                 std::string lines = "none\ndash\nkey=dashboard\nname=Xbox Dashboard\n";
                 lines += "scale=" + std::to_string(g_cfg.scale) + "\n";
-                lines += g_cfg.upscale == CONFIG_UPSCALE_SHARP ? "upscale=sgsr\n" : "upscale=bilinear\n";
+                lines += g_cfg.upscale == CONFIG_UPSCALE_SHARP ? "upscale=sgsr\n" :
+                         g_cfg.upscale == CONFIG_UPSCALE_CAS ? "upscale=cas\n" : "upscale=bilinear\n";
+                lines += "af=" + std::to_string(g_cfg.af) + "\n";
+                if (g_cfg.fastforward) {
+                    lines += "ff=1\n";    // patch 253
+                }
+                lines += "cas=" + std::to_string(g_cfg.cas) + "\ntexsharp=" + std::string("0") +
+                         "\ncrt=" + std::to_string(g_cfg.crt) + "\n";     // patch 247
                 lines += "volume=" + std::to_string(g_cfg.volume) + "\n";
                 lines += "fps=" + std::to_string(g_cfg.fps) + "\n";
                 lines += std::string("avpack=") + kAvpack[std::clamp(g_cfg.avpack, 0, 5)] + "\n";
-                lines += "lang=" + std::to_string(g_cfg.language) + "\n";
+                {
+                    std::string why;
+                    lines += "lang=" + std::to_string(GameLanguageFor(nullptr, &why)) + "\n";
+                }
                 lines += std::string(video) + "\n";
                 UiSoundPlay(UI_SOUND_LAUNCH);
                 m_start_lines = lines;
@@ -4016,6 +4721,9 @@ bool DashboardScene::Draw()
     ImGuiIO &io = ImGui::GetIO();
     float dt = io.DeltaTime;
     m_time += dt;
+    if (UpdaterTakeRestart()) { // An update is in: start again on it (patch 230)
+        QuitApp(true);
+    }
     if (m_boot) {
         // Steps of at most a 30 fps frame (startup stalls), X or O skips.
         float was = m_boot_t;
@@ -4187,6 +4895,8 @@ bool DashboardScene::Draw()
     bool attract = UpdateAttract(dt);
     if (m_pad_capture) {
         PadCapture(); // Waiting for a DualSense button: nothing else
+    } else if (m_gm_capture) {
+        GmCapture();  // The same for a game's button mapping (patch 269)
     } else if (m_visible && !attract && !m_boot) {
         HandleInput();
     }
@@ -4244,7 +4954,9 @@ bool DashboardScene::Draw()
     if (m_page_anim > 0.01f) {
         float a = m_alpha * m_page_anim;
         DrawPageHeader(s, a);
-        if (m_gs_open) {
+        if (m_gs_open && m_gm_open) {
+            DrawGameMapping(s, a);      // patch 269
+        } else if (m_gs_open) {
             DrawGameSettings(s, a);
             if (m_kb_open) {
                 DrawKeyboard(s, a);
@@ -4272,6 +4984,7 @@ bool DashboardScene::Draw()
             break;
         case PAGE_SYSTEM: DrawSystem(s, a); break;
         case PAGE_BROWSER: DrawBrowser(s, a); break;
+        case PAGE_CHIHIRO: DrawChihiro(s, a); break;
         }
     }
     DrawHints(s);
@@ -4363,7 +5076,7 @@ void DashboardScene::OrbPoke(float strength)
 
 void DashboardScene::DrawMainMenu(float s, float a)
 {
-    static const char *const names[MENU__COUNT] = { "Games", "Browser", "Settings", "System" };
+    static const char *const names[MENU__COUNT] = { "Games", "Chihiro", "Browser", "Settings", "System" };
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImFont *font = g_font_mgr.m_menu_font;
     ImFont *small = g_font_mgr.m_menu_font_small;
@@ -4392,10 +5105,13 @@ void DashboardScene::DrawMainMenu(float s, float a)
         const float mid = ImGui::GetIO().DisplaySize.x / 2;
         const float tw = TextSize(font, 70 * s, "XPSemu").x;
         // The name and its version together are what's centred.
-        const float vw = TextSize(small, 26 * s, "v3").x, gap_v = 10 * s;
+        // "v" + XOG_VERSION_NUM (updater.hh), so it follows the version by itself.
+#define XOG_TITLE_V2(x) "v" #x
+#define XOG_TITLE_V(x) XOG_TITLE_V2(x)
+        const float vw = TextSize(small, 26 * s, XOG_TITLE_V(XOG_VERSION_NUM)).x, gap_v = 10 * s;
         const float tx = mid - (tw + gap_v + vw) / 2;
         DrawTitle(s, a, ImVec2(tx, 70 * s));
-        Text(dl, small, 26 * s, ImVec2(tx + tw + gap_v, 102 * s), Label(a * 0.55f), "v3");
+        Text(dl, small, 26 * s, ImVec2(tx + tw + gap_v, 102 * s), Label(a * 0.55f), XOG_TITLE_V(XOG_VERSION_NUM));
     }
 
     // The bars on the name's centre, their icons beside them.
@@ -4409,7 +5125,7 @@ void DashboardScene::DrawMainMenu(float s, float a)
         float y = y0 + i * gap;
         bool selected = i == m_page && !m_shelf && !m_np_focus;
         // Its icon in front of the bar, lit when it's the one.
-        static const int icons[MENU__COUNT] = { ICON_GAMES, ICON_BROWSER, ICON_SETTINGS, ICON_SYSTEM };
+        static const int icons[MENU__COUNT] = { ICON_GAMES, ICON_CHIHIRO, ICON_BROWSER, ICON_SETTINGS, ICON_SYSTEM };
         const ImVec2 sc(x - 54 * s, y + h / 2);
         const float isize = (selected ? 70 : 62) * s;
         if (selected) {
@@ -4806,20 +5522,42 @@ void DashboardScene::DrawGameSettings(float s, float a)
         DrawGamePatches(s, a, x, w);
     } else {
         float h = 60 * s, gap = 72 * s, y0 = 226 * s;
+        TrainerCardRefresh(m_gs_key, m_gs_game.title_id ? m_gs_game.title_id : Art(m_gs_game.path).info.title_id, false);
         const std::vector<int> rows = GameRows(m_gs_group);
         const float base_x = x, base_w = w, indent = 44 * s;
-        for (int k = 0; k < (int)rows.size(); k++) {
+        // patch 246: more rows than fit (a trainer's options): a window around the chosen one
+        const int kVisible = 10, nrows = (int)rows.size();
+        const int top = nrows > kVisible ? std::clamp(GameRowIndex(rows, m_gs_row) - kVisible / 2, 0, nrows - kVisible) : 0;
+        const int shown = std::min(nrows, kVisible);
+        for (int k = top; k < top + shown; k++) {
             int i = rows[k];
-            float y = y0 + k * gap;
+            float y = y0 + (k - top) * gap;
             bool selected = i == m_gs_row;
             const bool head = i >= GS__COUNT;
             float x = base_x + (head ? 0 : indent), w = base_w - (head ? 0 : indent);
             Bar(dl, ImVec2(x, y), ImVec2(x + w, y + h), s, selected, a);
+            static std::string tr_name;     // patch 246: the trainer's and its options' names
+            if (i == GS_TRAINER) {
+                const TrainerEntry *t = TrainerPicked();
+                tr_name = t ? t->name : "Trainer";
+                if (tr_name.size() > 30) {
+                    tr_name = tr_name.substr(0, 28) + "...";
+                }
+            } else if (i >= GS_TOPT && i < GS__COUNT) {
+                const TrainerEntry *t = TrainerPicked();
+                tr_name = t && i - GS_TOPT < (int)t->options.size() ? t->options[i - GS_TOPT] : "";
+                if (tr_name.size() > 40) {
+                    tr_name = tr_name.substr(0, 38) + "...";
+                }
+            }
             const char *name = i >= GS__COUNT   ? kGameGroups[i - GS__COUNT].name :
+                               i == GS_TRAINER || i >= GS_TOPT ? tr_name.c_str() :
                                i < GO__COUNT    ? GameOptionName(i) :
                                i == GS_NAME     ? "Name" :
+                               i == GS_PADMAP   ? "Button mapping" :
                                i == GS_CONTINUE ? "Continue where you left off" :
                                i == GS_DELETE_STATES ? "Delete saved states" :
+                               i == GS_DELETE_SAVES ? "Delete game saves" :
                                i == GS_PATCHES  ? "Game patches" :
                                i == GS_SHORTCUT ? "Create Shortcut" :
                                i == GS_FRAMEGEN ? "Frame Generation" :
@@ -4833,7 +5571,53 @@ void DashboardScene::DrawGameSettings(float s, float a)
             if (head) {
                 snprintf(value, sizeof(value), "%s", i - GS__COUNT == m_gs_group ? "v" : ">");
             }
-            if (i == GS_DELETE_STATES) {
+            if (i == GS_TRAINER) {
+                const int n = (int)s_tr.list.size();
+                if (!n) {
+                    snprintf(value, sizeof(value), "%s", TrainersReady() ? "No trainer for this game" : "Looking...");
+                    col = selected ? Ink(a) : White(a * 0.55f);
+                } else {
+                    if (n > 1) {
+                        snprintf(value, sizeof(value), "%s  (L1/R1: %d of %d)", s_tr.choice.on ? "On" : "Off", s_tr.pick + 1, n);
+                    } else {
+                        snprintf(value, sizeof(value), "%s", s_tr.choice.on ? "On" : "Off");
+                    }
+                    if (!s_tr.choice.on && !selected) {
+                        col = White(a * 0.55f);
+                    }
+                }
+            } else if (i >= GS_TOPT && i < GS__COUNT) {
+                const int k = i - GS_TOPT;
+                const bool on = k < (int)s_tr.choice.opts.size() && s_tr.choice.opts[k] == '1';
+                snprintf(value, sizeof(value), selected ? "<  %s  >" : "%s", on ? "On" : "Off");
+                if ((!on || !s_tr.choice.on) && !selected) {
+                    col = White(a * 0.55f);
+                }
+            } else if (i == GS_DELETE_SAVES) {
+                const uint32_t tid = m_gs_game.title_id ? m_gs_game.title_id : Art(m_gs_game.path).info.title_id;
+                static std::string seen_dir;
+                static int seen_count;
+                static double seen_at = -10;
+                const std::string dir = GameSavesDir(tid);
+                if (dir != seen_dir || ImGui::GetTime() - seen_at > 1) {      // counted once a second
+                    seen_dir = dir;
+                    seen_count = dir.empty() ? 0 : GameSavesCount(dir);
+                    seen_at = ImGui::GetTime();
+                }
+                if (ImGui::GetTime() - m_saves_deleted_at < 5) {
+                    snprintf(value, sizeof(value), "Deleted: copy kept");
+                } else if (dir.empty() || seen_count == 0) {
+                    snprintf(value, sizeof(value), "None");     // also its title files alone, no save
+                } else if (ImGui::GetTime() <= m_saves_armed) {
+                    snprintf(value, sizeof(value), "Press again to delete");
+                } else {
+                    snprintf(value, sizeof(value), "%d save%s%s", seen_count, seen_count == 1 ? "" : "s",
+                             selected ? "  >" : "");
+                }
+                if ((dir.empty() || seen_count == 0) && !selected && ImGui::GetTime() - m_saves_deleted_at >= 5) {
+                    col = White(a * 0.55f);
+                }
+            } else if (i == GS_DELETE_STATES) {
                 std::error_code ec;
                 const bool have = std::filesystem::exists("/data/xpsemu/states/" + m_gs_key, ec);
                 snprintf(value, sizeof(value), "%s", !have ? "None" : ImGui::GetTime() <= m_delete_armed ? "Press again to delete" : selected ? "Delete  >" : "");
@@ -4846,7 +5630,13 @@ void DashboardScene::DrawGameSettings(float s, float a)
                 snprintf(value, sizeof(value), "%s", kFg[mode >= 0 && mode < 5 ? mode : 0]);
             } else if (i == GS_FPSPATCH) {
                 const bool have = GameFpsPatchAvail(m_gs_game);
-                snprintf(value, sizeof(value), "%s", !have ? "None for this game" : Fps60Wanted(m_gs_key) ? "On" : "Off");
+                const std::string other = have ? std::string() : ModVersionsText(Art(m_gs_game.path).info.title_id);
+                if (!other.empty()) {      // a mod for another version of this game (patch 179)
+                    snprintf(value, sizeof(value), "Only for %s (yours: v%u)", other.c_str(),
+                             Art(m_gs_game.path).info.version);
+                } else {
+                    snprintf(value, sizeof(value), "%s", !have ? "None for this game" : Fps60Wanted(m_gs_key) ? "On" : "Off");
+                }
                 if (!have && !selected) {
                     col = White(a * 0.55f);
                 }
@@ -4862,6 +5652,12 @@ void DashboardScene::DrawGameSettings(float s, float a)
                 const bool have = stat(state.c_str(), &st) == 0;
                 snprintf(value, sizeof(value), "%s", !have ? "Nothing saved" : selected ? "Continue  >" : "Saved");
                 if (!have && !selected) {
+                    col = White(a * 0.55f);
+                }
+            } else if (i == GS_PADMAP) {     // patch 269
+                const bool own = !m_gs_profile.padmap.empty();
+                snprintf(value, sizeof(value), selected ? "%s  >" : "%s", own ? "Custom" : "Default");
+                if (!own && !selected) {
                     col = White(a * 0.55f);
                 }
             } else if (i == GS_NAME) {
@@ -4910,7 +5706,15 @@ void DashboardScene::DrawGameSettings(float s, float a)
             } else if (i < GO__COUNT) {
                 bool locked = false;
                 int v = m_gs_profile.value[i];
-                if (v == GAME_DEFAULT) {
+                if (v == GAME_DEFAULT && (i == GO_TRIGGERS || i == GO_GYRO || i == GO_TURBO || i == GO_MSAA ||
+                                          i == GO_A2C || i == GO_MOVIEUP)) {     // patch 367: SSAO has a setting now
+                    // patch 266: no setting of the user's behind these: Auto (the kind it picks) and Off (patch 354, 355: On)
+                    std::string shown = i == GO_GYRO || i == GO_TURBO || i == GO_MSAA ? std::string("Off") :
+                        i == GO_A2C || i == GO_MOVIEUP ? std::string("On") :
+                        std::string("Auto (") + GameOptionValueName(GO_TRIGGERS, TriggersBuiltIn(m_gs_key, m_gs_game.name)) + ")";
+                    snprintf(value, sizeof(value), selected ? "<  %s  >" : "%s", shown.c_str());
+                    col = selected ? Ink(a) : White(a * 0.55f);
+                } else if (v == GAME_DEFAULT) {
                     std::string global = GameOptionValueLabel(i, GameGlobal(i));
                     snprintf(value, sizeof(value),
                              locked     ? "Default (%s)  (locked)" :
@@ -4935,34 +5739,57 @@ void DashboardScene::DrawGameSettings(float s, float a)
                      col, value);
             }
         }
-        float fy = y0 + GameRowIndex(rows, m_gs_row) * gap;
+        float fy = y0 + (GameRowIndex(rows, m_gs_row) - top) * gap;
         if (m_gs_row < GS__COUNT) {     // a row in a group is set in
             x += indent;
             w -= indent;
         }
         Focus(dl, ImVec2(x, fy), ImVec2(x + w, fy + h), s, m_time, a);
 
+        static std::string tr_help;     // patch 246
+        if (m_gs_row == GS_TRAINER) {
+            const TrainerEntry *t = TrainerPicked();
+            if (!t) {
+                tr_help = "Put .etm trainer files in /data/xpsemu/trainers (or xpsemu/trainers on a USB drive), "
+                          "sub-folders too. Only trainers made for this game show.";
+            } else {
+                const size_t slash = t->path.find_last_of('/');
+                tr_help = (t->author.empty() ? std::string() : t->author + "  -  ") +
+                          (slash == std::string::npos ? t->path : t->path.substr(slash + 1)) +
+                          ". On: it patches the game as it starts (from the next start)." +
+                          (s_tr.list.size() > 1 ? " L1/R1 picks another one." : "");
+            }
+        }
         const char *help =
             m_gs_row >= GS__COUNT ? kGameGroups[m_gs_row - GS__COUNT].help :
+            m_gs_row == GS_TRAINER ? tr_help.c_str() :
+            m_gs_row >= GS_TOPT ? "One of the trainer's cheats, on or off from the next start. Some work with "
+                                  "button combos in game (their names say so). The quick menu's Trainer group "
+                                  "changes them too, with a restart." :
             m_gs_row == GS_CONTINUE ? "Back to the moment you chose Save and go home in the quick menu." :
             m_gs_row == GS_DELETE_STATES ? "Every saved state of this game. The game's own saves stay." :
+            m_gs_row == GS_DELETE_SAVES ? "The game's own saves on the Xbox hard disk: it starts fresh. They're moved to "
+                                          "/data/xpsemu/deleted-saves, so they can be put back. Press twice." :
             m_gs_row < GO__COUNT ? GameOptionHelp(m_gs_row) :
             m_gs_row == GS_FRAMEGEN ?
                 "Extra frames made between the game's own (as in the quick menu). "
                 "Used from the next start." :
             m_gs_row == GS_FPSPATCH ?
-                "The game's 60 FPS unlock or frame rate mod, where it has one. "
-                "Used from the next start." :
+                "The game's 60 FPS unlock or frame rate mod, where it has one. A mod fits one version of a "
+                "disc: \"Only for\" names the versions it was made for. Used from the next start." :
             m_gs_row == GS_PAL60 ?
                 "A PAL disc runs its 60 Hz mode: faster and smoother, as on an "
                 "NTSC console. Used from the next start." :
             m_gs_row == GS_PATCHES ?
-                "Widescreen, 60 FPS and other fixes from .JMP files in "
-                "/data/xemu/patches, applied as the game loads: the disc "
+                "Widescreen, 60 FPS and other fixes (.JMP patches built "
+                "into XPSemu), applied as the game loads: the disc "
                 "image isn't changed." :
             m_gs_row == GS_NAME ?
                 "The name shown for it everywhere in XPSemu. Clear it for "
                 "its own name." :
+            m_gs_row == GS_PADMAP ?
+                "Which DualSense button does what in this game, and swapped or inverted sticks. Default is your "
+                "layout from Settings > Controller. Used from the next start." :
             m_gs_row == GS_SHORTCUT ?
                 (m_gs_shortcut.empty() ?
                      "A tile of its own on the PS5's home screen (installed by "
@@ -4971,7 +5798,7 @@ void DashboardScene::DrawGameSettings(float s, float a)
                      "too).") :
                 "Back to Default for every setting: this game uses your "
                 "Settings again (patches stay as they are).";
-        TextFit(dl, small, 30 * s, ImVec2(base_x + 10 * s, y0 + rows.size() * gap + 8 * s),
+        TextFit(dl, small, 30 * s, ImVec2(base_x + 10 * s, y0 + shown * gap + 8 * s),
                 Label(a), help, w);
     }
 
@@ -4992,6 +5819,21 @@ void DashboardScene::DrawGameSettings(float s, float a)
     ImVec2 ps = TextSize(small, 30 * s, played.c_str());
     Text(dl, small, 30 * s, ImVec2(cx - ps.x / 2, ty + ns.y + 12 * s),
          Lime(a), played.c_str());
+    float card_y = ty + ns.y + ps.y + 24 * s;
+    if (!s_gs_chihiro) {    // patch 269
+        const bool own = !m_gs_profile.padmap.empty();
+        const char *pm = own ? "Button mapping: Custom" : "Button mapping: Default";
+        ImVec2 ms = TextSize(small, 28 * s, pm);
+        Text(dl, small, 28 * s, ImVec2(cx - ms.x / 2, card_y), own ? Lime(a) : Label(a * 0.8f), pm);
+        card_y += ms.y + 12 * s;
+    }
+    auto dup = g_duplicates.find(m_gs_game.path);
+    if (dup != g_duplicates.end()) {
+        std::string also = "Duplicate: a copy of " + dup->second[0];
+        ImVec2 ds = small->CalcTextSizeA(26 * s, FLT_MAX, 440 * s, also.c_str());
+        Text(dl, small, 26 * s, ImVec2(cx - ds.x / 2, card_y), Rgba(255, 190, 90, a * 0.9f), also.c_str(), 440 * s);
+        card_y += ds.y + 12 * s;
+    }
     if (GameIsRunning(m_gs_key)) {
         const char *now = m_gs_patches ?
                               "Running now: patches apply when it restarts" :
@@ -4999,7 +5841,7 @@ void DashboardScene::DrawGameSettings(float s, float a)
                               "rest apply right away";
         ImVec2 rs = small->CalcTextSizeA(28 * s, FLT_MAX, 440 * s, now);
         Text(dl, small, 28 * s,
-             ImVec2(cx - rs.x / 2, ty + ns.y + ps.y + 24 * s),
+             ImVec2(cx - rs.x / 2, card_y),
              Label(a * 0.8f), now, 440 * s);
     }
 }
@@ -5018,8 +5860,8 @@ void DashboardScene::DrawGamePatches(float s, float a, float x, float w)
         Text(dl, font, 48 * s, ImVec2(x, 260 * s), White(a),
              "No patches for this game yet");
         std::string how =
-            std::string("Put .JMP patch files (from the Xbox Patch Hub at "
-                        "jayxbox.com) in /data/xemu/patches. This game's "
+            std::string("XPSemu has no built-in patch (from the Xbox Patch Hub at "
+                        "jayxbox.com) for this game. Its "
                         "title ID is ") +
             (m_gs_game.title_id ? id : "unknown") +
             ": a patch is for the game whose ID is on its version= line.";
@@ -5163,9 +6005,541 @@ void DashboardScene::DrawGamePatches(float s, float a, float x, float w)
     }
 }
 
+// ---- Sega Chihiro games (patch 184, Chihiro phase 1): /data/xpsemu/chihiro/games (and xpsemu/chihiro/games on a
+// drive): netboot images (.bin) and GD-ROM dumps (.cue / .gdi, unlocked with their security key). Listed on their
+// own page only. Starting them comes in phase 2. ----
+#include "chihiro_ps5.h"
+
+static const char *ChihiroRegions(uint8_t r)
+{
+    static char buf[48];
+    buf[0] = 0;
+    if (r & 2) strcat(buf, "Japan ");
+    if (r & 4) strcat(buf, "USA ");
+    if (r & 8) strcat(buf, "Export ");
+    if (buf[0]) buf[strlen(buf) - 1] = 0;
+    return buf;
+}
+
+// Preparing a Chihiro game (patch 187): 1 unpacking, 2 ready, 3 failed
+static std::atomic<int> g_chihiro_prep{0};
+static std::mutex g_chihiro_prep_lock;
+static std::string g_chihiro_prep_why, g_chihiro_prep_dest;
+static DashboardScene::ChihiroGame g_chihiro_prep_game;
+
+void DashboardScene::ScanChihiro()
+{
+    m_chihiro.clear();
+    std::vector<std::string> roots = { "/data/xpsemu/chihiro/games" };
+    for (const char *drive : { "/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3", "/mnt/ext0", "/mnt/ext1" }) {
+        roots.push_back(std::string(drive) + "/xpsemu/chihiro/games");
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(roots[0], ec);
+    std::set<std::string> seen;
+    auto add = [&](const std::filesystem::path &fp, bool from_browser) {
+            const std::string path = fp.string();
+            if (!seen.insert(path).second) {
+                return;
+            }
+            std::string ext = fp.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            const bool sheet = ext == ".cue" || ext == ".gdi" || ext == ".chd";   // + a MAME GD-ROM CHD (patch 221)
+            if (!sheet && ext != ".bin") {
+                return;
+            }
+            if (!sheet && path.find("(Track ") != std::string::npos) {
+                return;   // a GD-ROM's track: its .cue lists it
+            }
+            RxChihiroInfo info;
+            // patch 271: a file read once is answered from memory while its size and time stay the same (the page
+            // scans every 10 s: reading all the images' headers again held the UI 111 ms, a short freeze)
+            struct Seen { long long size, mtime; RxChihiroInfo info; bool ok; };
+            static std::map<std::string, Seen> known;
+            struct stat st;
+            const bool have_st = stat(path.c_str(), &st) == 0;
+            bool ok;
+            auto hit = known.find(path);
+            if (have_st && hit != known.end() && hit->second.size == (long long)st.st_size &&
+                hit->second.mtime == (long long)st.st_mtime) {
+                info = hit->second.info;
+                ok = hit->second.ok;
+            } else {
+                ok = rx_chihiro_info(path.c_str(), &info);
+                if (have_st) {
+                    known[path] = Seen{ (long long)st.st_size, (long long)st.st_mtime, info, ok };
+                }
+                fprintf(stderr, "XPSemu: chihiro: %s: %s%s%s\n", path.c_str(), ok ? info.name : "not usable: ",
+                        ok ? "" : info.why, ok ? (std::string(" (") + info.exe + ")").c_str() : "");
+            }
+            if (!ok && (!sheet || (from_browser && ext == ".chd" && !strstr(info.why, "locked")))) {
+                return;   // some other .bin (or, from the Browser, an Xbox CHD)
+            }
+            ChihiroGame g;
+            g.path = path;
+            g.ok = ok;
+            g.name = ok && info.name[0] ? info.name : fp.stem().string();
+            if (ok) {
+                g.details = std::string(info.format) + (info.encrypted ? " (unlocked)" : "") + "  -  " +
+                            ChihiroRegions(info.regions) + "  -  " + info.game_id + "  -  " + info.maker;
+            }
+            g.why = ok ? "" : info.why;
+            g.id = ok ? info.game_id : "";
+            g.exe = ok ? info.exe : "";     // boot.id's XBE: the game starts straight into it (patch 216)
+            m_chihiro.push_back(g);
+    };
+    for (const std::string &root : roots) {
+        if (!std::filesystem::is_directory(root, ec)) {
+            continue;
+        }
+        for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
+             it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec || it.depth() > 2 || !it->is_regular_file(ec)) {
+                continue;
+            }
+            add(it->path(), false);
+        }
+    }
+    // patch 239: games played from the Browser, wherever they are
+    {
+        std::ifstream library("/data/xpsemu/chihiro/library.txt");
+        std::string line;
+        while (std::getline(library, line)) {
+            if (!line.empty() && std::filesystem::is_regular_file(line, ec)) {
+                add(std::filesystem::path(line), true);
+            }
+        }
+    }
+    // two discs of one game (Maximum Tune: gdx-0008b Japan, gdx-0009b USA) told apart (patch 222): MAME's known
+    // regional discs by name, any other same-named pair by its file's name
+    for (ChihiroGame &g : m_chihiro) {
+        const std::string stem = std::filesystem::path(g.path).stem().string();
+        if (stem.find("gdx-0008") != std::string::npos) {
+            g.name += " (Japan)";
+        } else if (stem.find("gdx-0009") != std::string::npos) {
+            g.name += " (USA)";
+        }
+    }
+    for (size_t i = 0; i < m_chihiro.size(); i++) {
+        for (size_t j = i + 1; j < m_chihiro.size(); j++) {
+            if (m_chihiro[i].name == m_chihiro[j].name) {
+                m_chihiro[j].name += " (" + std::filesystem::path(m_chihiro[j].path).stem().string() + ")";
+            }
+        }
+    }
+    std::sort(m_chihiro.begin(), m_chihiro.end(),
+              [](const ChihiroGame &a, const ChihiroGame &b) { return strcasecmp(a.name.c_str(), b.name.c_str()) < 0; });
+    m_chihiro_sel = std::clamp(m_chihiro_sel, 0, std::max(0, (int)m_chihiro.size() - 1));
+    m_chihiro_scanned = ImGui::GetTime();
+    CheckChihiroBoards();
+}
+
+void DashboardScene::ChihiroInput(bool accept, bool up, bool down, bool l1, bool r1, bool triangle)
+{
+    const int n = (int)m_chihiro.size();
+    if (!n) {
+        return;
+    }
+    if (triangle) {
+        // Triangle: the next start once through the Sega boot (SEGABOOT, from the media board's flash, optional)
+        const ChihiroGame &g = m_chihiro[m_chihiro_sel];
+        const std::string flag = "/data/xpsemu/chihiro/run/" + (g.id.empty() ? std::string("game") : g.id) + ".segaboot";
+        struct stat st;
+        if (stat(flag.c_str(), &st) == 0) {
+            unlink(flag.c_str());
+            UiSoundPlay(UI_SOUND_SELECT);
+            xemu_queue_notification((g.name + ": starts directly again").c_str());
+        } else if (ChihiroFlash().empty()) {
+            UiSoundPlay(UI_SOUND_ERROR);
+            xemu_queue_notification("The Sega boot needs the media board's flash (fpr21042_m29w160et.bin) in /data/xpsemu/chihiro");
+        } else {
+            std::error_code ec;
+            std::filesystem::create_directories("/data/xpsemu/chihiro/run", ec);
+            std::ofstream(flag) << "1\n";
+            UiSoundPlay(UI_SOUND_SELECT);
+            xemu_queue_notification((g.name + ": the next start shows the Sega boot (once)").c_str());
+        }
+        return;
+    }
+    if (up && down) {
+        up = down = false;      // patch 229: both at once (a drifting stick and the D-pad): neither, no flicker
+    }
+    if (up) m_chihiro_sel = std::max(m_chihiro_sel - 1, 0);
+    if (down) m_chihiro_sel = std::min(m_chihiro_sel + 1, n - 1);
+    if (l1) m_chihiro_sel = std::max(m_chihiro_sel - 5, 0);
+    if (r1) m_chihiro_sel = std::min(m_chihiro_sel + 5, n - 1);
+    if (up || down || l1 || r1) {
+        UiSoundPlay(UI_SOUND_MOVE);
+    }
+    if (accept) {
+        const ChihiroGame &g = m_chihiro[m_chihiro_sel];
+        if (!g.ok) {
+            UiSoundPlay(UI_SOUND_ERROR);
+            xemu_queue_notification(("Can't use it: " + g.why).c_str());
+            return;
+        }
+        if (g_chihiro_prep.load() == 1) {
+            return;     // already preparing one
+        }
+        if (!m_chihiro_boards_ok) {
+            UiSoundPlay(UI_SOUND_ERROR);
+            xemu_queue_notification("The base board files are missing or wrong: see the list on this page");
+            return;
+        }
+        // The game's volume unpacked once into /data/xpsemu/chihiro/run/<game ID>: the media board's mbfs:
+        const std::string dest = "/data/xpsemu/chihiro/run/" + (g.id.empty() ? std::string("game") : g.id);
+        g_chihiro_prep_game = g;
+        g_chihiro_prep_dest = dest;
+        g_chihiro_prep.store(1);
+        UiSoundPlay(UI_SOUND_SELECT);
+        std::thread([path = g.path, dest]() {
+            std::error_code ec;
+            std::filesystem::create_directories(dest, ec);
+            char why[160] = "";
+            const bool ok = rx_chihiro_prepare(path.c_str(), dest.c_str(), why, sizeof(why));     // patch 219
+            {
+                std::lock_guard<std::mutex> guard(g_chihiro_prep_lock);
+                g_chihiro_prep_why = why;
+            }
+            g_chihiro_prep.store(ok ? 2 : 3);
+        }).detach();
+    }
+}
+
+
+// ---- Sega Chihiro's base board files (patch 217): found, checked, taken out of the user's chihiro.zip ----
+#include <zlib.h>
+extern "C" size_t tinfl_decompress_mem_to_mem(void *out, size_t out_len, const void *in, size_t in_len, int flags);
+
+namespace {
+
+struct BoardFile {
+    const char *name, *what;
+    size_t min, max;
+    int pid;            // the B2 header's USB product ID (ic10 QC 0002, pc20 SC 0003), -1: none
+};
+const BoardFile kBoardFiles[] = {
+    { "ic10_g24lc64.bin", "QC board firmware", 8192, 8192, 0x0002 },
+    { "pc20_g24lc64.bin", "SC board firmware", 8192, 8192, 0x0003 },
+    { "ic11_24lc024.bin", "board settings", 1, 512, -1 },
+};
+// versions seen working (CRC32): more than one of each exists (ic10 carries the region, ic11 the board's settings)
+const uint32_t kKnownCrc[] = { 0x8a3d9f9eu, 0u };
+
+std::string FindBoardFile(const char *name)
+{
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator("/data/xpsemu/chihiro", ec);
+         it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) {
+            break;
+        }
+        const std::string rel = it->path().string();
+        if (it.depth() > 1 || rel.find("/chihiro/run") != std::string::npos || rel.find("/chihiro/games") != std::string::npos) {
+            if (it->is_directory(ec) && (rel.find("/chihiro/run") != std::string::npos || rel.find("/chihiro/games") != std::string::npos)) {
+                it.disable_recursion_pending();
+            }
+            continue;
+        }
+        if (!strcasecmp(it->path().filename().string().c_str(), name)) {
+            return rel;
+        }
+    }
+    return "";
+}
+
+uint16_t Rd16(const std::string &b, size_t o) { return (uint8_t)b[o] | (uint8_t)b[o + 1] << 8; }
+uint32_t Rd32(const std::string &b, size_t o) { return Rd16(b, o) | (uint32_t)Rd16(b, o + 2) << 16; }
+
+// The named file out of a .zip (stored or deflated), "" when it isn't in it.
+std::string ZipEntry(const std::string &zip, const char *name)
+{
+    if (zip.size() < 22) {
+        return "";
+    }
+    size_t eocd = std::string::npos;
+    for (size_t i = zip.size() - 22; i + 1 > 0 && zip.size() - i < 70000; i--) {
+        if (Rd32(zip, i) == 0x06054b50u) {
+            eocd = i;
+            break;
+        }
+        if (i == 0) {
+            break;
+        }
+    }
+    if (eocd == std::string::npos) {
+        return "";
+    }
+    const unsigned count = Rd16(zip, eocd + 10);
+    size_t at = Rd32(zip, eocd + 16);
+    for (unsigned n = 0; n < count && at + 46 <= zip.size() && Rd32(zip, at) == 0x02014b50u; n++) {
+        const unsigned method = Rd16(zip, at + 10), nlen = Rd16(zip, at + 28), xlen = Rd16(zip, at + 30),
+                       clen = Rd16(zip, at + 32);
+        const uint32_t csize = Rd32(zip, at + 20), usize = Rd32(zip, at + 24), local = Rd32(zip, at + 42);
+        std::string entry = zip.substr(at + 46, nlen);
+        const size_t slash = entry.find_last_of('/');
+        const std::string base = slash == std::string::npos ? entry : entry.substr(slash + 1);
+        at += 46 + nlen + xlen + clen;
+        if (strcasecmp(base.c_str(), name) || usize > (1u << 20) || local + 30 > zip.size() ||
+            Rd32(zip, local) != 0x04034b50u) {
+            continue;
+        }
+        const size_t data = local + 30 + Rd16(zip, local + 26) + Rd16(zip, local + 28);
+        if (data + csize > zip.size()) {
+            return "";
+        }
+        if (method == 0) {
+            return zip.substr(data, csize);
+        }
+        if (method == 8) {
+            std::string out(usize, '\0');
+            const size_t got = tinfl_decompress_mem_to_mem(&out[0], usize, zip.data() + data, csize, 0);
+            return got == usize ? out : "";
+        }
+        return "";
+    }
+    return "";
+}
+
+}  // namespace
+
+void DashboardScene::CheckChihiroBoards()
+{
+    m_chihiro_boards.clear();
+    m_chihiro_boards_ok = true;
+    for (const BoardFile &f : kBoardFiles) {
+        std::string path = FindBoardFile(f.name), from;
+        if (path.empty()) {
+            // a chihiro.zip (the Chihiro BIOS set, any .zip in /data/xpsemu/chihiro): the file taken out once
+            std::error_code ec;
+            for (auto it = std::filesystem::directory_iterator("/data/xpsemu/chihiro", ec);
+                 path.empty() && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+                const std::string z = it->path().string();
+                if (ec || z.size() < 4 || strcasecmp(z.c_str() + z.size() - 4, ".zip") || it->file_size(ec) > (64u << 20)) {
+                    continue;
+                }
+                const std::string bytes = ZipEntry(ReadBinary(z), f.name);
+                if (!bytes.empty()) {
+                    path = std::string("/data/xpsemu/chihiro/") + f.name;
+                    WriteWhole(path, bytes.data(), bytes.size());
+                    from = it->path().filename().string();
+                    xog_ui_log("chihiro: %s taken out of %s", f.name, z.c_str());
+                }
+            }
+        }
+        char line[300];
+        if (path.empty()) {
+            snprintf(line, sizeof(line), "Missing  %s  (%s)", f.name, f.what);
+            m_chihiro_boards_ok = false;
+            m_chihiro_boards.push_back(line);
+            continue;
+        }
+        const std::string b = ReadBinary(path);
+        const uint32_t crc = (uint32_t)crc32(0, (const Bytef *)b.data(), (uInt)b.size());
+        std::string why;
+        if (b.size() < f.min || b.size() > f.max) {
+            why = "wrong size (" + std::to_string(b.size()) + " bytes, needs " + std::to_string(f.max) + ")";
+        } else if (f.pid >= 0 && ((uint8_t)b[0] != 0xB2 || Rd16(b, 1) != 0x0CA3 || Rd16(b, 3) != f.pid)) {
+            why = "not this board's firmware";
+        }
+        if (!why.empty()) {
+            m_chihiro_boards_ok = false;
+        }
+        snprintf(line, sizeof(line), "%s  %s  (%s)  CRC32 %08X%s%s%s", why.empty() ? "OK" : "Wrong", f.name, f.what, crc,
+                 why.empty() ? "" : "  -  ", why.c_str(), from.empty() ? "" : ("  -  from " + from).c_str());
+        m_chihiro_boards.push_back(line);
+    }
+    (void)kKnownCrc;
+}
+
+// The media board's flash (fpr21042_m29w160et.bin: SEGABOOT is its second megabyte): optional (patch 216), only for
+// the Sega boot on demand. "" when it isn't there.
+std::string DashboardScene::ChihiroFlash()
+{
+    for (const std::string &dir : { std::string("/data/xpsemu/chihiro") }) {
+        std::error_code ec;
+        for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
+             it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (!ec && it.depth() <= 2 && !strcasecmp(it->path().filename().string().c_str(), "fpr21042_m29w160et.bin")) {
+                return it->path().string();
+            }
+        }
+    }
+    return "";
+}
+
+void DashboardScene::StartChihiro(const ChihiroGame &g)
+{
+    std::error_code ec;
+    std::filesystem::create_directories("/data/xpsemu/chihiro/boot", ec);
+    // Phase 4b (patch 216): no SEGABOOT, no flash: what SEGABOOT hands a game is a launch data page naming its
+    // XBE (launch type 0, title FFFE0000, "\Device\CdRom0;<boot.id's XBE>", the rest zeros: OutRun 2's, kept in
+    // patch 212, was exactly that); made here, the core boots the game straight from it (its relaunch). The Sega
+    // boot only when asked (Triangle: run/<id>.segaboot) and the flash is there.
+    const std::string flag = g_chihiro_prep_dest + ".segaboot";
+    struct stat st;
+    std::string rom;
+    if (stat(flag.c_str(), &st) == 0) {
+        unlink(flag.c_str());               // once
+        rom = ChihiroFlash();
+    }
+    std::string data = rom.empty() ? std::string() : ReadBinary(rom);
+    const bool segaboot = data.size() == 2u << 20 && data.compare(1u << 20, 4, "XBEH") == 0;
+    if (segaboot) {
+        const std::string boot = "/data/xpsemu/chihiro/boot/default.xbe";
+        if (ReadBinary(boot) != data.substr(1u << 20)) {
+            WriteWhole(boot, data.data() + (1u << 20), 1u << 20);
+        }
+        const std::string boot_old = "/data/xpsemu/chihiro/boot/segaboot_old.xbe";     // mbrom0: (patch 187)
+        if (ReadBinary(boot_old) != data.substr(0, 1u << 20)) {
+            WriteWhole(boot_old, data.data(), 1u << 20);
+        }
+    }
+    const bool quick = !segaboot;
+    if (quick) {
+        std::string exe = g.exe.empty() ? std::string("default.xbe") : g.exe;
+        while (!exe.empty() && (exe[0] == '\\' || exe[0] == '/')) {
+            exe.erase(0, 1);
+        }
+        std::replace(exe.begin(), exe.end(), '\\', ';');
+        std::string page(0x1000, '\0');
+        page[4] = 0x00;                     // title FFFE0000 (SEGABOOT's)
+        page[5] = 0x00;
+        page[6] = (char)0xFE;
+        page[7] = (char)0xFF;
+        const std::string path = "\\Device\\CdRom0;" + exe;
+        memcpy(&page[8], path.data(), std::min(path.size(), (size_t)0x300));
+        unlink("/data/xpsemu/kept.bin");    // no other game's kept memory
+        WriteWhole("/data/xpsemu/relaunch.bin", page.data(), page.size());
+        WriteWhole(g_chihiro_prep_dest + ".launch.bin", page.data(), page.size());     // for the quick menu's restart
+    }
+    fprintf(stderr, "XPSemu: chihiro: starting %s (%s)\n", g.path.c_str(),
+            quick ? ("straight into " + g.exe + ", no SEGABOOT").c_str() : ("the Sega boot from " + rom).c_str());
+    std::string lines = "/data/xpsemu/chihiro/boot\n";
+    lines += "key=chihiro\n";
+    lines += "name=" + g.name + "\n";
+    lines += "chihiro=" + g.path + "\n";
+    lines += "chihirofs=" + g_chihiro_prep_dest + "\n";     // mbfs: (patch 187)
+    lines += "chihiroimg=" + g.path + "\n";                  // the image read in place, no unpacking (patch 219)
+    // What the quick menu remembered for Chihiro games (game-settings/chihiro.txt), else Settings, as an Xbox
+    // game's start does (patch 214: the overlay, AA, shape... were always Settings', the quick menu's choice lost)
+    const GameProfile profile = GameProfileLoad("chihiro");
+    auto value = [&](int o) { return profile.value[o] != GAME_DEFAULT ? profile.value[o] : GameGlobal(o); };
+    const int aspect = value(GO_ASPECT);
+    lines += "scale=" + std::to_string(value(GO_AA) >= 3 ? std::max(6, value(GO_SCALE)) : value(GO_SCALE)) + "\n";
+    lines += value(GO_AA) == 1 ? "aa=fxaa\n" : value(GO_AA) == 2 ? "aa=smaa\n" : value(GO_AA) == 3 ? "aa=ssaa\n" : value(GO_AA) == 4 ? "aa=ssaa+smaa\n" : "aa=off\n";
+    lines += "af=" + std::to_string(value(GO_AF)) + "\n";      // anisotropic filtering (patch 241)
+    lines += value(GO_FILTER) == CONFIG_UPSCALE_SHARP ? "upscale=sgsr\n" :
+             value(GO_FILTER) == CONFIG_UPSCALE_CAS ? "upscale=cas\n" : "upscale=bilinear\n";
+    // patch 247: CAS sharpness, texture sharpness, the CRT filter
+    lines += "cas=" + std::to_string(value(GO_CAS)) + "\ntexsharp=" + std::string("0") +
+             "\ncrt=" + std::to_string(value(GO_CRT)) + "\n";
+    lines += value(GO_FIT) == CONFIG_DISPLAY_UI_FIT_STRETCH ? "aspect=stretch\n" :
+             aspect == CONFIG_DISPLAY_UI_ASPECT_RATIO_16X9 ? "aspect=16:9\n" :
+             aspect == CONFIG_DISPLAY_UI_ASPECT_RATIO_4X3 ? "aspect=4:3\n" : "aspect=auto\n";
+    if (value(GO_FPS_CAP) >= 5) {
+        lines += "fpscap=" + std::to_string(value(GO_FPS_CAP)) + "\n";
+    }
+    lines += "volume=" + std::to_string(value(GO_VOLUME)) + "\n";
+    lines += "fps=" + std::to_string(value(GO_OVERLAY)) + "\n";
+    lines += "triggers=" + std::to_string(TriggersChihiro(g.id)) + "\n";     // patch 266: driving or gun games
+    lines += "avpack=vga\n";          // 31 kHz 640x480 progressive like the arcade monitor: SCART has no 480p, SEGABOOT's D3D found no mode (patch 189)
+    lines += "lang=1\n";
+    lines += "video=80000\n";          // 480p, as SEGABOOT wants
+    // SEGABOOT's D3D waits on a semaphore the GPU never reaches, GET == PUT: the Republic Commando pattern, the
+    // GPU's read-ahead after a trap (patch 156); on for Chihiro starts only (patch 190). + putwait (patch 150): the
+    // decoder catches up at each PUT write: its 512 KB ring wrapped and SEGABOOT's D3D wrote over the jump at 0x354
+    // before the decoder, behind on its own thread, got there (patch 191)
+    lines += "xogfix=prefetch,putwait\n";
+    if (quick) {
+        lines += "relaunch\n";
+    }
+    std::ofstream("/data/xpsemu/chihiro-start.txt") << g.path << "\n";    // back here after it (patch 186)
+    UiSoundPlay(UI_SOUND_LAUNCH);
+    m_start_lines = lines;
+    m_start_at = ImGui::GetTime() + 0.5;
+    m_visible = false;
+    m_music_at = -1;
+    UiMusicPlay(false);
+}
+
+void DashboardScene::DrawChihiro(float s, float a)
+{
+    const int prep = g_chihiro_prep.load();
+    if (prep == 2) {
+        g_chihiro_prep.store(0);
+        StartChihiro(g_chihiro_prep_game);
+    } else if (prep == 3) {
+        g_chihiro_prep.store(0);
+        std::lock_guard<std::mutex> guard(g_chihiro_prep_lock);
+        UiSoundPlay(UI_SOUND_ERROR);
+        xemu_queue_notification(("Couldn't prepare it: " + g_chihiro_prep_why).c_str());
+    }
+    if (ImGui::GetTime() - m_chihiro_scanned > 10) {
+        ScanChihiro();      // on opening, and again now and then (games copied over FTP show up)
+    }
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImFont *font = g_font_mgr.m_menu_font_medium;
+    ImFont *small = g_font_mgr.m_menu_font_small;
+    const float slide = 200 * s * (1 - m_page_anim);
+    const float x = 280 * s + slide, w = 1360 * s;
+    // the base board files (patch 217): all lines when one is missing or wrong, else one
+    const auto boards = [&](float by) {
+        if (m_chihiro_boards_ok) {
+            Text(dl, small, 24 * s, ImVec2(x, by), Lime(a), "Base board files: OK", w);
+            return;
+        }
+        Text(dl, small, 26 * s, ImVec2(x, by), White(a), "Base board files: put these 3 files in /data/xpsemu/chihiro", w);
+        for (size_t i = 0; i < m_chihiro_boards.size(); i++) {
+            const bool ok = m_chihiro_boards[i].rfind("OK", 0) == 0;
+            Text(dl, small, 24 * s, ImVec2(x + 24 * s, by + (48 + 44 * i) * s), ok ? Lime(a) : Rgba(255, 120, 90, a),
+                 m_chihiro_boards[i].c_str(), w - 24 * s);
+        }
+    };
+    if (m_chihiro.empty()) {
+        Text(dl, font, 56 * s, ImVec2(x, 330 * s), White(a), "No Chihiro games yet");
+        Text(dl, small, 34 * s, ImVec2(x, 410 * s), Label(a),
+             "Put them in /data/xpsemu/chihiro/games: a netboot image (.bin), or a GD-ROM dump (.cue or .gdi) "
+             "with its security key (.data or .pic) beside it.", w);
+        boards(520 * s);
+        return;
+    }
+    const int visible = 6;    // patch 219: room for the info block under it
+    const float h = 60 * s, gap = 72 * s, y0 = 226 * s;
+    const int n = (int)m_chihiro.size();
+    const int top = std::clamp(m_chihiro_sel - visible / 2, 0, std::max(0, n - visible));
+    for (int k = 0; k < visible && top + k < n; k++) {
+        const int i = top + k;
+        const ChihiroGame &g = m_chihiro[i];
+        const float y = y0 + k * gap;
+        const bool selected = i == m_chihiro_sel && m_in_page;
+        Bar(dl, ImVec2(x, y), ImVec2(x + w, y + h), s, selected, a);
+        Icon(dl, ICON_CHIHIRO, ImVec2(x + 40 * s, y + h / 2), 40 * s, selected ? Ink(a) : Label(a));
+        Text(dl, font, 40 * s, ImVec2(x + 80 * s, y + 9 * s), selected ? Ink(a) : (g.ok ? White(a) : White(a * 0.55f)),
+             g.name.c_str(), w - 120 * s);
+    }
+    const ChihiroGame &g = m_chihiro[m_chihiro_sel];
+    // patch 219: the info under the list as one clean block, one row each, room between them; "preparing" a
+    // spinner at the top left, not text over the rows
+    if (g_chihiro_prep.load() == 1) {
+        const ImVec2 c(110 * s, 107 * s);
+        const float r = 22 * s, t = (float)ImGui::GetTime() * 6.0f;
+        dl->PathArcTo(c, r, t, t + 4.4f, 32);
+        dl->PathStroke(Lime(a), 0, 5 * s);
+        Text(dl, small, 28 * s, ImVec2(c.x + r + 18 * s, c.y - 16 * s), Lime(a),
+             ("Preparing " + g_chihiro_prep_game.name).c_str(), 360 * s);
+    }
+    const float dy = y0 + std::min(visible, n) * gap + 26 * s, row = 48 * s;
+    Text(dl, small, 28 * s, ImVec2(x, dy), g.ok ? White(a) : Rgba(255, 120, 90, a),
+         g.ok ? g.details.c_str() : ("Can't use it: " + g.why).c_str(), w);
+    Text(dl, small, 24 * s, ImVec2(x, dy + row), Label(a * 0.7f), g.path.c_str(), w);
+    // (patch 232, the user's: the start-mode line removed for a cleaner page; Triangle still asks for the Sega boot)
+    boards(dy + 2 * row);
+}
+
 void DashboardScene::DrawPageHeader(float s, float a)
 {
-    static const char *const names[PAGE__COUNT] = { "Games", "Browser", "Settings", "System" };
+    static const char *const names[PAGE__COUNT] = { "Games", "Chihiro", "Browser", "Settings", "System" };
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImFont *font = g_font_mgr.m_menu_font;
     float slide = 200 * s * (1 - m_page_anim);
@@ -5179,7 +6553,9 @@ void DashboardScene::DrawPageHeader(float s, float a)
     // A game's settings opened on the shelf leave m_page on the menu's last
     // item, which isn't a page: as that page slides away after Back, keep
     // the title it had (names[] has only the pages).
-    if (m_gs_open) {
+    if (m_gs_open && m_gm_open) {
+        m_header = "Button mapping";    // patch 269
+    } else if (m_gs_open) {
         m_header = m_gs_patches ? "Game patches" : "Game settings";
     } else if (m_page == PAGE_SETTINGS && m_advanced) {
         m_header = "Advanced settings";
@@ -5356,7 +6732,7 @@ static XemuTexture DrawCase(const DashboardScene::Game &game, ImVec2 tl,
 // covers as it turns, a shadow under it, and the cover blurred behind.
 //
 
-// A game's back cover or spine: /data/xemu/covers/<TITLEID>.back.jpg /
+// A game's back cover or spine: /data/xpsemu/covers/<TITLEID>.back.jpg /
 // .spine.jpg, downloaded from xdb the first time it's wanted.
 static XemuTexture GamePart(const DashboardScene::Game &game, CoverPart part)
 {
@@ -5366,15 +6742,17 @@ static XemuTexture GamePart(const DashboardScene::Game &game, CoverPart part)
     if (!tried && game.title_id) {
         tried = true;
         art.parts_asked = ImGui::GetTime();
-        char file[64];
-        snprintf(file, sizeof(file), "/data/xemu/covers/%08X%s", game.title_id,
-                 part == COVER_BACK ? ".back.jpg" : ".spine.jpg");
+        char name[32];
+        snprintf(name, sizeof(name), "/%08X%s", game.title_id, part == COVER_BACK ? ".back.jpg" : ".spine.jpg");
         std::error_code ec;
+        std::string file = std::string(kCoversDir) + name;
+        if (!std::filesystem::exists(file, ec)) {
+            file = std::string(kOldCoversDir) + name;     // Alpha 2's folder
+        }
         if (std::filesystem::exists(file, ec)) {
             DecodeRequest({ game.path, file, 1024, part });
         } else {
-            CoverDownloadRequest({ { game.title_id, {}, part } },
-                                 "/data/xemu/covers");
+            CoverDownloadRequest({ { game.title_id, { game.name, art.info.title, art.stem }, part } }, kCoversDir);
         }
     }
     return tex;
@@ -5726,7 +7104,7 @@ void DashboardScene::DrawGames(float s, float a)
         Text(dl, font, 56 * s, ImVec2(280 * s + slide, 330 * s), White(a),
              "No games yet");
         Text(dl, small, 34 * s, ImVec2(280 * s + slide, 410 * s), Label(a),
-             "Put your games in /data/xpsemu/games (or /data/xemu/games): .iso, .cci, or a folder with default.xbe");
+             "Put your games in /data/xpsemu/games (or /data/xemu/games): .iso, .cci, .cso, .chd, or a folder with default.xbe");
         return;
     }
 
@@ -5960,13 +7338,26 @@ void DashboardScene::DrawGames(float s, float a)
     Text(dl, font, 54 * s, ImVec2(cx - ns.x / 2, ty), White(a),
          game.name.c_str(), size.x - 200 * s);
 
-    // Details: title ID, play time, when, and chips for this game's own
-    // settings.
+    // Details: region and languages (Redump's list, patch 176), title ID, play time, when, and chips
+    // for this game's own settings.
     std::string details;
+    {
+        const DiscFacts &facts = DiscFactsOf(game);
+        std::string where = facts.region;
+        if (!facts.languages.empty()) {
+            where += (where.empty() ? "" : "  -  ") + facts.languages;
+        }
+        if (!facts.revision.empty()) {
+            where += (where.empty() ? "" : "  -  ") + facts.revision;
+        }
+        if (!where.empty()) {
+            details = where + "     ";
+        }
+    }
     if (game.title_id) {
         char id[16];
         snprintf(id, sizeof(id), "%08X", game.title_id);
-        details = id;
+        details += id;
     }
     GamePlay play = GamePlayGet(KeyOf(game));
     std::string played = play.last ? "Played " + GamePlayTimeText(play.seconds) +
@@ -5978,9 +7369,13 @@ void DashboardScene::DrawGames(float s, float a)
     details += count;
 
     std::vector<std::string> chips;
+    if (g_duplicates.count(game.path)) {
+        chips.push_back("Duplicate");       // its settings say where the other copy is (patch 180)
+    }
     const GameProfile &profile = ProfileOf(game);
     for (int o = GO_SCALE; o < GO__COUNT; o++) {
-        if (o == GO_DSP) {
+        if (o == GO_DSP || o == GO_CAS || o == GO_TEXSHARP || o == GO_TRIGGERS || o == GO_GYRO || o == GO_TURBO ||
+            o == GO_MSAA || o == GO_A2C || o == GO_MOVIEUP || o == GO_SSAO) {   // patch 266: no chips (patch 325: nor MSAA's; 354, 355, 363)
             continue;
         }
         if (profile.value[o] != GAME_DEFAULT) {
@@ -6099,7 +7494,7 @@ static const int kPadLeft[] = { XB_LT, XB_WHITE, XB_LSTICK, XB_UP, XB_LEFT,
                                 XB_RIGHT, XB_DOWN, XB_BACK };
 static const int kPadRight[] = { XB_RT, XB_BLACK, XB_Y, XB_X, XB_B, XB_A,
                                  XB_RSTICK, XB_START };
-enum { PAD_ROWS_CONTROLS = 16, PAD_ROWS = 16 };
+enum { PAD_ROWS_CONTROLS = 16, PAD_ROWS = 18, PAD_ROW_VIBRATION = 16, PAD_ROW_TRIGGERS = 17 };
 
 static int PadRowControl(int row)
 {
@@ -6121,8 +7516,31 @@ extern "C" int g_xemu_ps5_pad_hold;
 void DashboardScene::PadInput(bool accept, bool left, bool right, bool up,
                               bool down, bool options)
 {
-    if (up) m_pad_sel = (m_pad_sel + PAD_ROWS - 1) % PAD_ROWS;
-    if (down) m_pad_sel = (m_pad_sel + 1) % PAD_ROWS;
+    // Each column up and down; below both, the Vibration button (patch 236) and, beside it, Adaptive triggers
+    // (patch 266): the left column leads to Vibration, the right one to Adaptive triggers; Cross switches them
+    if (m_pad_sel == PAD_ROW_VIBRATION || m_pad_sel == PAD_ROW_TRIGGERS) {
+        const int col = m_pad_sel == PAD_ROW_TRIGGERS ? 1 : 0;
+        if (up) m_pad_sel = col * 8 + 7;
+        else if (down) m_pad_sel = col * 8;
+        else if (left || right) {
+            m_pad_sel = m_pad_sel == PAD_ROW_VIBRATION ? PAD_ROW_TRIGGERS : PAD_ROW_VIBRATION;
+            return;
+        } else if (accept) {
+            bool &on = m_pad_sel == PAD_ROW_TRIGGERS ? g_cfg.triggers : g_cfg.vibration;
+            on = !on;
+            xemu_settings_save();
+            UiSoundPlay(UI_SOUND_CHANGE);
+            return;
+        }
+    } else if (up || down) {
+        const int col = m_pad_sel / 8, at = m_pad_sel % 8;
+        if ((down && at == 7) || (up && at == 0)) {
+            m_pad_sel = col ? PAD_ROW_TRIGGERS : PAD_ROW_VIBRATION;
+        } else {
+            m_pad_sel += down ? 1 : -1;
+        }
+        up = down = false;
+    }
     if (m_pad_sel < PAD_ROWS_CONTROLS) {
         if (left || right) { // The other column, same height
             m_pad_sel = (m_pad_sel + 8) % 16;
@@ -6292,18 +7710,366 @@ void DashboardScene::DrawPadPage(float s, float a)
              selected ? Ink(a * blink) : (just ? Lime(a) : White(a * 0.9f)), src);
     }
 
+    // The Vibration button under the controller (patch 236), and Adaptive triggers beside it (patch 266)
+    const float vw = 380 * s, vgap = 30 * s;
+    const ImVec2 v0(size.x / 2 - vw - vgap / 2 + slide, 828 * s), v1(v0.x + vw, v0.y + bh);
+    const ImVec2 t0(size.x / 2 + vgap / 2 + slide, 828 * s), t1(t0.x + vw, t0.y + bh);
+    auto toggle = [&](ImVec2 p0, ImVec2 p1, bool selected, const char *name, bool value) {
+        Bar(dl, p0, p1, s, selected, a);
+        Text(dl, small, 30 * s, ImVec2(p0.x + 26 * s, p0.y + 12 * s), selected ? Ink(a) : Label(a), name);
+        const char *on = value ? "On" : "Off";
+        ImVec2 os = TextSize(small, 30 * s, on);
+        Text(dl, small, 30 * s, ImVec2(p1.x - os.x - 26 * s, p0.y + 12 * s),
+             selected ? Ink(a) : (value ? Lime(a) : White(a * 0.9f)), on);
+    };
+    toggle(v0, v1, m_pad_sel == PAD_ROW_VIBRATION, "Vibration", g_cfg.vibration);
+    toggle(t0, t1, m_pad_sel == PAD_ROW_TRIGGERS, "Adaptive triggers", g_cfg.triggers);
+
     // Focus, and what the selection does.
     bool right_col = m_pad_sel >= 8;
     float fx = right_col ? size.x - 140 * s - bw + slide : 140 * s + slide;
     ImVec2 f0(fx, y0 + (m_pad_sel % 8) * gap), f1(f0.x + bw, f0.y + bh);
+    if (m_pad_sel == PAD_ROW_VIBRATION) {
+        f0 = v0;
+        f1 = v1;
+    } else if (m_pad_sel == PAD_ROW_TRIGGERS) {
+        f0 = t0;
+        f1 = t1;
+    }
     Focus(dl, f0, f1, s, m_time, a);
     const char *help =
+        m_pad_sel == PAD_ROW_VIBRATION ? "The controller rumbles when a game shakes it. For every game; also in the quick menu." :
+        m_pad_sel == PAD_ROW_TRIGGERS ? "L2 and R2 push back in driving games and shooters. For every game; also in the quick menu." :
         m_pad_capture ? "Press the DualSense button you want for it (6 s)." :
             "X to change it, Triangle for the standard layout. Press "
             "buttons to see what a game gets.";
     ImVec2 hs = TextSize(small, 30 * s, help);
     Text(dl, small, 30 * s, ImVec2(size.x / 2 - hs.x / 2 + slide, 910 * s),
          Label(a), help);
+}
+
+//
+// A game's own button mapping (patch 269): game settings > Controller > Button mapping. The Xbox inputs in two
+// columns (Cross, then the DualSense button for it), the stick options and Reset / Back under them, a DualSense
+// beside. Saved in the game's settings file at once; the game gets it as "padmap=" from its next start.
+//
+
+// The rows: the Xbox inputs (left column, right column), then these.
+static const int kGmOrder[XB__COUNT] = { XB_A, XB_B, XB_X, XB_Y, XB_BLACK, XB_WHITE, XB_LT, XB_RT,
+                                         XB_UP, XB_DOWN, XB_LEFT, XB_RIGHT, XB_START, XB_BACK, XB_LSTICK, XB_RSTICK };
+enum { GM_SWAP = XB__COUNT, GM_INV_R, GM_INV_L, GM_RESET, GM_BACK, GM__COUNT };
+static const float kGmWait = 5;     // s: nothing pressed, nothing changes (so Circle can be given too)
+
+static void GmPlace(int i, int *col, int *line)
+{
+    if (i < XB__COUNT) {
+        *col = i / 8;
+        *line = i % 8;
+    } else if (i < GM_RESET) {
+        *col = i - GM_SWAP;
+        *line = 8;
+    } else {
+        *col = i - GM_RESET;
+        *line = 9;
+    }
+}
+
+static int GmCols(int line) { return line == 8 ? 3 : 2; }
+
+static int GmAt(int col, int line)
+{
+    col = std::clamp(col, 0, GmCols(line) - 1);
+    return line < 8 ? col * 8 + line : line == 8 ? GM_SWAP + col : GM_RESET + col;
+}
+
+// A PS button's glyph in the icon atlas, or -1 (drawn as its name).
+static int GmGlyph(int src)
+{
+    switch (src) {
+    case PS5_SRC_CROSS: return GLYPH_CROSS;
+    case PS5_SRC_CIRCLE: return GLYPH_CIRCLE;
+    case PS5_SRC_SQUARE: return GLYPH_SQUARE;
+    case PS5_SRC_TRIANGLE: return GLYPH_TRIANGLE;
+    case PS5_SRC_OPTIONS: return GLYPH_OPTIONS;
+    }
+    return -1;
+}
+
+void DashboardScene::GmOpen()
+{
+    if (m_gs_profile.padmap.empty() || !xemu_ps5_padmap_parse(m_gs_profile.padmap.c_str(), &m_gm_map)) {
+        xemu_ps5_padmap_global(&m_gm_map);     // Default: your layout
+    }
+    m_gm_open = true;
+    m_gm_capture = false;
+    m_gm_sel = 0;
+}
+
+// Into the game's settings file: nothing when it's your layout as it is (Default).
+void DashboardScene::GmSave()
+{
+    XbPadMap global;
+    xemu_ps5_padmap_global(&global);
+    if (xemu_ps5_padmap_same(&m_gm_map, &global)) {
+        m_gs_profile.padmap.clear();
+    } else {
+        char text[64];
+        xemu_ps5_padmap_format(&m_gm_map, text, sizeof(text));
+        m_gs_profile.padmap = text;
+    }
+    GameProfileSave(m_gs_key, m_gs_profile);
+    g_profiles[m_gs_key] = m_gs_profile;
+}
+
+void DashboardScene::GmInput(bool accept, bool left, bool right, bool up, bool down)
+{
+    int col, line;
+    GmPlace(m_gm_sel, &col, &line);
+    if (up || down) {
+        line = (line + (down ? 1 : 9)) % 10;
+        m_gm_sel = GmAt(col, line);
+        return;
+    }
+    if (left || right) {
+        const int n = GmCols(line);
+        m_gm_sel = GmAt((col + (right ? 1 : n - 1)) % n, line);
+        return;
+    }
+    if (!accept) {
+        return;
+    }
+    if (m_gm_sel < XB__COUNT) { // Wait for the DualSense button to use
+        m_gm_capture = true;
+        m_gm_capture_t = m_time;
+        m_gm_released = false;
+        UiSoundPlay(UI_SOUND_SELECT);
+    } else if (m_gm_sel < GM_RESET) {
+        static const int bits[3] = { PADMAP_SWAP_STICKS, PADMAP_INVERT_RY, PADMAP_INVERT_LY };
+        m_gm_map.flags ^= bits[m_gm_sel - GM_SWAP];
+        GmSave();
+        UiSoundPlay(UI_SOUND_CHANGE);
+    } else if (m_gm_sel == GM_RESET) {
+        xemu_ps5_padmap_global(&m_gm_map);
+        GmSave();
+        UiSoundPlay(UI_SOUND_SELECT);
+        xemu_queue_notification("Button mapping: back to default");
+    } else {
+        m_gm_open = false;
+    }
+}
+
+// While waiting for a button: the first one pressed (after letting go of the one that started it) is the new
+// one, Circle included; none in kGmWait seconds, nothing changes. The touchpad isn't one (the quick menu).
+void DashboardScene::GmCapture()
+{
+    const int pressed = xemu_ps5_pad_pressed_source();
+    if (!m_gm_released) {
+        m_gm_released = pressed < 0;
+    } else if (pressed >= 0) {
+        m_gm_map.src[kGmOrder[m_gm_sel]] = (int8_t)pressed;
+        GmSave();
+        m_gm_capture = false;
+        m_gm_done_t = m_time;
+        UiSoundPlay(UI_SOUND_CHANGE);
+        m_prev_buttons = g_input_mgr.CombinedButtons(); // Not a press here
+        m_back_hold = 0;
+    }
+    if (m_gm_capture && m_time - m_gm_capture_t > kGmWait) {
+        m_gm_capture = false;
+        UiSoundPlay(UI_SOUND_BACK);
+    }
+}
+
+void DashboardScene::DrawGameMapping(float s, float a)
+{
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImFont *small = g_font_mgr.m_menu_font_small;
+    const float slide = 200 * s * (1 - m_page_anim);
+    const ImU32 warn_col = Rgba(255, 190, 90, a);
+
+    // How many Xbox inputs each DualSense button has (two or more: shown).
+    int uses[PS5_SRC__COUNT] = {};
+    for (int x = 0; x < XB__COUNT; x++) {
+        const int src = m_gm_map.src[x];
+        if (src >= 0 && src < PS5_SRC__COUNT) {
+            uses[src]++;
+        }
+    }
+
+    // The rows.
+    const float x0 = 120 * s + slide, span = 1160 * s, bh = 54 * s, gap = 64 * s, y0 = 220 * s;
+    auto box = [&](int i, ImVec2 *p0, ImVec2 *p1) {
+        int col, line;
+        GmPlace(i, &col, &line);
+        const int n = line < 8 ? 2 : GmCols(line);
+        const float cg = 40 * s, w = (span - cg * (n - 1)) / n;
+        const float y = y0 + line * gap + (line >= 8 ? 20 * s : 0);
+        *p0 = ImVec2(x0 + col * (w + cg), y);
+        *p1 = ImVec2(p0->x + w, y + bh);
+    };
+    const float ts = 30 * s;
+    for (int i = 0; i < GM__COUNT; i++) {
+        ImVec2 p0, p1;
+        box(i, &p0, &p1);
+        const bool selected = i == m_gm_sel;
+        Bar(dl, p0, p1, s, selected, a);
+        const float ty = p0.y + (bh - ts) / 2 - 2 * s;
+        const char *name = i < XB__COUNT ? xemu_ps5_xbox_name(kGmOrder[i]) :
+                           i == GM_SWAP ? "Swap sticks" :
+                           i == GM_INV_R ? "Invert right stick up/down" :
+                           i == GM_INV_L ? "Invert left stick up/down" :
+                           i == GM_RESET ? "Reset to default" : "Back";
+        Text(dl, small, ts, ImVec2(p0.x + 26 * s, ty), selected ? Ink(a) : Label(a), name);
+        if (i < XB__COUNT) {
+            const int src = m_gm_map.src[kGmOrder[i]];
+            const bool waiting = selected && m_gm_capture;
+            const bool just = selected && m_time - m_gm_done_t < 0.6f;
+            char value[64];
+            if (waiting) {
+                snprintf(value, sizeof(value), "Press a button... %d",
+                         std::max(1, (int)ceilf(kGmWait - (m_time - m_gm_capture_t))));
+            } else if (uses[src] > 1) {
+                snprintf(value, sizeof(value), "%s  x%d", xemu_ps5_source_name(src), uses[src]);
+            } else {
+                snprintf(value, sizeof(value), "%s", xemu_ps5_source_name(src));
+            }
+            const ImVec2 vs = TextSize(small, ts, value);
+            const float vx = p1.x - vs.x - 26 * s;
+            const float blink = waiting ? 0.55f + 0.45f * sinf(m_time * 8) : 1;
+            Text(dl, small, ts, ImVec2(vx, ty),
+                 selected ? Ink(a * blink) : just ? Lime(a) : uses[src] > 1 ? warn_col : White(a * 0.9f), value);
+            const int glyph = waiting ? -1 : GmGlyph(src);
+            if (glyph >= 0) {
+                DrawGlyph(dl, ImVec2(vx - 22 * s, p0.y + bh / 2), 14 * s, (Glyph)glyph, a);
+            }
+        } else if (i < GM_RESET) {
+            static const int bits[3] = { PADMAP_SWAP_STICKS, PADMAP_INVERT_RY, PADMAP_INVERT_LY };
+            const bool on = (m_gm_map.flags & bits[i - GM_SWAP]) != 0;
+            const char *v = on ? "On" : "Off";
+            const ImVec2 vs = TextSize(small, ts, v);
+            Text(dl, small, ts, ImVec2(p1.x - vs.x - 26 * s, ty), selected ? Ink(a) : on ? Lime(a) : White(a * 0.9f), v);
+        }
+    }
+    {
+        ImVec2 f0, f1;
+        box(m_gm_sel, &f0, &f1);
+        Focus(dl, f0, f1, s, m_time, a);
+    }
+
+    // The DualSense, its buttons with their names; the selected input's button lit.
+    const ImVec2 c(1600 * s + slide, 470 * s);
+    auto at = [&](float x, float y) { return ImVec2(c.x + x * s, c.y + y * s); };
+    for (int pass = 0; pass < 2; pass++) {
+        const float g = pass ? 0 : 4;
+        const ImU32 col = pass ? Rgba(22, 30, 22, a) : Lime(a * 0.75f);
+        for (int side = -1; side <= 1; side += 2) {
+            dl->AddRectFilled(at(side * 150 - 50 - g, -150 - g), at(side * 150 + 50 + g, -100 + g), col, 14 * s);
+            dl->AddEllipseFilled(at(side * 165, 95), ImVec2((78 + g) * s, (125 + g) * s), col, side * -0.35f, 48);
+        }
+        dl->AddRectFilled(at(-230 - g, -118 - g), at(230 + g, 78 + g), col, (64 + g) * s);
+    }
+    dl->AddRectFilledMultiColor(at(-190, -112), at(190, -70), White(a * 0.06f), White(a * 0.06f), White(0), White(0));
+    dl->AddRectFilled(at(-72, -112), at(72, -40), Rgba(40, 48, 40, a), 10 * s);     // the touchpad
+    dl->AddRect(at(-72, -112), at(72, -40), Line(a * 0.8f), 10 * s, 0, 1.5f * s);
+    {
+        const char *tp = "Quick menu";
+        const ImVec2 ss = TextSize(small, 18 * s, tp);
+        Text(dl, small, 18 * s, ImVec2(c.x - ss.x / 2, c.y - 84 * s), Label(a * 0.7f), tp);
+    }
+    const int lit = m_gm_sel < XB__COUNT ? m_gm_map.src[kGmOrder[m_gm_sel]] : -1;
+    struct Spot { int src; float x, y; const char *label; };
+    static const Spot spots[] = {
+        { PS5_SRC_TRIANGLE, 155, -40, nullptr }, { PS5_SRC_CIRCLE, 195, 0, nullptr },
+        { PS5_SRC_CROSS, 155, 40, nullptr },     { PS5_SRC_SQUARE, 115, 0, nullptr },
+        { PS5_SRC_UP, -155, -40, nullptr },      { PS5_SRC_DOWN, -155, 36, nullptr },
+        { PS5_SRC_LEFT, -193, -2, nullptr },     { PS5_SRC_RIGHT, -117, -2, nullptr },
+        { PS5_SRC_L3, -78, 50, "L3" },           { PS5_SRC_R3, 78, 50, "R3" },
+        { PS5_SRC_CREATE, -108, -96, "Create" }, { PS5_SRC_OPTIONS, 108, -96, nullptr },
+        { PS5_SRC_L1, -150, -125, "L1" },        { PS5_SRC_R1, 150, -125, "R1" },
+        { PS5_SRC_L2, -150, -180, "L2" },        { PS5_SRC_R2, 150, -180, "R2" },
+    };
+    for (const Spot &sp : spots) {
+        const ImVec2 p = at(sp.x, sp.y);
+        const bool on = sp.src == lit;
+        const bool dpad = sp.src >= PS5_SRC_UP && sp.src <= PS5_SRC_RIGHT;
+        const bool shoulder = sp.src == PS5_SRC_L1 || sp.src == PS5_SRC_R1 || sp.src == PS5_SRC_L2 || sp.src == PS5_SRC_R2;
+        if (on) {
+            dl->AddCircleFilled(p, 30 * s, Lime(a * 0.35f), 24);
+        }
+        const ImU32 fill = on ? Lime(a) : Rgba(48, 56, 48, a);
+        if (shoulder) {
+            dl->AddRectFilled(ImVec2(p.x - 40 * s, p.y - 17 * s), ImVec2(p.x + 40 * s, p.y + 17 * s), fill, 8 * s);
+        } else if (dpad) {
+            dl->AddRectFilled(ImVec2(p.x - 15 * s, p.y - 15 * s), ImVec2(p.x + 15 * s, p.y + 15 * s), fill, 4 * s);
+            // its arrow
+            const float d = 7 * s;
+            ImVec2 t0, t1, t2;
+            switch (sp.src) {
+            case PS5_SRC_UP: t0 = ImVec2(p.x, p.y - d); t1 = ImVec2(p.x + d, p.y + d * 0.6f); t2 = ImVec2(p.x - d, p.y + d * 0.6f); break;
+            case PS5_SRC_DOWN: t0 = ImVec2(p.x, p.y + d); t1 = ImVec2(p.x - d, p.y - d * 0.6f); t2 = ImVec2(p.x + d, p.y - d * 0.6f); break;
+            case PS5_SRC_LEFT: t0 = ImVec2(p.x - d, p.y); t1 = ImVec2(p.x + d * 0.6f, p.y - d); t2 = ImVec2(p.x + d * 0.6f, p.y + d); break;
+            default: t0 = ImVec2(p.x + d, p.y); t1 = ImVec2(p.x - d * 0.6f, p.y + d); t2 = ImVec2(p.x - d * 0.6f, p.y - d); break;
+            }
+            dl->AddTriangleFilled(t0, t1, t2, on ? Ink(a) : White(a * 0.8f));
+        } else if (sp.src == PS5_SRC_L3 || sp.src == PS5_SRC_R3) {
+            dl->AddCircleFilled(p, 34 * s, Rgba(10, 14, 10, a), 32);
+            dl->AddCircleFilled(p, 24 * s, fill, 32);
+            dl->AddCircle(p, 24 * s, Line(a), 32, 2 * s);
+        } else if (sp.src == PS5_SRC_CREATE || sp.src == PS5_SRC_OPTIONS) {
+            dl->AddRectFilled(ImVec2(p.x - 8 * s, p.y - 14 * s), ImVec2(p.x + 8 * s, p.y + 14 * s), fill, 6 * s);
+        } else {
+            dl->AddCircleFilled(p, 19 * s, on ? Lime(a) : Rgba(10, 14, 10, a), 24);
+            dl->AddCircle(p, 19 * s, Line(a * 0.8f), 24, 1.5f * s);
+        }
+        const int glyph = GmGlyph(sp.src);
+        if (glyph >= 0 && sp.src != PS5_SRC_OPTIONS) {
+            DrawGlyph(dl, p, 13 * s, (Glyph)glyph, a);
+        }
+        // the name: inside the shoulder buttons and sticks, beside Create and Options
+        if (sp.label && (shoulder || sp.src == PS5_SRC_L3 || sp.src == PS5_SRC_R3)) {
+            const ImVec2 ls = TextSize(small, 22 * s, sp.label);
+            Text(dl, small, 22 * s, ImVec2(p.x - ls.x / 2, p.y - ls.y / 2), on ? Ink(a) : White(a * 0.9f), sp.label);
+        } else if (sp.src == PS5_SRC_CREATE || sp.src == PS5_SRC_OPTIONS) {
+            const char *l = sp.src == PS5_SRC_CREATE ? "Create" : "Options";
+            const ImVec2 ls = TextSize(small, 18 * s, l);
+            Text(dl, small, 18 * s, ImVec2(p.x - ls.x / 2, p.y + 17 * s), on ? Lime(a) : Label(a * 0.8f), l);
+        }
+    }
+    // Under it: what the selected input gets.
+    {
+        std::string line = m_gm_sel < XB__COUNT ?
+            std::string(xemu_ps5_xbox_name(kGmOrder[m_gm_sel])) + ":  " + xemu_ps5_source_name(lit) :
+            std::string("This game only");
+        const ImVec2 ls = TextSize(small, 30 * s, line.c_str());
+        Text(dl, small, 30 * s, ImVec2(c.x - ls.x / 2, c.y + 250 * s), Lime(a), line.c_str());
+    }
+
+    // What the selection does.
+    std::string help;
+    if (m_gm_capture) {
+        help = std::string("Press the DualSense button for ") + xemu_ps5_xbox_name(kGmOrder[m_gm_sel]) +
+               ". Any button, Circle too. Nothing in 5 s: no change.";
+    } else if (m_gm_sel < XB__COUNT && lit >= 0 && uses[lit] > 1) {
+        help = std::string(xemu_ps5_source_name(lit)) + " is also on:";
+        for (int k = 0; k < XB__COUNT; k++) {
+            if (k != m_gm_sel && m_gm_map.src[kGmOrder[k]] == lit) {
+                help += std::string(" ") + xemu_ps5_xbox_name(kGmOrder[k]) + ",";
+            }
+        }
+        help.back() = '.';
+        help += " One button can press both.";
+    } else if (m_gm_sel < XB__COUNT) {
+        help = "X, then press the button you want for it. The touchpad stays the quick menu.";
+    } else if (m_gm_sel == GM_SWAP) {
+        help = "The left stick moves the Xbox's right stick, and the right stick its left one.";
+    } else if (m_gm_sel == GM_INV_R || m_gm_sel == GM_INV_L) {
+        help = "Up and down turned around on the Xbox's stick (after Swap sticks).";
+    } else if (m_gm_sel == GM_RESET) {
+        help = "Back to Default: your layout from Settings > Controller, sticks as they are.";
+    } else {
+        help = "Saved for this game. Used from its next start.";
+    }
+    TextFit(dl, small, 30 * s, ImVec2(x0 + 10 * s, 900 * s), m_gm_capture ? Lime(a) : Label(a), help, span + 600 * s);
 }
 
 
@@ -6333,6 +8099,7 @@ void DashboardScene::DrawSettings(float s, float a)
     values[SR_WIDE_PATCHES] = on_off(g_cfg.autopatch_widescreen);
     values[SR_FPS_PATCHES] = on_off(g_cfg.autopatch_60fps);
     values[SR_LANGUAGE] = kLanguages[LanguageIndex()].name;
+    values[SR_VIBRATION] = on_off(g_cfg.vibration);
     bool scale_locked = false; // Applies at the next start instead
     const struct {
         const char *name, *help;
@@ -6341,8 +8108,12 @@ void DashboardScene::DrawSettings(float s, float a)
         { "Screen shape",
           "Auto follows the game, and goes 16:9 when a widescreen patch is on." },
         { "Picture fit", "Stretch fills the whole screen." },
-        { "Upscaling", "How a picture smaller than the screen is enlarged. Sharp uses SGSR; Smooth is plain bilinear." },
-        { "hakuX Anti-aliasing", "Smooths jagged edges. FXAA is light, SMAA is sharper, SSAA draws at x6 and averages it down (the heaviest)." },
+        { "Upscaling", "How the picture is enlarged to the screen. Sharp uses SGSR; AMD CAS sharpens, best with anti-aliasing on." },
+        { "Ambient occlusion", "Soft shadows in corners, creases and where things touch the ground. Low or High; a game can have its own in its settings." },   // patch 375 (was the AMD CAS sharpness row)
+        { "Anti-aliasing", "Smooths jagged edges. FXAA is light, SMAA is sharper, SSAA draws at x6 and averages it down; SSAA + SMAA smooths that once more (the smoothest, and the heaviest)." },
+        { "Anisotropic filtering", "Sharper textures on floors, roads and walls seen at an angle. Higher is sharper; 16x costs a little more GPU." },
+        { "Texture sharpness", "Sharper textures by picking more detailed mipmaps. Works with anisotropic filtering and CAS. High can shimmer in some games." },
+        { "CRT filter", "An old TV's look over the picture. Scanlines draws dark lines between the game's own 480 lines; CRT adds a slight curve, darker corners and a light shadow mask." },
         { "Side art",
           "Panels after the Xbox 360's Blades dashboard beside 4:3 games, "
           "instead of black bars: green or orange." },
@@ -6365,8 +8136,9 @@ void DashboardScene::DrawSettings(float s, float a)
           "Runs games that have a 60 FPS patch at 60 by themselves. A few of these patches can make a game run "
           "too fast: turn this off if one does." },
         { "Game language",
-          "The language games use when they have it (an Xbox setting). "
-          "From the next game started." },
+          "Auto: your PS5's language when the game has it, else English. Or one language for every game "
+          "(an Xbox setting). From the next game started." },
+        { "Vibration", "The controller rumbles when the game shakes it. For every game; also in the quick menu." },
     };
 
     float x = 280 * s + slide, w = 1400 * s;
@@ -6389,7 +8161,7 @@ void DashboardScene::DrawSettings(float s, float a)
             if (i == CAT_ADVANCED) {
                 summary = "Video output, PAL 60, notifications";
             } else if (i == CAT_CONTROLLER) {
-                summary = "Your button layout";
+                summary = std::string("Your button layout   Vibration ") + (g_cfg.vibration ? "On" : "Off") + "   Triggers " + (g_cfg.triggers ? "On" : "Off");
             }
             ImVec2 ss = TextSize(small, 30 * s, summary.c_str());
             Text(dl, small, 30 * s, ImVec2(x + w - ss.x - 60 * s, y + 27 * s),
@@ -6407,11 +8179,16 @@ void DashboardScene::DrawSettings(float s, float a)
     float h = 70 * s, gap = 84 * s, y0 = 236 * s;
     int at = 0;
     for (int i = 0; i < cat.count; i++) {
-        int row = cat.rows[i];
-        if (row == m_setting) {
+        if (cat.rows[i] == m_setting) {
             at = i;
         }
-        float y = y0 + i * gap;
+    }
+    // patch 247: at most 8 shown, a window around the chosen one
+    const int visible = std::min(cat.count, 8);
+    const int top = std::clamp(at - visible / 2, 0, std::max(0, cat.count - visible));
+    for (int i = top; i < top + visible; i++) {
+        int row = cat.rows[i];
+        float y = y0 + (i - top) * gap;
         bool selected = row == m_setting;
         bool locked = row == SR_SCALE && scale_locked;
         float ra = locked ? a * 0.55f : a;
@@ -6428,8 +8205,14 @@ void DashboardScene::DrawSettings(float s, float a)
                  selected ? Ink(a) : White(ra * 0.9f), text);
         }
     }
-    Focus(dl, ImVec2(x, y0 + at * gap), ImVec2(x + w, y0 + at * gap + h), s,
+    Focus(dl, ImVec2(x, y0 + (at - top) * gap), ImVec2(x + w, y0 + (at - top) * gap + h), s,
           m_time, a);
+    if (top > 0) {
+        Text(dl, small, 30 * s, ImVec2(x + w + 20 * s, y0 + 10 * s), Lime(a), "^");
+    }
+    if (top + visible < cat.count) {
+        Text(dl, small, 30 * s, ImVec2(x + w + 20 * s, y0 + (visible - 1) * gap + 20 * s), Lime(a), "v");
+    }
 
     // The selection's explanation, under the list.
     const char *help = rows[m_setting].help;
@@ -6437,7 +8220,7 @@ void DashboardScene::DrawSettings(float s, float a)
         help = "Locked while a game runs. Change it before starting one "
                "(or after the Xbox Dashboard button).";
     }
-    TextFit(dl, small, 32 * s, ImVec2(x + 10 * s, y0 + cat.count * gap + 14 * s),
+    TextFit(dl, small, 32 * s, ImVec2(x + 10 * s, y0 + visible * gap + 14 * s),
             Label(a), help, w);
 }
 
@@ -6456,6 +8239,9 @@ void DashboardScene::DrawAdvanced(float s, float a)
           "HDTV lets games use 480p." },
         { "Notifications", on_off(g_cfg.notifications),
           "The small messages at the top of the screen." },
+        { "Fast-forward", on_off(g_cfg.fastforward),
+          "Shows a Fast-forward switch in the quick menu's Settings group: the game runs at double speed while it is "
+          "On. Xbox games only." },
     };
 
     float x = 280 * s + slide, w = 1400 * s, h = 62 * s, gap = 74 * s;
@@ -6519,7 +8305,7 @@ void DashboardScene::DrawSystem(float s, float a)
     };
     char games[96], version[64];
     snprintf(games, sizeof(games), "%d", (int)m_games.size());
-    snprintf(version, sizeof(version), "Alpha 3.0");
+    snprintf(version, sizeof(version), "%s", XOG_VERSION_TEXT);
     const struct { const char *name, *value; } info[] = {
         { "Games", games },
         { "Saves and hard disk", "/data/xpsemu/hdd" },
@@ -6552,12 +8338,36 @@ void DashboardScene::DrawSystem(float s, float a)
 #if XPSEMU_DEV
     float ay2 = ay + h + 30 * s;
     DrawDev(s, a, x, y, ay2);
+    const int update_row = 4;
+    float uy = ay2 + h + 30 * s;
     float fy = m_system_row >= 2 ? ay2 : ay;
     float fx = x + (m_system_row & 1) * gap;
 #else
+    const int update_row = 2;
+    float uy = ay + h + 30 * s;
     float fy = ay;
     float fx = x + m_system_row * gap;
 #endif
+    // Check for updates: as wide as the two above, what it found under it (patch 230)
+    {
+        const float uw = gap + w;
+        const bool selected = m_system_row == update_row;
+        bool busy = false;
+        const std::string news = UpdaterStatus(&busy);
+        const char *label = "Check for updates";
+        Bar(dl, ImVec2(x, uy), ImVec2(x + uw, uy + h), s, selected, a);
+        ImVec2 ts = TextSize(font, 40 * s, label);
+        Text(dl, font, 40 * s, ImVec2(x + (uw - ts.x) / 2, uy + 20 * s),
+             selected ? Ink(a) : Label(a), label);
+        if (!news.empty()) {
+            Text(dl, small, 32 * s, ImVec2(x + 10 * s, uy + h + 16 * s),
+                 busy ? Lime(a) : Label(a * 0.9f), news.c_str());
+        }
+        if (selected) {
+            Focus(dl, ImVec2(x, uy), ImVec2(x + uw, uy + h), s, m_time, a);
+            return;
+        }
+    }
     Focus(dl, ImVec2(fx, fy), ImVec2(fx + w, fy + h), s, m_time, a);
 }
 
@@ -6599,7 +8409,12 @@ void DashboardScene::DrawHints(float s)
             hints.push_back({ GLYPH_CIRCLE, "Back to the game" });
         }
     } else {
-        if (m_kb_open) {
+        if (m_gs_open && m_gm_open) {   // patch 269
+            if (!m_gm_capture) {
+                hints.push_back({ GLYPH_CROSS, m_gm_sel < XB__COUNT ? "Change" : m_gm_sel < XB__COUNT + 3 ? "Turn on/off" :
+                                               m_gm_sel == XB__COUNT + 3 ? "Reset" : "Back" });
+            }
+        } else if (m_kb_open) {
             hints.push_back({ GLYPH_CROSS, "Type" });
             hints.push_back({ GLYPH_SQUARE, "Delete" });
             hints.push_back({ GLYPH_TRIANGLE, "Space" });
@@ -6617,6 +8432,7 @@ void DashboardScene::DrawHints(float s)
                               m_gs_row == GS_RESET ? "Reset" :
                               m_gs_row == GS_PATCHES ? "Open" :
                               m_gs_row == GS_NAME ? "Rename" :
+                              m_gs_row == GS_PADMAP ? "Open" :
                               m_gs_row == GS_SHORTCUT ?
                                   (m_gs_shortcut.empty() ? "Create" : "Remove") :
                                                        "Change" });
@@ -7153,9 +8969,17 @@ void DashboardScene::BrowserOpen(const std::string &dir, const std::string &sele
             } else if (name[0] != '.') {
                 dirs.push_back({ name, entry.path().string(), false });
             }
-        } else if (ext == ".iso" || ext == ".xiso" ||
-                   (ext == ".cci" && !rx_cci_is_later_part(entry.path().string().c_str()))) {
+        } else if (!rx_cci_is_later_part(entry.path().string().c_str()) &&
+                   (ext == ".iso" || ext == ".xiso" || ext == ".chd" || ext == ".cci" || ext == ".cso")) {
             games.push_back({ name, entry.path().string(), true });
+        } else if (ext == ".gdi" || ext == ".cue" ||
+                   (ext == ".bin" && name.find("(Track ") == std::string::npos &&
+                    entry.file_size(ec2) >= (64ull << 20))) {
+            // patch 239: Sega Chihiro: GD-ROM sheets, and netboot images (.bin, 64 MB and up: not a track or
+            // a small file); a .chd is told apart when played
+            BrowserRow r{ name, entry.path().string(), true };
+            r.chihiro = true;
+            games.push_back(r);
         } else if (!strcasecmp(name.c_str(), "default.xbe")) {
             games.push_back({ name, dir, true });   // this folder is the game
         }
@@ -7185,6 +9009,44 @@ bool DashboardScene::BrowserBack()
         BrowserOpen(std::filesystem::path(was).parent_path().string(), was);
     }
     UiSoundPlay(UI_SOUND_BACK);
+    return true;
+}
+
+// patch 239: a Sega Chihiro game from the Browser: kept in the Chihiro list (/data/xpsemu/chihiro/library.txt) and
+// started from its page, as if chosen there. must: say why when it isn't one (else false: an Xbox CHD, say)
+bool DashboardScene::BrowserPlayChihiro(const std::string &path, bool must)
+{
+    RxChihiroInfo info;
+    const bool ok = rx_chihiro_info(path.c_str(), &info);
+    if (!ok && !strstr(info.why, "locked")) {
+        if (must) {
+            UiSoundPlay(UI_SOUND_ERROR);
+            xemu_queue_notification((std::string("Not a Chihiro game XPSemu can read: ") + info.why).c_str());
+        }
+        return false;
+    }
+    bool known = false;
+    for (const auto &g : m_chihiro) {
+        known = known || g.path == path;
+    }
+    if (!known) {
+        std::error_code ec;
+        std::filesystem::create_directories("/data/xpsemu/chihiro", ec);
+        std::ofstream("/data/xpsemu/chihiro/library.txt", std::ios::app) << path << "\n";
+    }
+    ScanChihiro();
+    for (size_t i = 0; i < m_chihiro.size(); i++) {
+        if (m_chihiro[i].path == path) {
+            m_chihiro_sel = (int)i;
+            m_page = PAGE_CHIHIRO;
+            m_in_page = true;
+            m_page_anim = 0;
+            ChihiroInput(true, false, false, false, false, false);
+            return true;
+        }
+    }
+    UiSoundPlay(UI_SOUND_ERROR);
+    xemu_queue_notification("That isn't a Chihiro game XPSemu can read");
     return true;
 }
 
@@ -7223,7 +9085,13 @@ void DashboardScene::BrowserInput(bool accept, bool up, bool down, bool l1, bool
     if (r1) m_br_sel = std::min(m_br_sel + 8, n - 1);
     if (accept) {
         const BrowserRow row = m_br_rows[m_br_sel];
-        if (row.game) {
+        std::string ext = std::filesystem::path(row.path).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (row.game && row.chihiro) {
+            BrowserPlayChihiro(row.path, true);
+        } else if (row.game && ext == ".chd" && BrowserPlayChihiro(row.path, false)) {
+            // a Chihiro GD-ROM CHD (patch 239)
+        } else if (row.game) {
             BrowserPlay(row.path);
         } else {
             BrowserOpen(row.path);
@@ -7287,7 +9155,7 @@ void DashboardScene::DrawBrowser(float s, float a)
                          row.path.rfind("/mnt/usb", 0) == 0 ? ICON_USB : ICON_DRIVE;
         Icon(dl, icon, ImVec2(x + 62 * s, y + h / 2), 44 * s, selected ? Ink(a) : Lime(a));
         Text(dl, font, 38 * s, ImVec2(x + 104 * s, y + 10 * s), selected ? Ink(a) : (row.game ? White(a) : Label(a)), name.c_str());
-        const char *kind = row.game ? "Game" : ">";
+        const char *kind = row.game ? (row.chihiro ? "Chihiro" : "Game") : ">";
         const ImVec2 ks = TextSize(font, 38 * s, kind);
         Text(dl, font, 38 * s, ImVec2(x + w - ks.x - 40 * s, y + 10 * s), selected ? Ink(a) : Lime(a), kind);
     }

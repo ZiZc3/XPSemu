@@ -70,7 +70,34 @@ typedef struct HleVkSurf {
     /* asynchronous pipeline builds (vk/draw.c target_note): the last swap a
      * draw targeted it and the one before (swap count + 1, 0: never) */
     uint64_t drawn_cur, drawn_prev;
+    /* patch 325: MSAA (hle_vk_set_msaa). A multisampled copy of the image
+     * the passes render into, resolved into img at each pass's end; img
+     * stays what everything else samples, copies and reads back. ms_ok: the
+     * copy holds what img does (no write to img since the last pass that
+     * rendered the copy, hle_surf_transition), so a pass can load it. */
+    uint32_t ms_samples;        /* the copy's samples, 0 = none made yet */
+    bool ms_failed;             /* none can be made for it: its passes stay 1x */
+    bool ms_ok;
+    VkImage ms_img;
+    VkDeviceMemory ms_mem;
+    VkImageView ms_view;
+    VkImageLayout ms_layout;
 } HleVkSurf;
+
+/* patch 325: MSAA. The samples asked for (1 off, 2, 4, 8; the "msaa=" start
+ * line, before the device is made), and the open pass's (1 when it renders
+ * the single-sample images): the draws' pipelines are made for it. */
+extern uint32_t g_hle_msaa;
+extern uint32_t g_hle_pass_samples;
+/* s's multisampled copy for a pass: made on first use; 0 when s can't have
+ * one (its format, size or kind, or the device), else its samples. */
+uint32_t hle_surf_ms_prepare(HleVkSurf *s);
+/* Before a pass renders s's copy: its layout, and the last pass's writes
+ * before this one's loads. */
+void hle_surf_ms_begin(VkCommandBuffer cb, HleVkSurf *s);
+/* patch 326: a count the quick menu asked for (hle_vk_msaa_request), made
+ * the one in use: render thread, no pass open (back.c open_pass). */
+void hle_surf_ms_apply(void);
 
 /* A pass or copy may write s: its wgen changes (zread.c converts again). */
 void hle_surf_written(HleVkSurf *s);
@@ -95,10 +122,44 @@ void hle_surf_rec_end(void);
 void hle_img_barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect,
                      VkImageLayout from, VkImageLayout to);
 void hle_surf_transition(VkCommandBuffer cb, HleVkSurf *s, VkImageLayout to);
-/* gamma.c: the swap's copy through the gamma ramp of src's top left sw x sh
- * pixels; false = not done (blit) */
+/* gamma.c: the swap's copy through the gamma ramp of src's pixels sx..sw x
+ * sy..sh (sx, sy 0: its top left sw x sh); false = not done (blit) */
 bool hle_gamma_pass(VkCommandBuffer cb, unsigned slot, const uint8_t ramp[3][256],
-                    HleVkSurf *src, uint32_t sw, uint32_t sh, VkImage dst, uint32_t dw, uint32_t dh);
+                    HleVkSurf *src, uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
+                    VkImage dst, uint32_t dw, uint32_t dh);
+/* gamma.c, patch 337: the video overlay drawn over display image dst (dw x
+ * dh, SHADER_READ_ONLY, left so) where the frame's pixel is the colour key
+ * (0x00RRGGBB): the frame src's pixels sx..sw x sy..sh fill dst (as the
+ * swap's copy); the overlay (ovl: ow x oh, SHADER_READ_ONLY) its src rect
+ * s[4] at d[4] (dst pixels). False = not done (the caller blits it). */
+bool hle_ovlkey_pass(VkCommandBuffer cb, unsigned slot, HleVkSurf *src, uint32_t sx, uint32_t sy,
+                     uint32_t sw, uint32_t sh, VkImageView ovl, uint32_t ow, uint32_t oh,
+                     const int32_t s[4], const int32_t d[4], uint32_t key, VkImage dst,
+                     uint32_t dw, uint32_t dh);
+/* patch 355: the movie upscaler (gamma.c). A set sampling src (an identity
+ * view, SHADER_READ_ONLY) for hle_movieup_pass, VK_NULL_HANDLE when there is
+ * none (the movie is drawn as before); freed once the GPU is done with it.
+ * The pass fills dst (dw x dh, R8G8B8A8, its whole contents new) with src
+ * enlarged (Catmull-Rom, deringed), left in layout to. Outside a pass. */
+VkDescriptorSet hle_movieup_set_new(VkImageView src);
+void hle_movieup_set_free(VkDescriptorSet set);
+void hle_movieup_pass(VkCommandBuffer cb, VkDescriptorSet set, VkImage dst, VkImageView dst_view,
+                      uint32_t dw, uint32_t dh, VkImageLayout to);
+/* draw.c: the "Movie upscaler" setting (movieup= start line), XOG_FIX nomovieup */
+bool hle_movieup_on(void);
+/* patch 363: ambient occlusion (gamma.c). The setting (ssao= start line, the
+ * quick menu at once): 0 off, 1 low, 2 high; hle_ssao_level: 0 as well with
+ * XOG_FIX nossao. The pass darkens display image dst (dw x dh,
+ * SHADER_READ_ONLY, left so) by depth buffer ds (left DEPTH_STENCIL_READ_ONLY):
+ * map takes a display pixel to ds's uv (x, y scale, x, y offset); gw x gh: the
+ * picture's guest size (the radius's unit). Outside a pass. False = not done.
+ * hle_ssao_regrow: its working images must grow for a ds of that size (made
+ * again in the pass): the caller waits for the GPU first. */
+extern volatile int g_hle_ssao;
+int hle_ssao_level(void);
+bool hle_ssao_regrow(uint32_t dw, uint32_t dh);
+bool hle_ssao_pass(VkCommandBuffer cb, unsigned slot, int level, HleVkSurf *ds, uint32_t gw,
+                   uint32_t gh, const float map[4], VkImage dst, uint32_t dw, uint32_t dh);
 /* zread.c: depth-stencil surface src into colour surface dst as its 32-bit
  * words (HleCmdZRead), outside a pass; slot: the frame's command buffer.
  * NULL = done, else why not. */

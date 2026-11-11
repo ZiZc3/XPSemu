@@ -57,9 +57,9 @@ void hle_psh_key(const uint32_t *rs, HlePshKey *k)
     k->final_efg = rs[HLE_PS_FINAL_EFG];
     k->count = rs[HLE_PS_COUNT] & 0x111FF;
     k->tex_modes = rs[HLE_PS_TEXMODES] & 0xFFFFF;
-    k->dot_map = rs[HLE_PS_DOTMAP] & 0xFFF;
+    k->dot_map = (uint16_t)(rs[HLE_PS_DOTMAP] & 0xFFF);
     k->input_tex = rs[HLE_PS_INPUTTEX] & 0x310000;
-    k->compare = rs[HLE_PS_COMPARE] & 0xFFFF;
+    k->compare = (uint16_t)(rs[HLE_PS_COMPARE] & 0xFFFF);
 }
 
 /* Register as a vec4 expression; final = the final combiner. */
@@ -230,10 +230,14 @@ static const char *k_cmp[8] = {
 
 /* Shadow buffer at stage s: the stored depth compared with the r coordinate
  * (depth FUNC r, both in the format's range; PROJECT2D compares with 0),
- * the four results bilinearly weighted (percentage-closer filtering). */
+ * the four results bilinearly weighted (percentage-closer filtering).
+ * Patch 335: the stored depth is scaled to 0..1 but for an uploaded F24
+ * texture's (format 0, which nothing else uses), its float as it is: F24
+ * reaches far past F16's 511.9375. */
 static void shadow_sample(Buf *b, const HlePshKey *k, unsigned s, bool project3d)
 {
-    static const char *const k_max[4] = { "1.0", "16777215.0", "65535.0", "511.9375" };
+    static const char *const k_max[4] = { "3.402823466e38", "16777215.0", "65535.0", "511.9375" };
+    static const char *const k_scale[4] = { "1.0", "16777215.0", "65535.0", "511.9375" };
     static const char *const k_op[8] = { "", "lessThan", "equal", "lessThanEqual", "greaterThan",
                                          "notEqual", "greaterThanEqual", "" };
     unsigned func = (k->shadow >> 4) & 7, fmt = (k->shadow_fmt >> (2 * s)) & 3;
@@ -241,7 +245,10 @@ static void shadow_sample(Buf *b, const HlePshKey *k, unsigned s, bool project3d
         put(b, "  vec4 t%u = vec4(%s);\n", s, func ? "1.0" : "0.0");
         return;
     }
-    const char *r = project3d ? "clamp(pq.z, 0.0, m)" : "0.0";
+    /* F24 (patch 335) compares at its precision: r's mantissa cut to 16 bits,
+     * as the depth stored */
+    const char *r = !project3d ? "0.0" : fmt ? "clamp(pq.z, 0.0, m)" :
+                    "uintBitsToFloat(floatBitsToUint(clamp(pq.z, 0.0, m)) & 0xFFFFFF80u)";
     put(b, "  vec4 t%u;\n  { uint ti = pc.tex[%u] & 0xFFFFu, si = pc.tex[%u] >> 16;\n"
            "    vec3 pq = nvproj(vTex%u);\n"
            "    vec2 uv = pq.xy;\n"
@@ -251,15 +258,60 @@ static void shadow_sample(Buf *b, const HlePshKey *k, unsigned s, bool project3d
            "      uv /= sz / ((pc.flags & (256u << %uu)) != 0u ? float(pc.flags >> 24) : 1.0);\n"
            "    float m = %s, r = %s;\n"
            "    vec4 d = textureGather(sampler2D(uTex2D[nonuniformEXT(ti)], "
-           "uSmp[nonuniformEXT(si)]), uv) * m;\n"
+           "uSmp[nonuniformEXT(si)]), uv) * %s;\n"
            "    vec4 p = vec4(%s(d, vec4(r)));\n"
            "    vec2 f = fract(uv * sz - 0.5);\n"
            "    t%u = vec4(mix(mix(p.w, p.z, f.x), mix(p.x, p.y, f.x), f.y));\n",
-        s, s, s, s, s, s, k_max[fmt], r, k_op[func], s);
+        s, s, s, s, s, s, k_max[fmt], r, fmt ? "m" : k_scale[fmt], k_op[func], s);
     if (k->debug == 17) {               /* debug view 17: stored depth, r, result */
         put(b, "    shdbg = vec4(d.x / m, r / m, t%u.x, 1.0);\n", s);
     }
     put(b, "  }\n");
+}
+
+/* Mode m fetches a texel from its stage's texture (as alpha_kill counts them) */
+static bool fetches(unsigned m)
+{
+    return m != HLE_PST_NONE && m != HLE_PST_PASSTHRU && m != HLE_PST_CLIPPLANE &&
+           m != HLE_PST_DOTPRODUCT;
+}
+
+/* patch 334: texture colour sign, stage s's signed channels (HlePshKey sgn_ob,
+ * sgn_raw) as the NV2A reads them, before anything uses the texel */
+static void sign_decode(Buf *b, const HlePshKey *k, unsigned s, unsigned m)
+{
+    const unsigned ob = (k->sgn_ob >> (4 * s)) & 15, raw = (k->sgn_raw >> (4 * s)) & 15 & ~ob;
+    if (!fetches(m)) {
+        return;
+    }
+    for (unsigned c = 0; c < 4; c++) {
+        if (((ob | raw) >> c) & 1) {
+            put(b, "  t%u.%c = %s(t%u.%c);\n", s, "rgba"[c], (ob >> c) & 1 ? "sgnob" : "sgnraw",
+                s, "rgba"[c]);
+        }
+    }
+}
+
+/* patch 340: the texture colour key (psh.h HLE_PSH_CKEY_*), as xemu: the
+ * texel as fetched, ARGB bytes, against the stage's key colour (an X
+ * format's alpha ignored): op 1 alpha 0, 2 colour and alpha 0, 3 discard */
+static void color_key(Buf *b, const HlePshKey *k, unsigned s, unsigned m)
+{
+    const unsigned op = (k->input_tex >> (2 * s)) & 3;
+    if (!op || !fetches(m)) {
+        return;
+    }
+    put(b, "  { uvec4 ck = uvec4(clamp(t%u, 0.0, 1.0) * 255.0 + 0.5);\n"
+           "    uint kc = uint(pc.mvp[2][%u]) << 16 | uint(pc.mvp[1][%u]), km = %s;\n"
+           "    if (((ck.a << 24 | ck.r << 16 | ck.g << 8 | ck.b) & km) == (kc & km)) ",
+        s, s, s, (k->input_tex & HLE_PSH_CKEY_X(s)) ? "0x00FFFFFFu" : "0xFFFFFFFFu");
+    if (op == 1) {
+        put(b, "t%u.a = 0.0; }\n", s);
+    } else if (op == 2) {
+        put(b, "t%u = vec4(0.0); }\n", s);
+    } else {
+        put(b, "discard; }\n");
+    }
 }
 
 /* D3DTSS_ALPHAKILL: a fetched texel with alpha 0 discards the fragment. A
@@ -360,6 +412,8 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
             "  vec2 v = floor(c * 255.0 + 0.5);\n"
             "  return mix(v, v - 256.0, greaterThanEqual(v, vec2(128.0))) / 127.0;\n"
             "}\n"
+            "%s"
+            "%s"
             "void main() {\n"
             "  vec4 v0 = vDiffuse, v1 = vSpecular;\n"
             "  vec4 vTex3 = %s;\n", interp, interp, k->wbuf ? HLE_WBUF_IN_FOR(k->wbuf) : "",
@@ -380,6 +434,28 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
          * stage maps so: other shaders' text, and their cached SPIR-V, stay) */
         hilo1 ? "  if (m == 4u) { uvec4 i = uvec4(c * 255.0 + 0.5);\n"
                 "    return vec3(float(i.a << 8 | i.r), float(i.g << 8 | i.b), 65535.0) / 65535.0; }\n" : "",
+        /* patch 334: colour sign, a channel offset binary, or as stored, as two's
+         * complement over 127 (only where a stage is signed: other shaders' text stays) */
+        k->sgn_ob | k->sgn_raw ?
+            "float sgnob(float c) { return max((c * 255.0 - 128.0) / 127.0, -1.0); }\n"
+            "float sgnraw(float c) {\n"
+            "  float v = floor(c * 255.0 + 0.5);\n"
+            "  return max((v >= 128.0 ? v - 256.0 : v) / 127.0, -1.0);\n"
+            "}\n" : "",
+        /* patch 342: the convolution filter, xemu's 3x3 gaussian of the stage's
+         * texels around uv, a guest texel apart (only where a stage asks) */
+        (k->input_tex & (HLE_PSH_CONV(0) | HLE_PSH_CONV(1) | HLE_PSH_CONV(2) | HLE_PSH_CONV(3))) ?
+            "vec4 conv(uint s, vec2 uv) {\n"
+            "  uint ti = pc.tex[s] & 0xFFFFu;\n"
+            "  vec2 d = (pc.flags & (1u << s)) != 0u ? vec2(1.0) :\n"
+            "      ((pc.flags & (256u << s)) != 0u ? float(pc.flags >> 24) : 1.0) /\n"
+            "      vec2(textureSize(sampler2D(uTex2D[nonuniformEXT(ti)], uSmp[0]), 0));\n"
+            "  vec4 r = vec4(0.0);\n"
+            "  for (int y = -1; y <= 1; y++)\n"
+            "    for (int x = -1; x <= 1; x++)\n"
+            "      r += samp(s, uv + vec2(x, y) * d) * (float((2 - abs(x)) * (2 - abs(y))) / 16.0);\n"
+            "  return r;\n"
+            "}\n" : "",
         k->point_sprite ? "vec4(gl_PointCoord, 1.0, 1.0)" : "vTex3i");
     if (k->wbuf) {
         put(&b, HLE_WBUF_CALC_GLSL);
@@ -429,6 +505,7 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
             /* the target drawn into: this pixel as the earlier draws left it
              * (an 8-bit target holds blue: back to its colour) */
             put(&b, "  vec4 t%u = subpassLoad(uFb)%s;\n", s, k->out_bgra ? ".bgra" : "");
+            sign_decode(&b, k, s, m);   /* patch 334: the target's colour sign (sgn_raw) */
             alpha_kill(&b, k, s, m);
             continue;
         }
@@ -456,8 +533,10 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
             }
             break;
         case HLE_PST_PROJECT2D:
-            put(&b, (k->vol >> s) & 1 ? "  vec4 t%u = samp3(%uu, vec3(nvproj(vTex%u).xy, 0.0));\n"
-                                      : "  vec4 t%u = samp(%uu, nvproj(vTex%u).xy);\n", s, s, s);
+            put(&b, (k->vol >> s) & 1 ? "  vec4 t%u = samp3(%uu, vec3(nvproj(vTex%u).xy, 0.0));\n" :
+                    (k->input_tex & HLE_PSH_CONV(s)) ? "  vec4 t%u = conv(%uu, nvproj(vTex%u).xy);\n"
+                                                     : "  vec4 t%u = samp(%uu, nvproj(vTex%u).xy);\n",
+                s, s, s);
             break;
         case HLE_PST_PROJECT3D:
             put(&b, "  vec4 t%u = samp3(%uu, nvproj(vTex%u));\n", s, s, s);
@@ -480,9 +559,22 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
             static const char *const mat[4][2] = {
                 { "", "" }, { "pc.bump.x", "pc.bump.y" }, { "pc.bump.z", "pc.bump.w" },
                 { "pc.bump3.x", "pc.bump3.y" } };
+            /* (du, dv) the input's signed bytes; a channel colour sign already
+             * made signed (sign_decode, patch 334) as it is */
+            const unsigned sd = ((k->sgn_ob | k->sgn_raw) >> (4 * in)) & 6;
+            char duv[64], du[24], dv[24];
+            snprintf(du, sizeof(du), sd & 4 ? "t%u.b" : "sgn8(t%u.bg).x", in);
+            snprintf(dv, sizeof(dv), sd & 2 ? "t%u.g" : "sgn8(t%u.bg).y", in);
+            if (sd == 6) {
+                snprintf(duv, sizeof(duv), "t%u.bg", in);
+            } else if (!sd) {
+                snprintf(duv, sizeof(duv), "sgn8(t%u.bg)", in);
+            } else {
+                snprintf(duv, sizeof(duv), "vec2(%s, %s)", du, dv);
+            }
             put(&b, "  vec4 t%u;\n"
                     "  { vec2 d = mat2(unpackHalf2x16(%s), unpackHalf2x16(%s)) * "
-                    "sgn8(t%u.bg);\n", s, mat[s][0], mat[s][1], in);
+                    "%s;\n", s, mat[s][0], mat[s][1], duv);
             if ((k->vol >> s) & 1) {            /* a volume: r passes through (Conker's
                                                  * electricity, animated along r) */
                 put(&b, "    t%u = samp3(%uu, vec3(nvproj(vTex%u).xy + d, vTex%u.z));\n",
@@ -555,6 +647,8 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
                 s, s, s, m);
             break;
         }
+        color_key(&b, k, s, m);         /* patch 340: the texel as fetched */
+        sign_decode(&b, k, s, m);       /* patch 334: the texel's colour sign */
         alpha_kill(&b, k, s, m);
     }
     put(&b, "  vec4 r0 = vec4(0.0, 0.0, 0.0, t0.a), r1 = vec4(0.0);\n"
@@ -565,7 +659,9 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
     }
     final_combiner(&b, k);
     put(&b, "  outc = clamp(outc, 0.0, 1.0);\n");
-    if (k->alpha_test && k->alpha_func < 8) {
+    if (k->alpha_test && (k->alpha_func & HLE_A2C_BIT)) {
+        put(&b, "%s", HLE_A2C_GLSL("outc"));   /* patch 354: MSAA alpha-to-coverage */
+    } else if (k->alpha_test && k->alpha_func < 8) {
         put(&b, "  { float a = outc.a, r = pc.alpha_ref; if (!(%s)) discard; }\n",
             k_cmp[k->alpha_func]);
     }
@@ -596,7 +692,11 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
                       k->debug == 22 ? "vec4(normalize(vTex2.xyz) * 0.5 + 0.5, 1.0)" :
                       k->debug == 23 ? "vec4(any(isnan(vTex2)) ? 1.0 : 0.0, "
                                        "any(isinf(vTex2)) ? 1.0 : 0.0, 0.0, 1.0)" :
-                      k->debug == 24 ? "sampc(2u, vec3(0.3, 0.5, 0.8))" : "outc";
+                      k->debug == 24 ? "sampc(2u, vec3(0.3, 0.5, 0.8))" :
+                      /* patch 364 (debug): solid colours for programs picked by HAKUX_HLE_PSDBG_VSH */
+                      k->debug == 25 ? "vec4(0.0, 1.0, 0.0, 1.0)" :
+                      k->debug == 26 ? "vec4(0.0, 1.0, 1.0, 1.0)" :
+                      k->debug == 27 ? "vec4(1.0, 1.0, 0.0, 1.0)" : "outc";
     put(&b, "  oColor = %s;\n%s", dbg, k->out_bgra ? "  oColor = oColor.bgra;\n" : "");
     if (k->sblend) {
         put(&b, "  { ivec4 sv = ivec4(floor(clamp(%s, 0.0, 1.0) * 255.0 + 0.5));\n"
@@ -604,6 +704,17 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
         "    sv -= 256 * (sv >> 7); dv -= 256 * (dv >> 7);\n"
         "    ivec4 r = clamp(dv %s sv, ivec4(-128), ivec4(127));\n"
         "    oColor = vec4(r & 255) / 255.0; }\n", "oColor", k->sblend == 1 ? "+" : "-");
+    }
+    if (k->tex_modes & HLE_PSH_ZCLIP) {
+        /* patch 338: the depth clip range (psh.h), on the depth stored */
+        const char *z = k->wbuf ? "wDepth" : "gl_FragCoord.z";
+        if (k->tex_modes & HLE_PSH_ZCLIP_CULL) {
+            put(&b, "  if (%s < pc.mvp[3].x || %s > pc.mvp[3].y) discard;\n", z, z);
+        } else if (k->wbuf) {
+            put(&b, "  wDepth = clamp(wDepth, pc.mvp[3].x, pc.mvp[3].y);\n");
+        } else {
+            put(&b, "  gl_FragDepth = clamp(gl_FragCoord.z, pc.mvp[3].x, pc.mvp[3].y);\n");
+        }
     }
     put(&b, "%s}\n", k->wbuf ? HLE_WBUF_STORE_GLSL : "");
     if (unsupported) {

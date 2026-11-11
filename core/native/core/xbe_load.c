@@ -112,6 +112,11 @@ bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, const NcKernel 
         return false;
     }
     const HleXbeInfo *x = &out->info;
+    if (x->chihiro_keys) {
+        const uint32_t flags = nc_rd32(hdr + 0x124);
+        nc_wr32(hdr + 0x124, (flags | 0x8u) & ~0x4u);
+        nc_log("hakuX-native", "xbe: %s is a Chihiro program: init flags %08x -> %08x", path, flags, nc_rd32(hdr + 0x124));
+    }
     out->tls_dir = nc_rd32(hdr + XBE_TLS_DIR);
     out->stack_commit = nc_rd32(hdr + XBE_STACK_COMMIT);
 

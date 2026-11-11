@@ -66,7 +66,8 @@ static bool state_method(uint32_t m)
 static bool state_unread(uint32_t m)
 {
     return (m >= 0x0440 && m < 0x09C0) ||              /* matrices, texgen planes */
-           (m >= 0x09D0 && m < 0x0A60) ||              /* fog plane .. eye position */
+           /* fog plane .. eye position (but SET_PROVOKING_VERTEX, patch 341) */
+           (m >= 0x09D0 && m < 0x0A60 && m != 0x09FC) ||
            (m >= 0x0C00 && m < 0x1500) ||              /* lights */
            (m >= 0x1720 && m < 0x17A0) ||              /* vertex arrays */
            /* a stage's OFFSET, FORMAT, CONTROL1, +0x18, IMAGE_RECT, PALETTE */
@@ -168,6 +169,13 @@ static void tss(uint32_t *t, unsigned s)
     t[TSS_ALPHAKILL] = (ctl0 >> 2) & 1;
     t[TSS_COLORSIGN] = filt & 0xF0000000u;
     t[TSS_BORDERCOLOR] = R(b + 0x24);
+    /* patch 342: MIN 7, the convolution filter (kernel 15:13: 1 quincunx, 2
+     * gaussian 3x3), sampled linear and convolved in the pixel shader;
+     * patch 343: MAX_LOD_CLAMP (17:6), as xemu a level (texture.c), where it
+     * can clamp a chain (below 15) */
+    const uint32_t kern = (filt >> 13) & 7, maxl = (ctl0 >> 6) & 0xFFF;
+    t[HLE_TSS_X_EXT] = (min == 7 && (kern == 1 || kern == 2) ? 1u : 0u) |
+                       (maxl < 15 ? (maxl + 1) << 16 : 0u);
     /* SET_TEXTURE_SET_BUMP_ENV_MAT 00 01 10 11, SCALE, OFFSET, where written */
     for (unsigned i = 0; i < 6; i++) {
         if (W(b + 0x28 + 4 * i)) {
@@ -277,6 +285,32 @@ void hle_kelvin_state(HleCmdState *st)
     }
     if (W(0x1D78)) {                    /* SET_ZMIN_MAX_CONTROL: ZCLAMP_EN (bits 4..7) CLAMP */
         st->zclamp = ((R(0x1D78) >> 4) & 0xF) == 1;
+    }
+    /* patch 338: the depth clip range (SET_CLIP_MIN / MAX) and its mode: CULL
+     * discards depth outside it, CLAMP clamps to it (xemu's depth_clipping) */
+    if (W(0x0394) || W(0x0398)) {
+        rs[HLE_RS_X_ZCTL] = 1u | (W(0x1D78) && ((R(0x1D78) >> 4) & 0xF) == 0 ? 2u : 0u);
+        rs[HLE_RS_X_CLIPMIN] = W(0x0394) ? R(0x0394) : 0;
+        rs[HLE_RS_X_CLIPMAX] = W(0x0398) ? R(0x0398) : 0x7F7FFFFFu;    /* FLT_MAX: none */
+    }
+    /* patch 341: SET_FRONT / BACK_POLYGON_MODE (0x1B00 point, 0x1B01 line,
+     * 0x1B02 fill) and SET_PROVOKING_VERTEX LAST (0) as pushed */
+    {
+        uint32_t x = 0;
+        for (unsigned f = 0; f < 2; f++) {
+            const uint32_t m = 0x038C + 4 * f;
+            const uint32_t v = W(m) ? R(m) : 0x1B02;
+            x |= (v == 0x1B00 ? 1u : v == 0x1B01 ? 2u : 0u) << (2 * f);
+        }
+        if (W(0x09FC) && R(0x09FC) == 0) {
+            x |= 0x10;
+        }
+        rs[HLE_RS_X_RASTER] = x;
+    }
+    for (unsigned s = 0; s < HLE_TSS_STAGES; s++) {
+        if (W(0x0AE0 + 4 * s)) {        /* patch 340: SET_COLOR_KEY_COLOR (ARGB) */
+            st->tss[s][HLE_TSS_X_KEYCOLOR] = R(0x0AE0 + 4 * s);
+        }
     }
 }
 

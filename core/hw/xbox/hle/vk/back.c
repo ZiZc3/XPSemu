@@ -3,6 +3,7 @@
  * into lazily opened dynamic-rendering passes, submits at FENCE/SWAP/KICK/
  * READBACK with the front end's timeline value (spec §5.3, §5.10-5.12).
  */
+#include <stdlib.h>
 #include "hw/xbox/hle/base.h"
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
@@ -56,6 +57,9 @@ static struct {
     HleBackStats st;
 } g_back;
 
+/* patch 325: the open pass's samples (MSAA): 1, or its attachments' copies' */
+uint32_t g_hle_pass_samples = 1;
+
 /* ---- visibility tests (occlusion queries) --------------------------------------
  * A test's draws are counted by one occlusion query per render pass they fall
  * in (a query may not span passes); at VIS_END the test's queries are parked
@@ -74,8 +78,10 @@ static struct {
     bool active;                                /* a test is open */
     int32_t in_pass;                            /* its query in the open pass, -1 none */
     uint32_t parts[VIS_MAX_PARTS], nparts;
+    uint8_t psamp[VIS_MAX_PARTS];               /* patch 325: each part's pass's samples */
     struct {
         uint32_t index, div, nparts, parts[VIS_MAX_PARTS];
+        uint8_t psamp[VIS_MAX_PARTS];
         uint32_t report;                        /* guest PA of the device's report, 0 none */
         uint64_t after;                         /* HLE_SURF_PARKED until submitted */
         uint64_t expect;                        /* the value its poller waits for */
@@ -126,6 +132,7 @@ static void vis_pass_end(VkCommandBuffer cb)
 {
     if (g_vis.in_pass >= 0) {
         T.vkCmdEndQuery(cb, g_vis.pool, (uint32_t)g_vis.in_pass);
+        g_vis.psamp[g_vis.nparts] = (uint8_t)g_hle_pass_samples;
         g_vis.parts[g_vis.nparts++] = (uint32_t)g_vis.in_pass;
         g_vis.in_pass = -1;
     }
@@ -178,6 +185,7 @@ static void cmd_vis_end(const HleCmdVis *c)
     p->expect = c->expect;
     p->nparts = g_vis.nparts;
     memcpy(p->parts, g_vis.parts, sizeof(p->parts));
+    memcpy(p->psamp, g_vis.psamp, sizeof(p->psamp));
     /* parked until the next submission, also without an open recording:
      * the front end waits for the value after its last one (and kicks once
      * for it); the last submitted value is older (Halo ends tests with
@@ -209,7 +217,10 @@ static void vis_reap(uint64_t completed)
             uint64_t n = 0;
             if (T.vkGetQueryPoolResults(g_hvk.dev, g_vis.pool, p->parts[k], 1, sizeof(n), &n,
                                         sizeof(n), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-                sum += n;
+                /* patch 325: an MSAA pass counts samples, not pixels (rounded
+                 * up: one sample seen is still seen) */
+                uint32_t ps = MAX(p->psamp[k], (uint8_t)1);
+                sum += (n + ps - 1) / ps;
             }
         }
         uint32_t count = (uint32_t)(sum / p->div);
@@ -539,11 +550,41 @@ static VkClearColorValue color_of(uint32_t argb)
  * one (the draw merge count, hle_draw_ff_diag). */
 uint64_t hle_back_breaks;
 
+/* patch 325: the samples a pass on rt (and ds) renders with: its
+ * attachments' MSAA copies when both can have one of the same samples and
+ * size, neither is read by its own draws (input attachments), and each copy
+ * holds what its image does or is cleared whole by this pass (pf, the
+ * pending clears; a new depth buffer is always cleared). Else 1: the pass
+ * renders the single-sample images, as with MSAA off. Depth-only passes
+ * (shadow maps) stay 1x: no edges to smooth. */
+static uint32_t pass_samples(HleVkSurf *rt, HleVkSurf *ds, uint32_t pf)
+{
+    if (g_hle_msaa < 2 || !rt || rt->local_read || (ds && ds->local_read) ||
+        (ds && (ds->w != rt->w || ds->h != rt->h))) {
+        return 1;
+    }
+    uint32_t n = hle_surf_ms_prepare(rt);
+    if (n < 2 || (ds && hle_surf_ms_prepare(ds) != n)) {
+        return 1;
+    }
+    if (!rt->ms_ok && !(pf & HLE_CLEAR_TARGET)) {
+        return 1;
+    }
+    if (ds && !ds->ms_ok && ds->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+        bool st = (ds->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+        if (!(pf & HLE_CLEAR_ZBUFFER) || (st && !(pf & HLE_CLEAR_STENCIL))) {
+            return 1;
+        }
+    }
+    return n;
+}
+
 /* lrz_off: the pass's first draw runs without the driver's LRZ
  * (hle_draw_lrz_off; true when not known) */
 static bool open_pass(bool lrz_off)
 {
     hle_back_breaks++;
+    hle_surf_ms_apply();                /* patch 326: a live MSAA change, between passes */
     HleVkSurf *rt = hle_surf_get(g_back.rt), *ds = hle_surf_get(g_back.ds);
     if (rt && !hle_surf_ensure(rt)) {
         rt = NULL;
@@ -560,6 +601,9 @@ static bool open_pass(bool lrz_off)
     VkRenderingAttachmentInfo ca = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkRenderingAttachmentInfo da = ca, sa = ca;
     uint32_t w = rt ? rt->w : ds->w, h = rt ? rt->h : ds->h;
+    /* patch 325: MSAA (1 = off, or this pass can't: the single-sample images) */
+    const uint32_t msn = pass_samples(rt, ds, pf);
+    g_hle_pass_samples = msn;
     if (rt) {
         /* nothing written yet and no clear: zeros, not what an attachment
          * compressor left (quirks.h) */
@@ -574,6 +618,23 @@ static bool open_pass(bool lrz_off)
                                                       : VK_ATTACHMENT_LOAD_OP_LOAD;
         ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         ca.clearValue.color = cfresh ? (VkClearColorValue){ .float32 = { 0 } } : g_back.pend_color;
+        if (msn > 1) {
+            /* patch 325: the pass renders the copy, resolved (averaged) into
+             * the image at its end. A copy never used yet holds nothing: it
+             * starts at zero, as the image (still new) would read. */
+            const bool ms_new = rt->ms_layout == VK_IMAGE_LAYOUT_UNDEFINED;
+            hle_surf_ms_begin(cb, rt);
+            ca.imageView = rt->ms_view;
+            ca.imageLayout = rt->ms_layout;
+            ca.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+            ca.resolveImageView = rt->view;
+            ca.resolveImageLayout = rt->layout;
+            if (ms_new && ca.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+                ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                ca.clearValue.color = (VkClearColorValue){ .float32 = { 0 } };
+            }
+            rt->ms_ok = true;
+        }
     }
     VkImageAspectFlags in_pass_clear = 0;   /* HLE_QUIRK_DS_SAME_LOAD */
     bool stencil = ds && (ds->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
@@ -600,13 +661,19 @@ static bool open_pass(bool lrz_off)
         }
         hle_surf_transition(cb, ds, ds->local_read ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR
                                                    : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        if (msn > 1) {
+            hle_surf_ms_begin(cb, ds);  /* patch 325: its copy, resolved by sample 0 */
+            ds->ms_ok = true;
+        }
         /* A pass clearing depth that opens on a draw without LRZ: an empty
          * pass of one pixel clears it first, and its end stores the driver's
          * cleared LRZ state, which the pass falls back to (quirks.h). */
         if ((pf & HLE_CLEAR_ZBUFFER) && lrz_off && hle_quirk(HLE_QUIRK_LRZ_CLEAR)) {
             VkRenderingAttachmentInfo za = {
-                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = ds->view,
-                .imageLayout = ds->layout, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = msn > 1 ? ds->ms_view : ds->view,
+                .imageLayout = msn > 1 ? ds->ms_layout : ds->layout,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
                 .clearValue.depthStencil.depth = g_back.pend_z };
             VkRenderingInfo zi = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -614,7 +681,11 @@ static bool open_pass(bool lrz_off)
                                    .pDepthAttachment = &za };
             T.vkCmdBeginRendering(cb, &zi);
             T.vkCmdEndRendering(cb);
-            hle_img_barrier(cb, ds->img, ds->aspect, ds->layout, ds->layout);
+            if (msn > 1) {
+                hle_img_barrier(cb, ds->ms_img, ds->aspect, ds->ms_layout, ds->ms_layout);
+            } else {
+                hle_img_barrier(cb, ds->img, ds->aspect, ds->layout, ds->layout);
+            }
         }
         if (title_pf & (HLE_CLEAR_ZBUFFER | HLE_CLEAR_STENCIL)) {
             hle_surf_written(ds);       /* else its draws say (draw.c), when they write it */
@@ -626,6 +697,15 @@ static bool open_pass(bool lrz_off)
         da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         da.clearValue.depthStencil.depth = g_back.pend_z;
         da.clearValue.depthStencil.stencil = g_back.pend_s;
+        if (msn > 1) {
+            /* patch 325: the copy; depth and stencil resolved by sample 0 (never
+             * averaged), what a single-sample buffer would have held there */
+            da.imageView = ds->ms_view;
+            da.imageLayout = ds->ms_layout;
+            da.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+            da.resolveImageView = ds->view;
+            da.resolveImageLayout = ds->layout;
+        }
         sa = da;
         sa.loadOp = (pf & HLE_CLEAR_STENCIL) ? VK_ATTACHMENT_LOAD_OP_CLEAR
                                              : VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -847,7 +927,7 @@ uint32_t g_hle_rscale = 1;
 
 static void cmd_device(const HleCmdDevice *c, bool reset)
 {
-    uint32_t scale = MIN(MAX(hle_host_render_scale(), 1), 6);
+    uint32_t scale = MIN(MAX(hle_host_render_scale(), 1), 10);   /* patch 328: up to x10 */
     /* A Reset replaces only the device's surfaces (the front end destroys the
      * old ones by OBJ_DESTROY): the title's own render targets and textures
      * keep their images. A new scale resizes every image. */
@@ -1450,7 +1530,7 @@ static struct {
     bool failed;
     VkPipelineLayout pl;
     VkShaderModule vs, fs;
-    struct { VkFormat cf, df; bool st; uint8_t mask; VkPipeline p; } p[16];
+    struct { VkFormat cf, df; bool st; uint8_t mask; uint32_t samples; VkPipeline p; } p[16];
     unsigned np;
 } g_mc;
 
@@ -1472,7 +1552,7 @@ static VkPipeline mc_pipe(VkFormat cf, VkFormat df, bool st, uint8_t mask)
 {
     for (unsigned i = 0; i < g_mc.np; i++) {
         if (g_mc.p[i].cf == cf && g_mc.p[i].df == df && g_mc.p[i].st == st &&
-            g_mc.p[i].mask == mask) {
+            g_mc.p[i].mask == mask && g_mc.p[i].samples == g_hle_pass_samples) {
             return g_mc.p[i].p;
         }
     }
@@ -1512,7 +1592,8 @@ static VkPipeline mc_pipe(VkFormat cf, VkFormat df, bool st, uint8_t mask)
         .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+        /* patch 325: the open pass's (MSAA) */
+        .rasterizationSamples = (VkSampleCountFlagBits)g_hle_pass_samples };
     VkPipelineDepthStencilStateCreateInfo dsi = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
     VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = mask };
@@ -1537,7 +1618,7 @@ static VkPipeline mc_pipe(VkFormat cf, VkFormat df, bool st, uint8_t mask)
     if (T.vkCreateGraphicsPipelines(g_hvk.dev, VK_NULL_HANDLE, 1, &gci, NULL, &p) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
-    g_mc.p[g_mc.np++] = (typeof(g_mc.p[0])){ cf, df, st, mask, p };
+    g_mc.p[g_mc.np++] = (typeof(g_mc.p[0])){ cf, df, st, mask, g_hle_pass_samples, p };
     return p;
 }
 
@@ -1732,7 +1813,124 @@ static struct {
     VkImage img;
     VkDeviceMemory mem;
     uint32_t w, h;
+    VkImageView view;                   /* patch 337: sampled by the colour key's pass */
 } g_ovl_img;
+
+/* patch 355: the overlay (always a movie) enlarged by the movie upscaler
+ * (gamma.c) into an image of its own, s times its size, made again with each
+ * of its frames, left TRANSFER_SRC as the overlay's; the swap's blit (or the
+ * colour key's pass) then reads it. s: the blit's last enlargement, rounded,
+ * 2 to 4 (each side at most 4096); 1 or off: drawn as before. */
+static struct {
+    VkImage img;
+    VkDeviceMemory mem;
+    VkImageView view;                   /* R8G8B8A8: attachment, and sampled */
+    VkImageView src;                    /* the overlay's own (identity) view */
+    VkDescriptorSet set;
+    uint32_t w, h, s;                   /* the overlay's size, the scale */
+    uint32_t want;                      /* the scale overlay_blit asks for */
+    bool ok;                            /* holds the overlay's latest frame */
+} g_ovl_up;
+
+/* After a flush_idle (or before the first use): nothing uses them */
+static void ovl_up_free(void)
+{
+    hle_movieup_set_free(g_ovl_up.set);
+    if (g_ovl_up.view) {
+        T.vkDestroyImageView(g_hvk.dev, g_ovl_up.view, NULL);
+    }
+    if (g_ovl_up.src) {
+        T.vkDestroyImageView(g_hvk.dev, g_ovl_up.src, NULL);
+    }
+    if (g_ovl_up.img) {
+        T.vkDestroyImage(g_hvk.dev, g_ovl_up.img, NULL);
+    }
+    if (g_ovl_up.mem) {
+        T.vkFreeMemory(g_hvk.dev, g_ovl_up.mem, NULL);
+    }
+    const uint32_t want = g_ovl_up.want;
+    memset(&g_ovl_up, 0, sizeof(g_ovl_up));
+    g_ovl_up.want = want;
+}
+
+static bool ovl_up_make(uint32_t s)
+{
+    const uint32_t w = g_ovl_img.w * s, h = g_ovl_img.h * s;
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { w, h, 1 }, .mipLevels = 1,
+        .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    VkImageViewCreateInfo sv = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_ovl_img.img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    bool ok = T.vkCreateImage(g_hvk.dev, &ici, NULL, &g_ovl_up.img) == VK_SUCCESS;
+    if (!ok) {
+        g_ovl_up.img = VK_NULL_HANDLE;
+    } else {
+        VkMemoryRequirements req;
+        T.vkGetImageMemoryRequirements(g_hvk.dev, g_ovl_up.img, &req);
+        int mt = hle_vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                     .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt };
+        ok = mt >= 0 && T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &g_ovl_up.mem) == VK_SUCCESS;
+        if (!ok) {
+            g_ovl_up.mem = VK_NULL_HANDLE;
+        }
+    }
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_ovl_up.img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    ok = ok && T.vkBindImageMemory(g_hvk.dev, g_ovl_up.img, g_ovl_up.mem, 0) == VK_SUCCESS;
+    ok = ok && T.vkCreateImageView(g_hvk.dev, &vci, NULL, &g_ovl_up.view) == VK_SUCCESS;
+    ok = ok && T.vkCreateImageView(g_hvk.dev, &sv, NULL, &g_ovl_up.src) == VK_SUCCESS;
+    ok = ok && (g_ovl_up.set = hle_movieup_set_new(g_ovl_up.src)) != VK_NULL_HANDLE;
+    if (!ok) {
+        ovl_up_free();
+        return false;
+    }
+    g_ovl_up.w = g_ovl_img.w;
+    g_ovl_up.h = g_ovl_img.h;
+    g_ovl_up.s = s;
+    hle_log("hakuX-hle-back", "movie upscaler (patch 355): overlay %ux%u -> %ux%u", g_ovl_img.w,
+            g_ovl_img.h, w, h);
+    return true;
+}
+
+/* The scale the copy is made at: overlay_blit's ask, each side at most 4096 */
+static uint32_t ovl_up_scale(void)
+{
+    uint32_t s = MIN(g_ovl_up.want, 4u);
+    while (s > 1 && (g_ovl_img.w * s > 4096 || g_ovl_img.h * s > 4096)) {
+        s--;
+    }
+    return s;
+}
+
+/* The overlay's new frame (g_ovl_img, TRANSFER_SRC) into its enlarged copy */
+static void ovl_up(VkCommandBuffer cb)
+{
+    g_ovl_up.ok = false;
+    const uint32_t s = ovl_up_scale();
+    if (s < 2 || !hle_movieup_on() || !g_ovl_img.img || (g_ovl_up.img && g_ovl_up.s != s)) {
+        return;
+    }
+    if (!g_ovl_up.img && !ovl_up_make(s)) {
+        g_ovl_up.want = 1;              /* not again */
+        return;
+    }
+    hle_img_barrier(cb, g_ovl_img.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    hle_movieup_pass(cb, g_ovl_up.set, g_ovl_up.img, g_ovl_up.view, g_ovl_img.w * s, g_ovl_img.h * s,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    hle_img_barrier(cb, g_ovl_img.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    g_ovl_up.ok = true;
+}
 
 /* The overlay's texels (arena) into its image, left TRANSFER_SRC. */
 static void cmd_overlay(const HleCmdOverlay *c)
@@ -1741,8 +1939,20 @@ static void cmd_overlay(const HleCmdOverlay *c)
     if (!c->on) {
         return;
     }
+    /* patch 355: the movie upscaler's copy at another scale (the picture's
+     * size changed: rare): made again once its last frame's reads are done */
+    if (g_ovl_up.img && g_ovl_img.img && g_ovl_img.w == c->w && g_ovl_img.h == c->h &&
+        g_ovl_up.s != ovl_up_scale()) {
+        flush_idle();
+        ovl_up_free();
+    }
     if (g_ovl_img.img && (g_ovl_img.w != c->w || g_ovl_img.h != c->h)) {
         flush_idle();
+        ovl_up_free();                  /* patch 355: its enlarged copy too */
+        if (g_ovl_img.view) {
+            T.vkDestroyImageView(g_hvk.dev, g_ovl_img.view, NULL);
+            g_ovl_img.view = VK_NULL_HANDLE;
+        }
         T.vkDestroyImage(g_hvk.dev, g_ovl_img.img, NULL);
         T.vkFreeMemory(g_hvk.dev, g_ovl_img.mem, NULL);
         g_ovl_img.img = VK_NULL_HANDLE;
@@ -1754,7 +1964,9 @@ static void cmd_overlay(const HleCmdOverlay *c)
             .format = VK_FORMAT_B8G8R8A8_UNORM, .extent = { c->w, c->h, 1 }, .mipLevels = 1,
             .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            /* patch 337: sampled too (the colour key's pass) */
+            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                     VK_IMAGE_USAGE_SAMPLED_BIT,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
         VkMemoryRequirements req;
         if (T.vkCreateImage(g_hvk.dev, &ici, NULL, &g_ovl_img.img) != VK_SUCCESS) {
@@ -1786,9 +1998,58 @@ static void cmd_overlay(const HleCmdOverlay *c)
                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
     hle_img_barrier(cb, g_ovl_img.img, VK_IMAGE_ASPECT_COLOR_BIT,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (g_ovl_up.want > 1 || g_ovl_up.img) {
+        ovl_up(cb);                     /* patch 355: the movie upscaler */
+    }
 }
 
-static void overlay_blit(VkCommandBuffer cb, VkImage dst, uint32_t dw, uint32_t dh)
+/* patch 337: the overlay through its colour key (gamma.c hle_ovlkey_pass),
+ * over the frame src's part fx..fw x fy..fh as the swap showed it; false:
+ * blitted as before (no key, or XOG_FIX noovlkey: the front end sends none) */
+static bool overlay_key(VkCommandBuffer cb, HleVkSurf *src, uint32_t fx, uint32_t fy, uint32_t fw,
+                        uint32_t fh, VkImage dst, uint32_t dw, uint32_t dh, const int32_t s[4],
+                        const int32_t d[4], bool up)
+{
+    if (!g_ovl.key_on || !src) {
+        return false;
+    }
+    if (up) {                           /* patch 355: its enlarged copy (s: in its texels) */
+        hle_img_barrier(cb, g_ovl_up.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        const bool ok = hle_ovlkey_pass(cb, g_back.cur, src, fx, fy, fw, fh, g_ovl_up.view,
+                                        g_ovl_up.w * g_ovl_up.s, g_ovl_up.h * g_ovl_up.s, s, d, g_ovl.key,
+                                        dst, dw, dh);
+        hle_img_barrier(cb, g_ovl_up.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        return ok;
+    }
+    if (!g_ovl_img.view) {
+        VkImageViewCreateInfo vci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_ovl_img.img,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        if (T.vkCreateImageView(g_hvk.dev, &vci, NULL, &g_ovl_img.view) != VK_SUCCESS) {
+            g_ovl_img.view = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    hle_img_barrier(cb, g_ovl_img.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    const bool ok = hle_ovlkey_pass(cb, g_back.cur, src, fx, fy, fw, fh, g_ovl_img.view, g_ovl_img.w,
+                                    g_ovl_img.h, s, d, g_ovl.key, dst, dw, dh);
+    hle_img_barrier(cb, g_ovl_img.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    static unsigned s_logged;
+    if (s_logged < 4) {
+        s_logged++;
+        hle_log("hakuX-hle-back", "overlay: colour key %06x (patch 337) %s", g_ovl.key,
+                ok ? "drawn" : "pass failed, blitted without it");
+    }
+    return ok;
+}
+
+static void overlay_blit(VkCommandBuffer cb, VkImage dst, uint32_t dw, uint32_t dh, HleVkSurf *src,
+                         uint32_t fx, uint32_t fy, uint32_t fw, uint32_t fh)
 {
     VkImage img = g_ovl_img.img;
     uint32_t tw = g_ovl_img.w, th = g_ovl_img.h;
@@ -1804,6 +2065,32 @@ static void overlay_blit(VkCommandBuffer cb, VkImage dst, uint32_t dw, uint32_t 
     d0y = MIN(MAX(d0y, 0), (int32_t)dh); d1y = MIN(MAX(d1y, 0), (int32_t)dh);
     if (s1x <= s0x || s1y <= s0y || d1x <= d0x || d0y == d1y) {
         return;
+    }
+    /* patch 355: the enlargement the movie upscaler makes its copy at (the
+     * overlay's next frame), and that copy, when it holds this frame */
+    {
+        const float ex = (float)(d1x - d0x) / (float)(s1x - s0x);
+        const float ey = (float)abs(d1y - d0y) / (float)(s1y - s0y);
+        const float e = MIN(ex, ey);
+        if (g_ovl_up.want != 1 || g_ovl_up.img) {
+            g_ovl_up.want = e >= 1.5f ? MIN((uint32_t)(e + 0.5f), 4u) : 0;
+        }
+    }
+    const bool up = g_ovl_up.ok && g_ovl_up.img && g_ovl_up.w == tw && g_ovl_up.h == th &&
+                    hle_movieup_on();
+    {
+        const int32_t k = up ? (int32_t)g_ovl_up.s : 1;
+        const int32_t sr[4] = { s0x * k, s0y * k, s1x * k, s1y * k }, dr[4] = { d0x, d0y, d1x, d1y };
+        if (overlay_key(cb, src, fx, fy, fw, fh, dst, dw, dh, sr, dr, up)) {
+            return;
+        }
+    }
+    if (up) {
+        img = g_ovl_up.img;
+        s0x *= (int32_t)g_ovl_up.s;
+        s0y *= (int32_t)g_ovl_up.s;
+        s1x *= (int32_t)g_ovl_up.s;
+        s1y *= (int32_t)g_ovl_up.s;
     }
     hle_img_barrier(cb, dst, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1893,6 +2180,121 @@ static void fh_deliver(uint64_t n, uint64_t value)
 
 static void cmd_swap_present(const HleCmdSwap *c);
 
+/* ---- patch 363: ambient occlusion's scene depth ---------------------------------
+ * While it is on (g_hle_ssao), the frame's draws are counted by (target, depth
+ * buffer); at the swap the depth buffer drawn the most with the presented
+ * surface is the scene's (else, the pair with the most draws whose target is
+ * the presented one's multisampled back buffer: 1x or 2x its guest size on
+ * each axis). It must be the target's size, a fixed-point depth, scale x6 at
+ * most: else no AO that frame (none rather than a wrong one). */
+#define AO_PAIRS 8
+static struct {
+    uint32_t rt[AO_PAIRS], ds[AO_PAIRS], draws[AO_PAIRS];
+    unsigned n, last;
+} g_aop;
+
+static inline void ao_note(uint32_t rt, uint32_t ds)
+{
+    if (!rt || !ds) {
+        return;
+    }
+    unsigned i = g_aop.last;
+    if (i >= g_aop.n || g_aop.rt[i] != rt || g_aop.ds[i] != ds) {
+        for (i = 0; i < g_aop.n && (g_aop.rt[i] != rt || g_aop.ds[i] != ds); i++) {
+        }
+        if (i == g_aop.n) {
+            if (i == AO_PAIRS) {
+                return;
+            }
+            g_aop.rt[i] = rt;
+            g_aop.ds[i] = ds;
+            g_aop.draws[i] = 0;
+            g_aop.n++;
+        }
+        g_aop.last = i;
+    }
+    g_aop.draws[i]++;
+}
+
+static HleVkSurf *ao_depth(HleVkSurf *src, uint32_t sid, const char **why)
+{
+    int best = -1;
+    HleVkSurf *rt = src;
+    for (unsigned i = 0; i < g_aop.n; i++) {
+        if (g_aop.rt[i] == sid && (best < 0 || g_aop.draws[i] > g_aop.draws[best])) {
+            best = (int)i;
+        }
+    }
+    if (best < 0) {
+        int most = -1;
+        for (unsigned i = 0; i < g_aop.n; i++) {
+            if (most < 0 || g_aop.draws[i] > g_aop.draws[most]) {
+                most = (int)i;
+            }
+        }
+        HleVkSurf *r = most >= 0 ? hle_surf_get(g_aop.rt[most]) : NULL;
+        const uint32_t fx = r && src->d.w ? r->d.w / src->d.w : 0;
+        const uint32_t fy = r && src->d.h ? r->d.h / src->d.h : 0;
+        if (r && (fx == 1 || fx == 2) && (fy == 1 || fy == 2) && r->d.w == fx * src->d.w &&
+            r->d.h == fy * src->d.h) {
+            best = most;
+            rt = r;
+        }
+    }
+    if (best < 0) {
+        *why = "no depth buffer drawn with the shown picture";
+        return NULL;
+    }
+    HleVkSurf *ds = hle_surf_get(g_aop.ds[best]);
+    const uint32_t xf = ds ? ds->d.xfmt : 0;
+    if (!ds || !ds->alive || ds->destroy_after || !ds->img || ds->general || ds->d.parent ||
+        !(ds->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || ds->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        *why = "its depth buffer can't be read";
+        return NULL;
+    }
+    if (xf == HLE_XFMT_F24S8 || xf == HLE_XFMT_LIN_F24S8 || xf == HLE_XFMT_F16 ||
+        xf == HLE_XFMT_LIN_F16) {
+        *why = "a floating-point depth buffer";
+        return NULL;
+    }
+    if (ds->w != rt->w || ds->h != rt->h || ds->w < 16 || ds->h < 16) {
+        *why = "the depth buffer's size isn't the picture's";
+        return NULL;
+    }
+    if (ds->scale > 6 || (uint64_t)((ds->w + 1) / 2) * ((ds->h + 1) / 2) > 3000000u) {
+        *why = "resolution above x6";
+        return NULL;
+    }
+    *why = NULL;
+    return ds;
+}
+
+/* The display image dst darkened by ds's AO (after the swap's copy, before the
+ * video overlay): a display pixel's place in src's shown part (cx..sw x
+ * cy..sh), as the copy put it there, is ds's uv. */
+static void ao_apply(VkCommandBuffer cb, int level, HleVkSurf *ds, HleVkSurf *src, uint32_t cx,
+                     uint32_t cy, uint32_t sw, uint32_t sh, VkImage dst, uint32_t dw, uint32_t dh)
+{
+    if (!ds || !dw || !dh) {
+        return;
+    }
+    cx = sw > 1u ? MIN(cx, sw - 1u) : 0u;
+    cy = sh > 1u ? MIN(cy, sh - 1u) : 0u;
+    const float map[4] = {
+        (float)MAX(sw - cx, 1u) / ((float)dw * (float)src->w),
+        (float)MAX(sh - cy, 1u) / ((float)dh * (float)src->h),
+        (float)cx / (float)src->w, (float)cy / (float)src->h };
+    static unsigned s_logged;
+    if (!hle_ssao_pass(cb, g_back.cur, level, ds, src->d.w, src->d.h, map, dst, dw, dh)) {
+        if (s_logged++ < 8) {
+            hle_log("hakuX-hle-back", "ambient occlusion: pass not done (patch 363)");
+        }
+    } else if (!s_logged++) {
+        hle_log("hakuX-hle-back", "ambient occlusion (patch 363): %s, depth %u %ux%u (x%u) under "
+                "surface %u", level >= 2 ? "high" : "low", ds->id, ds->w, ds->h, ds->scale, src->id);
+    }
+}
+
 static void cmd_swap(const HleCmdSwap *c)
 {
     rtd_poll();
@@ -1902,6 +2304,8 @@ static void cmd_swap(const HleCmdSwap *c)
     const uint64_t n = g_back.st.swaps + 1;     /* the swap that ends the frame */
     g_fh.armed = g_fh.hook.want && g_fh.hook.want(n, g_fh.hook.opaque);
     cmd_swap_present(c);
+    g_aop.n = 0;                        /* patch 363: the next frame's draws */
+    g_aop.last = 0;
     if (dump) {
         rtd_write(c->value);
     }
@@ -2043,6 +2447,25 @@ static void cmd_swap_present(const HleCmdSwap *c)
     }
     if (src && slot >= 0 && hle_surf_ensure(src) &&
         (src->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        /* patch 363: ambient occlusion's depth buffer (none while it is off); its
+         * working images grown only with the GPU idle (rare: a bigger one) */
+        const int ao_lv = hle_ssao_level();
+        HleVkSurf *aods = NULL;
+        if (ao_lv) {
+            static const char *s_why;
+            static unsigned s_nwhy;
+            const char *why = NULL;
+            aods = ao_depth(src, c->surf, &why);
+            if (why != s_why && s_nwhy < 32) {
+                s_nwhy++;
+                hle_log("hakuX-hle-back", "ambient occlusion (patch 363): %s (swap %llu)",
+                        why ? why : "on", (unsigned long long)g_back.st.swaps);
+            }
+            s_why = why;
+            if (aods && hle_ssao_regrow(aods->w, aods->h)) {
+                flush_idle();
+            }
+        }
         VkCommandBuffer cb = cb_get();
         VkImage dst = hle_disp_image(slot);
         uint32_t dw, dh;
@@ -2050,9 +2473,26 @@ static void cmd_swap_present(const HleCmdSwap *c)
         /* the part of src shown (HleCmdSwap.src_w / src_h), in its pixels */
         const uint32_t sw = c->src_w ? MIN(src->w, c->src_w * src->scale) : src->w;
         const uint32_t sh = c->src_h ? MIN(src->h, c->src_h * src->scale) : src->h;
+        /* XOG patch 274 (xogfix=edgecrop, per game): the picture's first guest row
+         * and column left out. Dead or Alive 3's full-screen 2D passes (menus,
+         * intro, its title) cover pixels 1.. only, both axes, the right and bottom
+         * edges whole: row 0 and column 0 keep what the 3D under them left, a
+         * bright line along the top and left that a TV's overscan hides. */
+        static int s_crop = -1;
+        if (s_crop < 0) {
+            const char *e = getenv("XOG_FIX");
+            s_crop = e && strstr(e, "edgecrop") ? 1 : 0;
+            if (s_crop) {
+                hle_log("hakuX-hle-back", "edgecrop: the shown picture starts at guest pixel (1, 1) "
+                        "(xogfix=edgecrop, patch 274)");
+            }
+        }
+        const uint32_t cx = s_crop && sw > 2u * src->scale ? src->scale : 0u;
+        const uint32_t cy = s_crop && sh > 2u * src->scale ? src->scale : 0u;
         if (!g_gamma.identity && !g_gamma.off && !hle_disp_gamma_consumer() &&
-            hle_gamma_pass(cb, g_back.cur, g_gamma.rgb, src, sw, sh, dst, dw, dh)) {
-            overlay_blit(cb, dst, dw, dh);
+            hle_gamma_pass(cb, g_back.cur, g_gamma.rgb, src, cx, cy, sw, sh, dst, dw, dh)) {
+            ao_apply(cb, ao_lv, aods, src, cx, cy, sw, sh, dst, dw, dh);     /* patch 363 */
+            overlay_blit(cb, dst, dw, dh, src, cx, cy, sw, sh);
             fh_copy(cb, dst, dw, dh);
             submit(c->value);           /* through the ramp instead of the blit */
             g_back.st.swaps++;
@@ -2064,7 +2504,7 @@ static void cmd_swap_present(const HleCmdSwap *c)
         VkImageBlit2 r = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .srcOffsets = { { 0, 0, 0 }, { (int32_t)sw, (int32_t)sh, 1 } },
+            .srcOffsets = { { (int32_t)cx, (int32_t)cy, 0 }, { (int32_t)sw, (int32_t)sh, 1 } },
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .dstOffsets = { { 0, 0, 0 }, { (int32_t)dw, (int32_t)dh, 1 } } };
         VkBlitImageInfo2 bi = {
@@ -2076,7 +2516,8 @@ static void cmd_swap_present(const HleCmdSwap *c)
         hle_img_barrier(cb, dst, VK_IMAGE_ASPECT_COLOR_BIT,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        overlay_blit(cb, dst, dw, dh);
+        ao_apply(cb, ao_lv, aods, src, cx, cy, sw, sh, dst, dw, dh);         /* patch 363 */
+        overlay_blit(cb, dst, dw, dh, src, cx, cy, sw, sh);
         fh_copy(cb, dst, dw, dh);
     }
     submit(c->value);
@@ -2587,6 +3028,9 @@ static void dispatch(const HleCmdHdr *h)
             g_hle_zeq = zv ? zq : 0;
             hle_draw_cmd_draw(p, g_back.fr[g_back.cur].cb, g_back.rt, g_back.ds, &g_back.vp);
             g_back.st.draws++;
+            if (unlikely(g_hle_ssao)) {
+                ao_note(g_back.rt, g_back.ds);  /* patch 363: the frame's scene depth */
+            }
             if (g_pix.active) {
                 pix_after(p);
             }
@@ -2730,7 +3174,7 @@ int hle_back_start(void)
     }
     /* DXT decoded on the way in (no BC: pbres.c) takes four to eight times the bytes */
     const char *what = hle_vk_guest_ram_init() ? "guest RAM" :
-                       hle_vk_arena_init(g_hvk.caps.bc ? 32u << 20 : 64u << 20) ? "the upload arena" :
+                       hle_vk_arena_init(getenv("NC_CHIHIRO") || (getenv("XOG_FIX") && strstr(getenv("XOG_FIX"), "arena128")) ? 128u << 20 :   /* + a game asking for it (xogfix=arena128, patch 242: Conker) */ g_hvk.caps.bc ? 32u << 20 : 64u << 20) /* patch 229: Sega Chihiro 128 MB (Ghost Squad: decoder blocked 850 ms, upload arena full) */ ? "the upload arena" :
                        hle_vk_land_init(16u << 20) ? "the readback buffer" :
                        hle_fe_init() ? "the front end" :
                        hle_tl_init(on_complete) ? "the timeline" :

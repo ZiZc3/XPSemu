@@ -13,6 +13,7 @@
  * into the thread's saved EAX when the wait ends.
  */
 #include "native/kernel/kernel.h"
+#include <stdlib.h>
 #include "hw/xbox/hle/host.h"
 
 #include <pthread.h>
@@ -83,11 +84,15 @@ static uint32_t g_tseq;
 static bool g_tstill;
 static uint64_t g_tstill_raw, g_off;
 
+/* XOG patch 253: the host's time as the guest goes by it: CLOCK_MONOTONIC, twice as fast while fast-forward is
+ * on (ps5/src/ff_ps5.c). Every value kept here (g_tstill_raw, g_off, g_hold_raw) is on this clock;
+ * nc_ke_host_ns turns a result back into the host's for the waits. */
+uint64_t nc_ff_now_ns(void);
+uint64_t nc_ff_host_ns(uint64_t v);
+
 static uint64_t raw_ns(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return nc_ff_now_ns();
 }
 
 /* The time's state, read whole with the host's time: whether it stands
@@ -144,6 +149,22 @@ void nc_ke_pause_begin(void)
 }
 
 uint64_t nc_ke_pause_end(void)
+{
+    return time_write(false, 0);
+}
+
+/* XPSemu patch 201: the guest's time stands still while a device does at once what QEMU does with its clock
+ * stopped (a Sega Chihiro base board's 8051 started by the game: 8M cycles, ~0.75 s here). Not inside a pause. */
+bool nc_ke_freeze_begin(void)
+{
+    if (g_tstill) {
+        return false;
+    }
+    time_write(true, 0);
+    return true;
+}
+
+uint64_t nc_ke_freeze_end(void)
 {
     return time_write(false, 0);
 }
@@ -214,13 +235,13 @@ uint64_t nc_ke_host_ns(uint64_t guest_ns)
 {
     uint64_t sr, off, raw;
     if (!time_read(&sr, &off, &raw) || guest_ns + off <= sr) {
-        return guest_ns + off;          /* going on, or due before it stands still */
+        return nc_ff_host_ns(guest_ns + off);   /* going on, or due before it stands still */
     }
     /* due after it stands still: when it comes if the time goes on at once
      * (a deadline from the time going on, past by then, had a thread spin
      * through a hold), a millisecond at least while it stands */
     const uint64_t at = raw > sr ? raw : sr, d = guest_ns + off - sr;
-    return at + (raw > sr && d < 1000000u ? 1000000u : d);
+    return nc_ff_host_ns(at + (raw > sr && d < 1000000u ? 1000000u : d));
 }
 
 uint64_t nc_ke_now_ns(void)
@@ -452,10 +473,26 @@ static int wait_increment(NcKernel *k, const NcWait *w, int idx)
     return type <= 2 || type == 5;
 }
 
+/* XPSemu patch 198 (Sega Chihiro only): as NT, the DPCs queued go before a wait's timeout is judged. SEGABOOT's
+ * main thread sat at DISPATCH_LEVEL 272 ms (its sound start); the OHCI DPC that completes a board request waited,
+ * and when the IRQL fell the request's 100 ms wait was timed out first, the DPC ran after: SEGABOOT cancelled a
+ * request that was done and its cancel walk crashed (guest 7ffffff8 at 0x157c1). */
+bool nc_dpc_pending(void);
+
+static bool chihiro_dpc_first(NcKernel *k)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("NC_CHIHIRO") != NULL;
+    }
+    return on && (k->in_dpc || nc_dpc_pending());
+}
+
 uint64_t nc_ke_check_waits(NcKernel *k)
 {
     const uint64_t now = nc_ke_now_ns();
     uint64_t earliest = 0;
+    const bool dpc_first = chihiro_dpc_first(k);
     for (unsigned i = 0; i < NC_MAX_THREADS; i++) {
         NcThread *t = &k->threads[i];
         if (t->state != NC_T_WAITING) {
@@ -467,13 +504,19 @@ uint64_t nc_ke_check_waits(NcKernel *k)
             take(k, t, &t->wait, idx);
             nc_context_set_gpr(&t->ctx, NC_EAX, (uint32_t)idx);
             t->state = NC_T_READY;
-        } else if (t->wait.deadline_ns && now >= t->wait.deadline_ns) {
-            /* A delay ends successfully; a wait times out. */
+        } else if (t->wait.deadline_ns && now >= t->wait.deadline_ns && !(dpc_first && t->wait.count)) {
+            /* A delay ends successfully; a wait times out (Chihiro: once the queued DPCs ran, patch 198). */
             nc_ps_boost(k, t, 0);
             nc_context_set_gpr(&t->ctx, NC_EAX, t->wait.count ? NC_STATUS_TIMEOUT : NC_STATUS_SUCCESS);
             t->state = NC_T_READY;
         } else if (t->wait.deadline_ns && (!earliest || t->wait.deadline_ns < earliest)) {
             earliest = t->wait.deadline_ns;
+            if (dpc_first && now >= earliest) {
+                static unsigned logged;
+                if (logged++ < 20) {
+                    nc_log("hakuX-native", "ke: thread %u's wait timeout held: DPCs queued first (patch 198)", i);
+                }
+            }
         }
     }
     k->wait_due_ns = earliest;
@@ -513,6 +556,13 @@ static void poll_spin(NcKernel *k)
     }
     s_last = cur;
     if (++s_polls >= 64) {
+        /* patch 320: a thread that has polled for a millisecond has had its boost's worth: it goes, as NT's decay at
+         * a quantum's end (its slice never ends while it idles on the host between polls). Boosted by a wake a step
+         * above the threads of its priority, a poller kept them from running: SSX 3's render thread spinning on
+         * its GPU fence above the XAPI timer thread (EA's movie clock), a Bink thread above the decoder it polls. */
+        if (cur && now - s_spin_since > 1000000) {
+            nc_ps_unboost(k, cur);
+        }
         for (unsigned i = 0; i < k->threads_hi; i++) {
             const NcThread *t = &k->threads[i];
             if (t != cur && t->state == NC_T_READY && !t->suspend && nc_eff_priority(k, t) >= nc_eff_priority(k, cur)) {

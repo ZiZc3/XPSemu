@@ -41,6 +41,25 @@ static struct {
     uint64_t after;
 } g_vretire[HLE_MAX_VIEW_RETIRE];
 
+/* patch 326: MSAA copies dropped by a live change of the count (the quick
+ * menu): destroyed once the submission closing the recording that may use
+ * them completes, as the views above. */
+#define HLE_MAX_MS_RETIRE 64
+static struct {
+    VkImage img;
+    VkDeviceMemory mem;
+    VkImageView v;
+    uint64_t after;
+} g_msretire[HLE_MAX_MS_RETIRE];
+
+static void ms_retire_now(unsigned i)
+{
+    T.vkDestroyImageView(g_hvk.dev, g_msretire[i].v, NULL);
+    T.vkDestroyImage(g_hvk.dev, g_msretire[i].img, NULL);
+    T.vkFreeMemory(g_hvk.dev, g_msretire[i].mem, NULL);
+    memset(&g_msretire[i], 0, sizeof(g_msretire[i]));
+}
+
 static void retire_view(VkImageView v)
 {
     if (!v) {
@@ -186,6 +205,15 @@ static void destroy_now(HleVkSurf *s)
     }
     if (s->cube_view) {
         T.vkDestroyImageView(g_hvk.dev, s->cube_view, NULL);
+    }
+    if (s->ms_view) {                           /* patch 325: its MSAA copy */
+        T.vkDestroyImageView(g_hvk.dev, s->ms_view, NULL);
+    }
+    if (s->ms_img) {
+        T.vkDestroyImage(g_hvk.dev, s->ms_img, NULL);
+    }
+    if (s->ms_mem) {
+        T.vkFreeMemory(g_hvk.dev, s->ms_mem, NULL);
     }
     for (unsigned i = 0; s->img && s->general && i < HLE_MAX_VK_SURF; i++) {
         HleVkSurf *v = &g_surf[i];
@@ -433,6 +461,7 @@ bool hle_surf_ensure(HleVkSurf *s)
     }
     s->view_gen = ++g_view_gen;
     s->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    s->ms_ok = true;                            /* patch 325: both new, nothing in either */
     s->dirty = 0;
     s->rendered_levels = 0;
     s->sview_levels = 0;
@@ -461,6 +490,11 @@ void hle_surf_stamp_parked(uint64_t value)
             g_vretire[i].after = value;
         }
     }
+    for (unsigned i = 0; i < HLE_MAX_MS_RETIRE; i++) {
+        if (g_msretire[i].img && g_msretire[i].after == HLE_SURF_PARKED) {
+            g_msretire[i].after = value;
+        }
+    }
 }
 
 void hle_surf_reap(uint64_t completed)
@@ -477,6 +511,12 @@ void hle_surf_reap(uint64_t completed)
             g_vretire[i].after <= completed) {
             T.vkDestroyImageView(g_hvk.dev, g_vretire[i].v, NULL);
             g_vretire[i].v = VK_NULL_HANDLE;
+        }
+    }
+    for (unsigned i = 0; i < HLE_MAX_MS_RETIRE; i++) {
+        if (g_msretire[i].img && g_msretire[i].after != HLE_SURF_PARKED &&
+            g_msretire[i].after <= completed) {
+            ms_retire_now(i);
         }
     }
 }
@@ -596,6 +636,11 @@ void hle_surf_destroy_all(void)
             g_vretire[i].v = VK_NULL_HANDLE;
         }
     }
+    for (unsigned i = 0; i < HLE_MAX_MS_RETIRE; i++) {
+        if (g_msretire[i].img) {
+            ms_retire_now(i);               /* the device is idle (above) */
+        }
+    }
 }
 
 static void barrier_range(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect,
@@ -680,6 +725,15 @@ void hle_surf_written(HleVkSurf *s)
 void hle_surf_transition(VkCommandBuffer cb, HleVkSurf *s, VkImageLayout to)
 {
     s->rec_gen = g_rec_gen;                     /* every recorded use goes through here */
+    /* patch 325: a use that may write the single-sample image (a pass on it,
+     * a copy, an upload, zread / zwrite) leaves its MSAA copy behind: a pass
+     * loads the copy again only after one that cleared it (open_pass sets
+     * ms_ok again for the passes that render the copy). Reads keep it. */
+    if (to != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+        to != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
+        to != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
+        s->ms_ok = false;
+    }
     if (s->general) {
         general_use(cb, s, to);
         return;
@@ -800,5 +854,277 @@ VkImageView hle_surf_order_view(HleVkSurf *s, uint32_t ord)
     s->oview_levels = n;
     s->oview_gen = ++g_view_gen;
     return s->oview;
+}
+
+/* ---- MSAA (patch 325) -------------------------------------------------------
+ * The game's render targets and depth buffers are rendered multisampled at
+ * their own size (the resolution scale's), then resolved into the
+ * single-sample images at each pass's end (back.c open_pass: colour
+ * averaged, depth and stencil sample 0). The single-sample images stay what
+ * every other path uses: textures, copies, readbacks, zread / zwrite, the
+ * display and save states. The present path's upscaling and its FXAA / SMAA
+ * stay single-sample. Off (1) by default: then nothing here runs and every
+ * surface renders as before. Chosen per game before the start ("msaa=" start
+ * line, main_ps5.c), never changed while a game runs. */
+uint32_t g_hle_msaa = 1;
+
+void hle_vk_set_msaa(int samples)
+{
+    g_hle_msaa = samples >= 8 ? 8 : samples >= 4 ? 4 : samples >= 2 ? 2 : 1;
+}
+
+/* patch 326: the quick menu's MSAA row, any thread: only the count is kept
+ * here (0 none asked); the render thread makes it the one in use before its
+ * next pass (hle_surf_ms_apply). */
+static volatile uint32_t g_ms_req;
+
+void hle_vk_msaa_request(uint32_t samples)
+{
+    __atomic_store_n(&g_ms_req, samples >= 8 ? 8u : samples >= 4 ? 4u : samples >= 2 ? 2u : 1u,
+                     __ATOMIC_RELEASE);
+}
+
+void hle_surf_ms_apply(void)
+{
+    uint32_t n = __atomic_exchange_n(&g_ms_req, 0u, __ATOMIC_ACQUIRE);
+    if (!n || n == g_hle_msaa) {
+        return;
+    }
+    g_hle_msaa = n;
+    unsigned dropped = 0;
+    for (unsigned i = 0; i < HLE_MAX_VK_SURF; i++) {
+        HleVkSurf *s = &g_surf[i];
+        if (!s->alive) {
+            continue;
+        }
+        s->ms_failed = false;               /* tried again at the new count */
+        if (!s->ms_img || s->ms_samples == n) {
+            continue;
+        }
+        /* the open recording may use the copy: kept until its submission completes */
+        unsigned j = 0;
+        while (j < HLE_MAX_MS_RETIRE && g_msretire[j].img) {
+            j++;
+        }
+        if (j == HLE_MAX_MS_RETIRE) {
+            hle_vk_queue_lock();
+            const VkResult r = T.vkDeviceWaitIdle(g_hvk.dev);  /* full: rare, and safe */
+            hle_vk_queue_unlock();
+            hle_vk_check(r, "vkDeviceWaitIdle (MSAA copies)");
+            for (unsigned k = 0; k < HLE_MAX_MS_RETIRE; k++) {
+                if (g_msretire[k].img && g_msretire[k].after != HLE_SURF_PARKED) {
+                    ms_retire_now(k);
+                }
+            }
+            j = 0;
+            while (j < HLE_MAX_MS_RETIRE && g_msretire[j].img) {
+                j++;
+            }
+        }
+        if (j == HLE_MAX_MS_RETIRE) {
+            break;                          /* all parked by the open recording: the rest next time */
+        }
+        g_msretire[j].img = s->ms_img;
+        g_msretire[j].mem = s->ms_mem;
+        g_msretire[j].v = s->ms_view;
+        g_msretire[j].after = HLE_SURF_PARKED;
+        s->ms_img = VK_NULL_HANDLE;
+        s->ms_mem = VK_NULL_HANDLE;
+        s->ms_view = VK_NULL_HANDLE;
+        s->ms_samples = 0;
+        s->ms_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        /* a new copy holds nothing: loaded again only after a pass that clears it */
+        s->ms_ok = false;
+        dropped++;
+    }
+    hle_log("hle-msaa", "now %ux (live)%s, %u copies dropped", n, n > 1 ? "" : " (off)", dropped);
+}
+
+/* Bigger copies than this many samples (4x at 3840x2160) are made with fewer
+ * samples: the memory of a scale x6 target at 8x would run out. */
+#define MS_MAX_SAMPLES (4ull * 3840 * 2160)
+
+static struct {
+    bool probed, ok;                    /* the device can (Vulkan 1.3's dynamic rendering) */
+    VkSampleCountFlags col, dep, sten;  /* framebuffer limits */
+    bool zres, sres;                    /* depth / stencil resolve by sample 0 */
+    unsigned nlog;
+    struct { VkFormat f; uint32_t n; } logged[24];
+    uint32_t why_logged;                /* fallback reasons logged once each */
+} g_ms;
+
+static void ms_probe(void)
+{
+    g_ms.probed = true;
+    VkPhysicalDeviceDepthStencilResolveProperties dsr = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES };
+    VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                       .pNext = &dsr };
+    vkGetPhysicalDeviceProperties2(g_hvk.phys, &p2);
+    const VkPhysicalDeviceLimits *l = &p2.properties.limits;
+    g_ms.col = l->framebufferColorSampleCounts;
+    g_ms.dep = l->framebufferDepthSampleCounts;
+    g_ms.sten = l->framebufferStencilSampleCounts;
+    g_ms.zres = (dsr.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) != 0;
+    g_ms.sres = (dsr.supportedStencilResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) != 0;
+    /* compat.c's render passes have no resolve attachments: Vulkan 1.3's
+     * dynamic rendering only */
+    g_ms.ok = g_hvk.caps.vk13 && g_hvk.caps.dyn_render && g_hvk.caps.sync2;
+    hle_log("hle-msaa", "%ux asked; device: colour %s%s%s, depth %s%s%s, depth resolve %s, stencil "
+            "resolve %s, dynamic rendering %s", g_hle_msaa,
+            g_ms.col & 2 ? "2x " : "", g_ms.col & 4 ? "4x " : "", g_ms.col & 8 ? "8x" : "",
+            g_ms.dep & 2 ? "2x " : "", g_ms.dep & 4 ? "4x " : "", g_ms.dep & 8 ? "8x" : "",
+            g_ms.zres ? "yes" : "no", g_ms.sres ? "yes" : "no", g_ms.ok ? "yes" : "no (MSAA off)");
+}
+
+/* why: a bit per reason, each logged once */
+static uint32_t ms_skip(HleVkSurf *s, unsigned why, const char *text)
+{
+    s->ms_failed = true;
+    if (!(g_ms.why_logged & (1u << why))) {
+        g_ms.why_logged |= 1u << why;
+        hle_log("hle-msaa", "surface %u (%ux%u fmt %d): 1x, %s", s->id, s->w, s->h, (int)s->fmt,
+                text);
+    }
+    return 0;
+}
+
+static bool ms_colour_format(VkFormat f)
+{
+    /* the pictures' formats. R8 / R8G8 / R16 targets hold data (bump maps,
+     * depth halves read as colour): averaged edges would change values. */
+    return f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R5G6B5_UNORM_PACK16 ||
+           f == VK_FORMAT_A1R5G5B5_UNORM_PACK16;
+}
+
+uint32_t hle_surf_ms_prepare(HleVkSurf *s)
+{
+    if (s->ms_samples) {
+        return s->ms_samples;
+    }
+    if (g_hle_msaa < 2 || s->ms_failed || !s->img) {
+        return 0;
+    }
+    if (!g_ms.probed) {
+        ms_probe();
+    }
+    if (!g_ms.ok) {
+        return ms_skip(s, 0, "the device has no dynamic rendering of its own");
+    }
+    /* texture levels and faces (GENERAL), views and input-attachment targets
+     * keep their single-sample passes */
+    if (s->general || s->d.parent) {
+        return ms_skip(s, 1, "a texture's level or face");
+    }
+    if (s->local_read) {
+        return ms_skip(s, 2, "read by its own draws (input attachment)");
+    }
+    /* small render-to-texture targets (surf_scale's): simulations that rely
+     * on 1x sample positions (Morrowind's water ripples) */
+    if (MAX(s->d.w, s->d.h) <= SURF_UNSCALED_MAX) {
+        return ms_skip(s, 3, "a small render-to-texture target");
+    }
+    const bool depth = !(s->aspect & VK_IMAGE_ASPECT_COLOR_BIT);
+    const bool stencil = (s->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+    if (!depth && !ms_colour_format(s->fmt)) {
+        return ms_skip(s, 4, "a data format (no averaged edges)");
+    }
+    if (depth && (!g_ms.zres || (stencil && !g_ms.sres))) {
+        return ms_skip(s, 5, "no depth / stencil resolve");
+    }
+    const VkImageUsageFlags usage = depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                          : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkImageFormatProperties fp;
+    VkSampleCountFlags can = 0;
+    if (vkGetPhysicalDeviceImageFormatProperties(g_hvk.phys, s->fmt, VK_IMAGE_TYPE_2D,
+                                                 VK_IMAGE_TILING_OPTIMAL, usage, 0,
+                                                 &fp) == VK_SUCCESS) {
+        can = fp.sampleCounts & (depth ? g_ms.dep & (stencil ? g_ms.sten : ~0u) : g_ms.col);
+    }
+    uint32_t n = g_hle_msaa;
+    while (n > 1 && (!(can & n) || (uint64_t)n * s->w * s->h > MS_MAX_SAMPLES)) {
+        n >>= 1;
+    }
+    if (n < 2) {
+        return ms_skip(s, 6, "the format or size can't be multisampled");
+    }
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = s->fmt, .extent = { s->w, s->h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .samples = (VkSampleCountFlagBits)n, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = usage,                         /* an attachment only: never sampled or copied */
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (T.vkCreateImage(g_hvk.dev, &ici, NULL, &s->ms_img) != VK_SUCCESS) {
+        s->ms_img = VK_NULL_HANDLE;
+        return ms_skip(s, 7, "its image could not be made");
+    }
+    VkMemoryRequirements req;
+    T.vkGetImageMemoryRequirements(g_hvk.dev, s->ms_img, &req);
+    int mt = hle_vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = (uint32_t)mt };
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = s->ms_img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = s->fmt,
+        .subresourceRange = { s->aspect, 0, 1, 0, 1 } };
+    if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &s->ms_mem) != VK_SUCCESS ||
+        T.vkBindImageMemory(g_hvk.dev, s->ms_img, s->ms_mem, 0) != VK_SUCCESS ||
+        T.vkCreateImageView(g_hvk.dev, &vci, NULL, &s->ms_view) != VK_SUCCESS) {
+        T.vkDestroyImage(g_hvk.dev, s->ms_img, NULL);
+        if (s->ms_mem) {
+            T.vkFreeMemory(g_hvk.dev, s->ms_mem, NULL);
+        }
+        s->ms_img = VK_NULL_HANDLE;
+        s->ms_mem = VK_NULL_HANDLE;
+        s->ms_view = VK_NULL_HANDLE;
+        return ms_skip(s, 8, "no memory for its copy");
+    }
+    s->ms_samples = n;
+    s->ms_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    /* each kind (format, samples) logged once */
+    unsigned i = 0;
+    while (i < g_ms.nlog && !(g_ms.logged[i].f == s->fmt && g_ms.logged[i].n == n)) {
+        i++;
+    }
+    if (i == g_ms.nlog && i < ARRAY_SIZE(g_ms.logged)) {
+        g_ms.logged[g_ms.nlog++] = (typeof(g_ms.logged[0])){ s->fmt, n };
+        hle_log("hle-msaa", "%s fmt %d: %ux (surface %u, %ux%u, %.1f MB)%s",
+                depth ? "depth" : "colour", (int)s->fmt, n, s->id, s->w, s->h,
+                req.size / 1048576.0, n < g_hle_msaa ? " (fewer than asked: format or size)" : "");
+    }
+    return n;
+}
+
+void hle_surf_ms_begin(VkCommandBuffer cb, HleVkSurf *s)
+{
+    const bool depth = !(s->aspect & VK_IMAGE_ASPECT_COLOR_BIT);
+    const VkImageLayout to = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                   : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    const VkPipelineStageFlags2 st = depth ? VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                             VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT
+                                           : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    const VkAccessFlags2 wr = depth ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                                    : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    const VkAccessFlags2 rd = depth ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                                    : VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
+    /* the last pass's stores (and its resolve, in the colour output stage)
+     * before this one's loads */
+    VkImageMemoryBarrier2 b = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = st | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .srcAccessMask = s->ms_layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : wr,
+        .dstStageMask = st,
+        .dstAccessMask = rd | wr,
+        .oldLayout = s->ms_layout, .newLayout = to,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = s->ms_img, .subresourceRange = { s->aspect, 0, 1, 0, 1 } };
+    VkDependencyInfo di = {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b };
+    T.vkCmdPipelineBarrier2(cb, &di);
+    s->ms_layout = to;
+    s->rec_gen = g_rec_gen;
 }
 

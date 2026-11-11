@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -89,9 +90,17 @@ void rx_log_drain(void)
     __atomic_store_n(&g_draining, 0, __ATOMIC_RELEASE);
 }
 
+/* XPSemu patch 206: a Sega Chihiro start writes through the ring from the first line (no 20 s of synchronous
+ * writes): its USB thread logs under its lock, and a slow write held it 400-600 ms; OutRun 2's USB requests timed
+ * out and its cancel crashed. */
+static bool chihiro_no_sync(void)
+{
+    return getenv("NC_CHIHIRO") != NULL;     /* read each time: only inside the 20 s window, set after the first lines */
+}
+
 void rx_log_line(const char *text, size_t len)
 {
-    if (!g_started || now_ns() < g_sync_until_ns) {
+    if (!g_started || (now_ns() < g_sync_until_ns && !chihiro_no_sync())) {
         rx_log_write(text, len);
         return;
     }

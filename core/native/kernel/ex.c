@@ -422,7 +422,12 @@ static uint8_t *eeprom(NcKernel *k)
         nc_wr32(g_eeprom + 0xBC, pal ? 2 : 1);
         /* So do the video settings: the app's (widescreen, 480p...). */
         if (g_video_flags >= 0) {
-            nc_wr32(g_eeprom + 0x94, (uint32_t)g_video_flags);
+            /* PAL 60 makes a PAL title's console NTSC-M 60 Hz (0x58 above); the user flags then
+             * drop the PAL-60 bit, as no real NTSC console has it (patch 314). Thief: Deadly
+             * Shadows read "standard set + PAL-60 bit" as "ask for 50 Hz", the 60 Hz-only modes
+             * refused it, its renderer was never made and it crashed loading (0x521083). */
+            const bool pal60_ntsc = pal && (g_video_flags & 0x400000);
+            nc_wr32(g_eeprom + 0x94, (uint32_t)g_video_flags & (pal60_ntsc ? ~0x400000u : ~0u));
         }
         if (g_language) {
             nc_wr32(g_eeprom + 0x90, (uint32_t)g_language);
@@ -466,6 +471,13 @@ static const NvSetting *nv_find(uint32_t index)
 static uint64_t ExQueryNonVolatileSetting(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
     const NvSetting *s = nv_find(a[0]);
+    if (a[0] == 0x07 || a[0] == XC_MAX_OS) {      /* the game asks for its language (XPSemu patch 181) */
+        static unsigned asked;
+        if (asked++ < 4) {
+            nc_log("hakuX-native", "ex: the game asked for the %s: language %u", a[0] == 0x07 ? "language" : "whole user section",
+                   g_eeprom ? nc_rd32(g_eeprom + 0x90) : 0);
+        }
+    }
     if (!s) {
         nc_log("hakuX-native", "ex: non-volatile setting 0x%x not known", a[0]);
         return 0xC0000034u; /* STATUS_OBJECT_NAME_NOT_FOUND */
@@ -776,8 +788,11 @@ static uint64_t AvSetDisplayMode(NcKernel *k, NcFrame *f, const uint32_t *a)
     if (a[2]) {
         /* AV mode bit 30: the 50 Hz modes (PAL 576-line timings, as
          * 0x58030314 is); the 480-line, 480p and HD modes are 60 Hz. */
-        nc_dev_nv2a_refresh(a[2] & 0x40000000u ? 50 : 60);
-        nc_dev_nv2a_display_mode(a[4], a[3], a[2] & 0x40000000u ? 50 : 60, a[5]);
+        /* Sega Chihiro (XPSemu patch 213): its VGA modes set bits 31 and 30 together (OutRun 2: c0060601), and
+         * they're 60 Hz (the board's monitor); bit 30 alone stays the TV's 50 Hz */
+        const bool hz50 = (a[2] & 0x40000000u) && !((a[2] & 0x80000000u) && getenv("NC_CHIHIRO"));
+        nc_dev_nv2a_refresh(hz50 ? 50 : 60);
+        nc_dev_nv2a_display_mode(a[4], a[3], hz50 ? 50 : 60, a[5]);
     }
     return 0;
 }
@@ -904,6 +919,20 @@ static uint64_t HalReturnToFirmware(NcKernel *k, NcFrame *f, const uint32_t *a)
     const uint32_t page = slot ? nc_vm_rd32(k->vm, slot) : 0;
     char xbe[LAUNCH_PATH_LEN] = "", host[512];
     bool go = false;
+    if (a[0] == 2 && page && getenv("NC_CHIHIRO")) {
+        /* Sega Chihiro (XPSemu patch 208): a reboot to the dashboard (none named, or the Xbox's) goes back to
+         * SEGABOOT, the board's own boot (\Device\CdRom0\default.xbe here), as the game's Test button does to
+         * reach the test menu; the launch data page goes along. The Xbox dashboard isn't a Chihiro's. */
+        uint8_t *pg = nc_vm_host(k->vm, page);
+        char named[LAUNCH_PATH_LEN] = "";
+        const bool has = nc_kernel_launch_xbe(pg, named, sizeof(named));
+        if (!has || !strcasecmp(named, NC_DASHBOARD_PATH) || strncasecmp(named, "\\Device\\CdRom0", 14)) {
+            nc_log("hakuX-native", "Chihiro: reboot (launch type %u, to %s): back to SEGABOOT", nc_rd32(pg),
+                   has ? named : "the dashboard");
+            memset(pg + LAUNCH_PATH_OFF, 0, LAUNCH_PATH_LEN);
+            snprintf((char *)pg + LAUNCH_PATH_OFF, LAUNCH_PATH_LEN, "%s", "\\Device\\CdRom0;default.xbe");
+        }
+    }
     if (a[0] == 2 && page) {
         uint8_t *pg = nc_vm_host(k->vm, page);
         const bool named = nc_kernel_launch_xbe(pg, xbe, sizeof(xbe));
@@ -918,6 +947,27 @@ static uint64_t HalReturnToFirmware(NcKernel *k, NcFrame *f, const uint32_t *a)
         const bool ok = fp && fwrite(nc_vm_host(k->vm, page), 1, NC_LAUNCH_PAGE, fp) == NC_LAUNCH_PAGE;
         if (fp) {
             fclose(fp);
+        }
+        const char *cfs = getenv("NC_CHIHIRO_FS");
+        if (ok && cfs && *cfs && !strncasecmp(xbe, "\\Device\\CdRom0\\", 15) && strcasecmp(xbe + 15, "default.xbe") &&
+            strcasecmp(xbe + 15, "segaboot_old.xbe")) {
+            /* Sega Chihiro (XPSemu patch 212): SEGABOOT hands the game over: its launch data page kept beside the
+             * game's unpacked image, the dashboard starts the game with it next time (no SEGABOOT, the quick
+             * start) */
+            const uint8_t *pg = nc_vm_host(k->vm, page);
+            char keep[600];
+            snprintf(keep, sizeof(keep), "%s.launch.bin", cfs);
+            FILE *kf = fopen(keep, "wb");
+            const bool kept = kf && fwrite(pg, 1, NC_LAUNCH_PAGE, kf) == NC_LAUNCH_PAGE;
+            if (kf) {
+                fclose(kf);
+            }
+            char hex[3 * 32 + 1] = "";
+            for (int i = 0; i < 32; i++) {
+                snprintf(hex + 3 * i, 4, " %02x", pg[0x400 + i]);
+            }
+            nc_log("hakuX-native", "Chihiro: SEGABOOT starts %s (launch type %u, title %08x); its page %s %s; data:%s",
+                   xbe, nc_rd32(pg), nc_rd32(pg + 4), kept ? "kept in" : "NOT kept in", keep, hex);
         }
         if (ok) {
             k->relaunch = true;
@@ -1037,6 +1087,12 @@ void nc_kernel_title_loaded(NcKernel *k, const NcDisc *disc, const NcDiscFile *x
     const uint32_t cert = nc_vm_rd32(k->vm, xbe_base + 0x118);
     const uint32_t region = nc_vm_rd32(k->vm, cert + 0xA0);
     k->game_region = region & 1 ? 1 : region & 2 ? 2 : region & 4 ? 4 : 1;
+    if (getenv("NC_CHIHIRO") && k->game_region == 4) {
+        /* Sega Chihiro (XPSemu patch 211): the board is NTSC timing, 60 Hz (480p on its VGA); an export title
+         * (region 4 only) made the console PAL and the game ran at 50 */
+        nc_log("hakuX-native", "Chihiro: title region %08x: NTSC (60 Hz), as the board", region);
+        k->game_region = 1;
+    }
     nc_io_set_cache_game(nc_vm_rd32(k->vm, cert + 8));
 
     /* XeImageFileName: ANSI_STRING { Length, MaximumLength, Buffer }. */

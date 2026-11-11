@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <ctype.h>
 #include <math.h>
 #include <sstream>
 #include <time.h>
@@ -39,6 +40,10 @@
 static const char *const kOptionKeys[GO__COUNT] = {
     "resolution", "screen_shape", "picture_fit", "smoothing",
     "dsp",        "volume",       "overlay",      "anti_aliasing", "fps_cap",
+    "anisotropic_filtering", "cas_sharpness", "texture_sharpness", "crt_filter",
+    "adaptive_triggers", "gyro_aim", "turbo", "msaa",
+    "msaa_cutouts", "movie_upscaler",       // patch 354, 355
+    "ambient_occlusion",                    // patch 363
 };
 
 const char *GameOptionName(int option)
@@ -47,6 +52,10 @@ const char *GameOptionName(int option)
         "Resolution",     "Screen shape",          "Picture fit",
         "Upscaling",      "Audio processor (DSP)", "Volume",
         "FPS counter",    "Anti-aliasing", "FPS cap",
+        "Anisotropic filtering", "AMD CAS sharpness", "Texture sharpness", "CRT filter",
+        "Adaptive triggers", "Gyro aim", "Turbo buttons", "MSAA",
+        "MSAA smooth cut-outs", "Movie upscaler",       // patch 354, 355
+        "Ambient occlusion",                            // patch 363
     };
     return names[option];
 }
@@ -58,13 +67,31 @@ const char *GameOptionHelp(int option)
         "Auto follows the game, and goes 16:9 when a widescreen patch is on. "
         "16:9 here also tells the game the console is set to widescreen.",
         "Stretch fills the whole screen.",
-        "How a picture smaller than the screen is enlarged. Sharp uses SGSR; Smooth is plain bilinear.",
+        "How the picture is enlarged to the screen. Sharp uses SGSR; AMD CAS sharpens, best with anti-aliasing on.",
         "Keep it Off: very slow on the PS5 and games stall. Only if this "
         "game has no sound without it.",
         "How loud this game is.",
         "In the corner while this game runs: the frame rate, or Full for frame time, CPU, memory and resolution too.",
-        "Smooths jagged edges. FXAA is light, SMAA is sharper, SSAA draws at x6 and averages it down (the heaviest).",
+        "Smooths jagged edges. FXAA is light, SMAA is sharper, SSAA draws at x6 and averages it down; SSAA + SMAA smooths that once more (the smoothest, and the heaviest).",
         "Holds the game at this rate. Custom lets you type any number. A game whose speed is tied to its frames slows down with it.",
+        "Sharper textures on floors, roads and walls seen at an angle. Higher is sharper; 16x costs a little more GPU.",
+        "How much AMD CAS sharpens: 0.0 is the lightest, 1.0 the strongest. Only with Upscaling on AMD CAS.",
+        "Sharper textures by picking more detailed mipmaps. Works with anisotropic filtering and CAS. High can shimmer in some games.",
+        "An old TV's look over the picture. Scanlines draws dark lines between the game's own 480 lines; CRT adds a slight curve, darker corners and a light shadow mask.",
+        "Triggers push back. Heavy: harder to press. Trigger: a click like a gun. Auto: picks for known games.",
+        "Tilt the controller to aim or look around, on top of the right stick. Higher turns faster.",
+        "Hold a turbo button and the game sees it pressed again and again, about 15 times a second: nonstop "
+        "fire in shooters, button mashing done for you. With your own button mapping, it follows the Xbox button behind it.",
+        "Smooths the jagged edges of the game's 3D shapes as they are drawn: 2x, 4x or 8x samples per pixel. "
+        "Higher is smoother and uses more of the GPU. Works with the other anti-aliasing. Used from the next start.",
+        // patch 354
+        "With MSAA on, also smooths the edges of see-through cut-outs: grass, leaves, fences, hair. "
+        "Does nothing while MSAA is Off.",
+        // patch 355
+        "Makes the game's videos sharper when Resolution is above x1. Only videos change, nothing else in the game.",
+        // patch 363
+        "Soft shadows in corners and where things meet, for more depth in 3D scenes. "
+        "Low is subtle, High is stronger. Uses a little more of the GPU; a few games show none.",
     };
     return help[option];
 }
@@ -73,7 +100,7 @@ const char *GameOptionHelp(int option)
 static std::vector<int> Choices(int option)
 {
     switch (option) {
-    case GO_SCALE: return { 1, 2, 3, 4, 5, 6 };
+    case GO_SCALE: return { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };   // patch 328: up to x10 (user: "for fun")
     case GO_ASPECT:
         return { CONFIG_DISPLAY_UI_ASPECT_RATIO_AUTO,
                  CONFIG_DISPLAY_UI_ASPECT_RATIO_4X3,
@@ -81,13 +108,26 @@ static std::vector<int> Choices(int option)
     case GO_FIT:
         return { CONFIG_DISPLAY_UI_FIT_SCALE, CONFIG_DISPLAY_UI_FIT_STRETCH };
     case GO_FILTER:
-        return { CONFIG_UPSCALE_SHARP, CONFIG_UPSCALE_SMOOTH };
+        return { CONFIG_UPSCALE_SMOOTH, CONFIG_UPSCALE_SHARP, CONFIG_UPSCALE_CAS };
     case GO_DSP: return { 1, 0 };
     case GO_VOLUME: return { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
     case GO_OVERLAY:
         return { CONFIG_FPS_ON, CONFIG_FPS_FULL, CONFIG_FPS_OFF };
-    case GO_AA: return { 0, 1, 2, 3 };
+    case GO_AA: return { 0, 1, 2, 3, 4 };
     case GO_FPS_CAP: return { 0, 30, 60, 90, GO_FPS_CAP_CUSTOM };
+    case GO_AF: return { 0, 2, 4, 8, 16 };
+    case GO_CAS: return { 0, 1, 2, 3, 4 };
+    case GO_TEXSHARP: return { 0, 1, 2, 3 };
+    case GO_CRT: return { 0, 1, 2 };
+    case GO_TRIGGERS: return { TRIGGERS_OFF, TRIGGERS_DRIVING, TRIGGERS_SHOOTER };     // Auto is the default
+    case GO_GYRO: return { 1, 2, 3 };     // Off is the default
+    case GO_TURBO:                        // Off is the default
+        return { TURBO_A, TURBO_B, TURBO_X, TURBO_Y, TURBO_RT, TURBO_A | TURBO_X, TURBO_A | TURBO_B | TURBO_X | TURBO_Y,
+                 TURBO_A | TURBO_B | TURBO_X | TURBO_Y | TURBO_RT | TURBO_LT };
+    case GO_MSAA: return { 2, 4, 8 };     // patch 325: Off is the default
+    case GO_A2C: return { 0 };            // patch 354: On is the default
+    case GO_MOVIEUP: return { 0 };        // patch 355: On is the default
+    case GO_SSAO: return { 0, 1, 2 };     // patch 367: a Video setting too (per game: Default is it)
     }
     return {};
 }
@@ -96,7 +136,8 @@ const char *GameOptionValueName(int option, int value)
 {
     static char buf[16];
     if (value == GAME_DEFAULT) {
-        return "Default";
+        return option == GO_TRIGGERS ? "Auto" : option == GO_GYRO || option == GO_TURBO || option == GO_MSAA ? "Off" :
+               option == GO_A2C || option == GO_MOVIEUP ? "On" : "Default";     // patch 354, 355
     }
     switch (option) {
     case GO_SCALE:
@@ -111,7 +152,7 @@ const char *GameOptionValueName(int option, int value)
     case GO_FIT:
         return value == CONFIG_DISPLAY_UI_FIT_STRETCH ? "Stretch" : "Fit";
     case GO_FILTER:
-        return value == CONFIG_UPSCALE_SHARP ? "Sharp" : "Smooth";
+        return value == CONFIG_UPSCALE_SHARP ? "Sharp" : value == CONFIG_UPSCALE_CAS ? "AMD CAS" : "Smooth";
     case GO_DSP: return value ? "On" : "Off";
     case GO_VOLUME:
         snprintf(buf, sizeof(buf), "%d%%", value * 10);
@@ -119,7 +160,7 @@ const char *GameOptionValueName(int option, int value)
     case GO_OVERLAY:
         return value == CONFIG_FPS_FULL ? "Full" : value == CONFIG_FPS_ON ? "FPS" : "Off";
     case GO_AA:
-        return value == 1 ? "FXAA" : value == 2 ? "SMAA" : value == 3 ? "SSAA" : "Off";
+        return value == 1 ? "FXAA" : value == 2 ? "SMAA" : value == 3 ? "SSAA" : value == 4 ? "SSAA + SMAA" : "Off";
     case GO_FPS_CAP:
         if (value == 0) {
             return "Off";
@@ -129,6 +170,39 @@ const char *GameOptionValueName(int option, int value)
         }
         snprintf(buf, sizeof(buf), "%d FPS", value);
         return buf;
+    case GO_AF:
+        if (value < 2) {
+            return "Off";
+        }
+        snprintf(buf, sizeof(buf), "%dx", value);
+        return buf;
+    case GO_CAS: {
+        static const char *const k[5] = { "0.0", "0.25", "0.5", "0.75", "1.0" };
+        return k[std::clamp(value, 0, 4)];
+    }
+    case GO_TEXSHARP: {
+        static const char *const k[4] = { "Off", "Low", "Medium", "High" };
+        return k[std::clamp(value, 0, 3)];
+    }
+    case GO_CRT: return value == 2 ? "CRT" : value == 1 ? "Scanlines" : "Off";
+    case GO_TRIGGERS: return value == TRIGGERS_DRIVING ? "Heavy" : value == TRIGGERS_SHOOTER ? "Trigger" : "Off";
+    case GO_GYRO: return value >= 3 ? "High" : value == 2 ? "Medium" : "Low";
+    case GO_TURBO:
+        switch (value) {
+        // patch 327: the DualSense's names (the Xbox's A B X Y RT under the default layout)
+        case TURBO_A: return "Cross";
+        case TURBO_B: return "Circle";
+        case TURBO_X: return "Square";
+        case TURBO_Y: return "Triangle";
+        case TURBO_RT: return "R2";
+        case TURBO_A | TURBO_X: return "Cross + Square";
+        case TURBO_A | TURBO_B | TURBO_X | TURBO_Y: return "All buttons";
+        default: return "All buttons + L2, R2";
+        }
+    case GO_MSAA: return value >= 8 ? "8x" : value >= 4 ? "4x" : value >= 2 ? "2x" : "Off";
+    case GO_A2C:
+    case GO_MOVIEUP: return value ? "On" : "Off";     // patch 354, 355
+    case GO_SSAO: return value >= 2 ? "High" : value == 1 ? "Low" : "Off";     // patch 363
     }
     return "";
 }
@@ -151,6 +225,87 @@ int GameOptionStep(int option, int value, int step, bool with_default)
     auto it = std::find(choices.begin(), choices.end(), value);
     int i = it == choices.end() ? 0 : it - choices.begin();
     return choices[((i + step) % n + n) % n];
+}
+
+// patch 266: the adaptive triggers' kind of game. By title ID, then by name for the series with many IDs.
+int TriggersBuiltIn(const std::string &key, const std::string &name)
+{
+    static const char *const driving[] = {
+        "4541005B",     // Burnout 3: Takedown
+        "45410076",     // Burnout Revenge
+        "41430019",     // Burnout 2: Point of Impact
+        "4D53004B",     // Project Gotham Racing 2
+        "4D530003",     // Project Gotham Racing
+        "54540079",     // Midnight Club 3: DUB Edition Remix
+        "45410028",     // Need for Speed: Hot Pursuit 2
+        "45410047",     // Need for Speed: Underground
+        "4541005A",     // Need for Speed: Underground 2
+        "4541007B",     // Need for Speed: Most Wanted
+        "4541009E",     // Need for Speed: Carbon
+        "434D0001",     // Colin McRae Rally 3
+        "434D002B",     // Colin McRae Rally 2005
+        "434D0011",     // TOCA Race Driver 2
+        "434D0050",     // TOCA Race Driver 3
+        "4D53002A",     // Midtown Madness 3
+    };
+    static const char *const shooter[] = {
+        "4D530004",     // Halo: Combat Evolved
+        "4D530064",     // Halo 2
+        "55530008",     // Far Cry Instincts
+        "55530060",     // Far Cry Instincts: Evolution
+        "45410083",     // Black
+        "4D530051",     // Conker: Live & Reloaded
+        "4553000A",     // TimeSplitters 2
+        "4156002A",     // Call of Duty: Finest Hour
+        "41560051",     // Call of Duty 2: Big Red One
+        "4156005D",     // Call of Duty 3
+        "45410091",     // Half-Life 2
+        "4541001A",     // Medal of Honor: Frontline
+        "4541003F",     // Medal of Honor: Rising Sun
+        "4541005E",     // Medal of Honor: European Assault
+        "41560020",     // DOOM 3
+        "4156004E",     // DOOM 3: Resurrection of Evil
+    };
+    for (const char *k : driving) {
+        if (key == k) {
+            return TRIGGERS_DRIVING;
+        }
+    }
+    for (const char *k : shooter) {
+        if (key == k) {
+            return TRIGGERS_SHOOTER;
+        }
+    }
+    std::string n = name;
+    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)tolower(c); });
+    static const char *const driving_names[] = {
+        "outrun", "out run", "need for speed", "burnout", "gotham", "midnight club", "forza", "rallisport",
+    };
+    for (const char *w : driving_names) {
+        if (n.find(w) != std::string::npos) {
+            return TRIGGERS_DRIVING;
+        }
+    }
+    if (n.rfind("halo", 0) == 0) {
+        return TRIGGERS_SHOOTER;
+    }
+    return TRIGGERS_OFF;
+}
+
+int TriggersChihiro(const std::string &id)
+{
+    if (id == "SGBZ" || id == "SBFY" || id == "SBHQ" || id == "SBKD") {    // OutRun 2, Crazy Taxi, Maximum Tune 1 / 2
+        return TRIGGERS_DRIVING;
+    }
+    if (id == "SBFN" || id == "SBFZ" || id == "SBHU") {    // House of the Dead 3, Virtua Cop 3, Ghost Squad
+        return TRIGGERS_SHOOTER;
+    }
+    return TRIGGERS_OFF;
+}
+
+int TriggersFor(const std::string &key, const std::string &name, int choice)
+{
+    return choice == GAME_DEFAULT ? TriggersBuiltIn(key, name) : std::clamp(choice, 0, 2);
 }
 
 std::string GameKey(uint32_t title_id, const std::string &fallback)
@@ -176,7 +331,7 @@ static bool g_scale_now;
 
 static void ReadConfig(int values[GO__COUNT])
 {
-    values[GO_SCALE] = std::clamp(g_cfg.scale, 1, 6);
+    values[GO_SCALE] = std::clamp(g_cfg.scale, 1, 10);
     values[GO_ASPECT] = g_cfg.aspect;
     values[GO_FIT] = g_cfg.fit;
     values[GO_FILTER] = g_cfg.upscale;
@@ -185,6 +340,17 @@ static void ReadConfig(int values[GO__COUNT])
     values[GO_OVERLAY] = g_cfg.fps;
     values[GO_AA] = g_cfg.aa;
     values[GO_FPS_CAP] = g_cfg.fps_cap;
+    values[GO_AF] = g_cfg.af;
+    values[GO_CAS] = g_cfg.cas;
+    values[GO_TEXSHARP] = g_cfg.texsharp;
+    values[GO_CRT] = g_cfg.crt;
+    values[GO_TRIGGERS] = GAME_DEFAULT;     // patch 266: per game only (Auto), no setting of the user's
+    values[GO_GYRO] = GAME_DEFAULT;         // (Off)
+    values[GO_TURBO] = GAME_DEFAULT;        // (Off), per game only
+    values[GO_MSAA] = GAME_DEFAULT;         // patch 325: (Off), per game only
+    values[GO_A2C] = GAME_DEFAULT;          // patch 354: (On), per game only
+    values[GO_MOVIEUP] = GAME_DEFAULT;      // patch 355: (On), per game only
+    values[GO_SSAO] = g_cfg.ssao;           // patch 367: the Video setting (patch 363 was per game only)
 }
 
 static void WriteConfig(const int values[GO__COUNT], bool)
@@ -197,6 +363,11 @@ static void WriteConfig(const int values[GO__COUNT], bool)
     g_cfg.fps = values[GO_OVERLAY];
     g_cfg.aa = values[GO_AA];
     g_cfg.fps_cap = values[GO_FPS_CAP];
+    g_cfg.af = values[GO_AF];
+    g_cfg.cas = values[GO_CAS];
+    g_cfg.texsharp = values[GO_TEXSHARP];
+    g_cfg.crt = values[GO_CRT];
+    g_cfg.ssao = values[GO_SSAO];           // patch 367
 }
 
 //
@@ -279,12 +450,9 @@ static void Pal60Load()
 bool Pal60On(const std::string &key)
 {
     Pal60Load();
-    if (g_pal60_off.count(key)) {
-        return false;
-    }
-    return g_pal60_on.count(key) || key == "4D5300D1" ||    // Fable: 25 fps at 50 Hz, 30 at 60
-           key == "54540086" || key == "545400A4" || key == "54540095" || key == "545400A5" ||  // GTA San Andreas, the same
-           key == "5553001D";       // Prince of Persia: The Sands of Time, 30 fps at 60 Hz
+    // On for every PAL game by default (user, patch 313), like a real Xbox with PAL 60 set in its dashboard:
+    // a game that supports 60 Hz picks it, one that doesn't stays at 50 Hz. "-key" in pal60.txt turns one game off.
+    return !g_pal60_off.count(key);
 }
 
 void Pal60Toggle(const std::string &key)
@@ -347,14 +515,31 @@ std::string FrameGenLine(const std::string &key)
     return mode == 0 ? std::string() : mode == 1 ? std::string("framegen=auto\n") : "framegen=" + std::to_string(mode) + "\n";
 }
 
-static std::set<std::string> g_unlock_off;
+static std::set<std::string> g_unlock_off;   // "-KEY": a game on by default, turned off
+static std::set<std::string> g_unlock_on;    // "+KEY": a game off by default, turned on
 static bool g_unlock_loaded;
 static const char *const kUnlockFile = "/data/xpsemu/unlock60.txt";
+
+// Games whose Unlock 60 is offered but OFF until the player turns it on: their timing was read from the
+// code, not yet played through at 60.
+static bool Unlock60DefaultOff(const std::string &key)
+{
+    // Black was offered here (patch 313) and removed (patch 314): at 60 its play ran fast (user test) -
+    // its gameplay steps per frame; only its RenderWare timers follow the clock.
+    (void)key;
+    return false;
+}
 
 bool Unlock60Known(const std::string &key)
 {
     return key == "41560020" || key == "45410091" ||    // Doom 3, Half-Life 2
-           key == "56550039";                           // Hulk: Ultimate Destruction (patch 140)
+           key == "56550039" ||                         // Hulk: Ultimate Destruction (patch 140)
+           key == "4E4D0009" ||                         // Breakdown (patch 346): on, to test - removed if its play
+                                                        // runs fast at 60
+           key == "4D53002A" ||                         // Midtown Madness 3: measured, averaged frame time (main
+                                                        // loop 0x1e6c87, timer on the trapped rdtsc 0x9f814); user
+                                                        // played it at 60: perfect
+           Unlock60DefaultOff(key);
 }
 
 bool Fps60Wanted(const std::string &key)
@@ -366,10 +551,12 @@ bool Fps60Wanted(const std::string &key)
         while (std::getline(f, line)) {
             if (line.size() > 1 && line[0] == '-') {
                 g_unlock_off.insert(line.substr(1));
+            } else if (line.size() > 1 && line[0] == '+') {
+                g_unlock_on.insert(line.substr(1));
             }
         }
     }
-    return !g_unlock_off.count(key);
+    return Unlock60DefaultOff(key) ? g_unlock_on.count(key) != 0 : !g_unlock_off.count(key);
 }
 
 bool Unlock60On(const std::string &key)
@@ -379,7 +566,14 @@ bool Unlock60On(const std::string &key)
 
 void Unlock60Toggle(const std::string &key)
 {
-    if (Fps60Wanted(key)) {
+    const bool on = Fps60Wanted(key);
+    if (Unlock60DefaultOff(key)) {
+        if (on) {
+            g_unlock_on.erase(key);
+        } else {
+            g_unlock_on.insert(key);
+        }
+    } else if (on) {
         g_unlock_off.insert(key);
     } else {
         g_unlock_off.erase(key);
@@ -387,6 +581,9 @@ void Unlock60Toggle(const std::string &key)
     std::ofstream f(kUnlockFile);
     for (const std::string &k : g_unlock_off) {
         f << "-" << k << "\n";
+    }
+    for (const std::string &k : g_unlock_on) {
+        f << "+" << k << "\n";
     }
 }
 
@@ -401,6 +598,15 @@ GameProfile GameProfileLoad(const std::string &key)
             continue;
         }
         std::string name = line.substr(0, eq);
+        if (name == "button_mapping") {     // patch 269
+            XbPadMap m;
+            if (xemu_ps5_padmap_parse(line.c_str() + eq + 1, &m)) {
+                char text[64];
+                xemu_ps5_padmap_format(&m, text, sizeof(text));
+                profile.padmap = text;
+            }
+            continue;
+        }
         int value = atoi(line.c_str() + eq + 1);
         for (int i = 0; i < GO__COUNT; i++) {
             std::vector<int> ok = Choices(i);
@@ -425,6 +631,10 @@ void GameProfileSave(const std::string &key, const GameProfile &profile)
             out << kOptionKeys[i] << "=" << profile.value[i] << "\n";
             any = true;
         }
+    }
+    if (!profile.padmap.empty()) {      // patch 269
+        out << "button_mapping=" << profile.padmap << "\n";
+        any = true;
     }
     if (any) {
         std::ofstream(file, std::ios::trunc) << out.str();

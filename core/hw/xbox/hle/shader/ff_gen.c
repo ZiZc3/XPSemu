@@ -487,6 +487,19 @@ static const char *k_cmp[8] = {
     "false", "a < r", "a == r", "a <= r", "a > r", "a != r", "a >= r", "true",
 };
 
+/* patch 334: stage s's signed channels (HleFfStage.sgn) as the NV2A reads
+ * them, -1..1, before anything uses the texel */
+static void sign_decode(Buf *b, const HleFfStage *st, unsigned s)
+{
+    const unsigned ob = st->sgn & 15, raw = (st->sgn >> 4) & 15 & ~ob;
+    for (unsigned c = 0; c < 4; c++) {
+        if (((ob | raw) >> c) & 1) {
+            put(b, "  t%u.%c = %s(t%u.%c);\n", s, "rgba"[c], (ob >> c) & 1 ? "sgnob" : "sgnraw",
+                s, "rgba"[c]);
+        }
+    }
+}
+
 size_t hle_ff_ps_glsl(const HleFfPsKey *k, char *buf, size_t cap)
 {
     Buf b = { buf, cap, 0, false };
@@ -515,6 +528,17 @@ size_t hle_ff_ps_glsl(const HleFfPsKey *k, char *buf, size_t cap)
     if (k->fbfetch & HLE_FB_ZEQ) {
         put(&b, HLE_ZEQ_DECL_GLSL);
     }
+    bool sgn = false;
+    for (unsigned s = 0; s < k->nstages; s++) {
+        sgn |= k->st[s].texture && k->st[s].sgn;
+    }
+    if (sgn) {          /* patch 334: a channel offset binary, or as stored, over 127 */
+        put(&b, "float sgnob(float c) { return max((c * 255.0 - 128.0) / 127.0, -1.0); }\n"
+                "float sgnraw(float c) {\n"
+                "  float v = floor(c * 255.0 + 0.5);\n"
+                "  return max((v >= 128.0 ? v - 256.0 : v) / 127.0, -1.0);\n"
+                "}\n");
+    }
     put(&b, "void main() {\n  vec4 cur = vDiffuse, tmp = vec4(0.0), r;\n");
     if (k->wbuf) {
         put(&b, HLE_WBUF_CALC_GLSL);
@@ -525,6 +549,7 @@ size_t hle_ff_ps_glsl(const HleFfPsKey *k, char *buf, size_t cap)
             /* the target drawn into: this pixel as the earlier draws left it
              * (an 8-bit target holds blue: back to its colour) */
             put(&b, "  vec4 t%u = subpassLoad(uFb)%s;\n", s, k->out_bgra ? ".bgra" : "");
+            sign_decode(&b, st, s);             /* patch 334: the target's (as stored) */
             if (st->alpha_kill) {
                 put(&b, "  if (t%u.a == 0.0) discard;\n", s);
             }
@@ -542,6 +567,7 @@ size_t hle_ff_ps_glsl(const HleFfPsKey *k, char *buf, size_t cap)
             put(&b, "  vec4 t%u = texture(sampler2D(uTex2D[nonuniformEXT(pc.tex[%u] & 0xFFFFu)], "
                     "uSmp[nonuniformEXT(pc.tex[%u] >> 16)]), uv%u);\n",
                 s, s, s, s);
+            sign_decode(&b, st, s);             /* patch 334 */
             if (st->alpha_kill) {               /* D3DTSS_ALPHAKILL */
                 put(&b, "  if (t%u.a == 0.0) discard;\n", s);
             }
@@ -585,7 +611,9 @@ size_t hle_ff_ps_glsl(const HleFfPsKey *k, char *buf, size_t cap)
     if (k->fog) {
         put(&b, "  cur.rgb = mix(unpackUnorm4x8(pc.fog_color).zyx, cur.rgb, fogf);\n");
     }
-    if (k->alpha_test && k->alpha_func < 8) {
+    if (k->alpha_test && (k->alpha_func & HLE_A2C_BIT)) {
+        put(&b, "%s", HLE_A2C_GLSL("cur"));    /* patch 354: MSAA alpha-to-coverage */
+    } else if (k->alpha_test && k->alpha_func < 8) {
         put(&b, "  { float a = cur.a, r = pc.alpha_ref; if (!(%s)) discard; }\n",
             k_cmp[k->alpha_func]);
     }

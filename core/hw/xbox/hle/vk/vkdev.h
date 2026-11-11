@@ -90,7 +90,12 @@ typedef struct HleCaps {
                                    cache only (vk/draw.c, asynchronous builds) */
     bool swapchain;             /* the Android surface and VK_KHR_swapchain: the window's
                                    presenter (vk/swapchain.c) */
+    /* patch 341: fillModeNonSolid (point / line polygon modes), and
+     * VK_EXT_provoking_vertex's last vertex (enabled where present) */
+    bool fill_nonsolid, pv_last;
     float max_lod_bias;         /* maxSamplerLodBias */
+    float max_aniso;            /* maxSamplerAnisotropy: the most of it a sampler can ask
+                                   (with aniso; vk/draw.c sampler_index, patch 241) */
 } HleCaps;
 
 typedef struct HleVk {

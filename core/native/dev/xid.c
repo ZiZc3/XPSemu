@@ -12,6 +12,7 @@
  * it from a file (debug.hakux.env holds 91 characters).
  */
 #include "native/dev/usb.h"
+#include "native/dev/chihiro/chihiro_usb.h"
 #include "native/core/irq.h"
 #include "hw/xbox/hle/vk/back.h"
 
@@ -315,6 +316,9 @@ NcUsbDev *nc_xid_gamepad_new(unsigned player)
 
 void nc_pad_set(unsigned player, const NcPadState *s)
 {
+    if (player == 0 && nc_chihiro_usb_enabled()) {
+        nc_chihiro_pad_input(s);        /* Sega Chihiro: the JVS I/O board's controls (patch 207) */
+    }
     if (player < XID_PLAYERS) {
         pthread_mutex_lock(&g_lock);
         g_pad[player] = *s;
@@ -324,6 +328,13 @@ void nc_pad_set(unsigned player, const NcPadState *s)
 
 void nc_pad_rumble(unsigned player, uint16_t *left, uint16_t *right)
 {
+    if (player == 0 && nc_chihiro_usb_enabled()) {
+        nc_chihiro_rumble(left, right);     /* Sega Chihiro: the drive board's force feedback (patch 209) */
+        if (nc_paused()) {
+            *left = *right = 0;
+        }
+        return;
+    }
     if (player < XID_PLAYERS) {
         pthread_mutex_lock(&g_lock);
         *left = g_rumble[player][0];

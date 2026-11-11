@@ -667,12 +667,17 @@ static uint32_t rx_free_block(const NcVm *vm)
     return UINT32_MAX;
 }
 
+uint32_t nc_mm_slack_bytes(void);   /* mm.c */
+
 static uint32_t rx_free_pages(const NcVm *vm)
 {
     uint32_t used = 0;
     for (uint32_t p = 0; p < vm->ram_size / NC_PAGE; p++) {
         used += vm->page_used[p] != 0;
     }
+    /* patch 320: contiguous blocks' alignment slack isn't the title's (a console packs the blocks) */
+    const uint32_t slack = nc_mm_slack_bytes() / NC_PAGE;
+    used = used > slack ? used - slack : 0;
     const uint32_t all = vm->guest_size / NC_PAGE;
     return used < all ? all - used : 0;
 }

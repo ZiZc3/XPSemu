@@ -6,6 +6,7 @@
  * chunks added as it fills. First-fit over a sorted free list kept on the
  * host; blocks are 16-byte aligned.
  */
+#include <stdlib.h>
 #include "native/kernel/kernel.h"
 
 #define POOL_ALIGN 16u
@@ -24,7 +25,26 @@ void nc_pool_init(NcKernel *k, uint32_t va, uint32_t len)
 static bool pool_grow(NcKernel *k, uint32_t size)
 {
     const uint32_t chunk = nc_align_up(size > POOL_CHUNK ? size : POOL_CHUNK, POOL_CHUNK);
-    const uint32_t pa = nc_vm_alloc_phys_high(k->vm, chunk);
+    /* patch 372 (xogfix=poolfit, per game: RalliSport Challenge 2): the chunk in the smallest free hole that holds it
+     * (above 1 MiB, under the top reserve) instead of the highest window. Grown mid-race, the highest window was the
+     * middle of RAM (0x2195000, the memory map at the failure): back in the menu the title's 25.25 MiB block found
+     * 18 MiB free below that chunk and 21.9 MiB above it, no window, and the game sat in its fatal-error loop. */
+    static int fit = -1;
+    if (fit < 0) {
+        const char *e = getenv("XOG_FIX");
+        fit = e && strstr(e, "poolfit") ? 1 : 0;
+    }
+    uint32_t pa = UINT32_MAX;
+    if (fit == 1 && k->vm->ram_size > NC_TOP_RESERVE + 0x100000u) {
+        pa = nc_vm_alloc_phys(k->vm, chunk, 0x100000u, k->vm->ram_size - NC_TOP_RESERVE);
+        static unsigned told;
+        if (pa != UINT32_MAX && told++ < 8) {
+            nc_log("hakuX-native", "pool: %u KiB more at %08x, the smallest hole (xogfix=poolfit)", chunk >> 10, pa);
+        }
+    }
+    if (pa == UINT32_MAX) {
+        pa = nc_vm_alloc_phys_high(k->vm, chunk);
+    }
     if (pa == UINT32_MAX) {
         return false;
     }

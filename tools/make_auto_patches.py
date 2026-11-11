@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 HERE = os.path.dirname(os.path.abspath(__file__))
 CAT = os.path.join(HERE, "..", "ps5", "ui", "patch-catalog.h")
 OUT = os.path.join(HERE, "..", "ps5", "ui", "patches-auto.inc")
-CACHE = "patches-cache"
+CACHE = "/mnt/k/XOG/patches"
 BASE = "https://raw.githubusercontent.com/JayYardley/Xbox-Magic-Patches-by-Jay/main/"
 
 line = re.compile(r'^\s*\{ "([^"]*)", "([^"]*)", "([^"]*)", "([^"]*)", "((?:[^"\\]|\\.)*)", "((?:[^"\\]|\\.)*)", "((?:[^"\\]|\\.)*)" \},')

@@ -12,6 +12,7 @@
  * gamepad on port 1.
  */
 #include "native/dev/usb.h"
+#include "native/dev/chihiro/chihiro_usb.h"
 #include "native/core/irq.h"
 #include "native/core/mmio.h"
 #include "native/core/vm.h"
@@ -128,6 +129,31 @@ typedef struct Ohci {
 
 static Ohci g_ohci = {.lock = PTHREAD_MUTEX_INITIALIZER, .run = PTHREAD_COND_INITIALIZER};
 static bool g_trace; /* NC_TRACE_USB: every transfer but NAKed polls */
+static struct {
+    uint32_t key, n;
+} g_nak[8];                             /* NAKed TDs per address/endpoint/PID (Chihiro, patch 196) */
+static unsigned g_trace_left = 3000;    /* the TD trace's lines in Chihiro mode (patch 196) */
+/* XPSemu patch 203 (Chihiro, a tool): the lock's long holds and waits, and the slowest device call of a frame */
+static uint64_t g_slow_td_ns, g_slow_td_cpu_ns;
+static char g_slow_td[160];
+static uint64_t now_ns(void);
+
+static uint64_t thread_cpu_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void lock_waited(uint64_t ns, uint32_t off, const char *what)
+{
+    static unsigned logged;
+    if (ns > 20000000ull && logged < 100) {
+        logged++;
+        nc_log("hakuX-native-usb", "ohci: the guest waited %.1f ms for the USB lock (%s register %02x) (patch 203 tool)",
+               ns / 1e6, what, off);
+    }
+}
 
 /* Each player's controller (a hub with the gamepad on its port 1), made at
  * boot; its root port has it while the player has a controller
@@ -137,6 +163,19 @@ static NcUsbDev *g_pad_hub[4];
 static bool g_front_hub;
 static bool g_ready;                    /* nc_dev_ohci_init done */
 static int g_early_mask = -1;           /* nc_dev_ohci_set_pads before it: the boot's */
+/* Sega Chihiro mode (XPSemu phase 3): the base boards take root ports 1-2
+ * (dev/chihiro/chihiro_usb.c), so pads only for players 1-2 (ports 3-4);
+ * NC_CHIHIRO_NO_PAD=1: none. */
+static bool g_chihiro;
+
+static unsigned chihiro_pad_mask(unsigned mask)
+{
+    if (!g_chihiro) {
+        return mask;
+    }
+    const char *np = getenv("NC_CHIHIRO_NO_PAD");
+    return np && atoi(np) ? 0 : mask & 0x3;
+}
 
 static uint64_t now_ns(void)
 {
@@ -200,6 +239,42 @@ static void port_attach(Ohci *o, unsigned i)
         o->port[i] |= PORT_CCS | PORT_CSC | (o->dev[i]->low_speed ? PORT_LSDA : 0);
         set_interrupt(o, INT_RHSC);
     }
+}
+
+/* Chihiro base boards (chihiro_usb.c): a device into a root port, or out of
+ * it, as a hot plug. Its address is cleared (no USB reset: the host's port
+ * reset brings that). Lock held. */
+void nc_ohci_root_plug(unsigned port, NcUsbDev *d)
+{
+    Ohci *o = &g_ohci;
+    if (!port || port > ROOT_PORTS) {
+        return;
+    }
+    const unsigned i = port - 1;
+    if (d) {
+        d->addr = 0;
+        d->config = 0;
+        d->stalled = false;
+        d->pending_addr = -1;
+        o->dev[i] = d;
+        o->port[i] = (o->port[i] & PORT_PPS) | PORT_CCS | PORT_CSC | (d->low_speed ? PORT_LSDA : 0);
+    } else {
+        o->port[i] = (o->port[i] & PORT_PPS) | PORT_CSC;
+        o->dev[i] = NULL;
+    }
+    set_interrupt(o, INT_RHSC);
+}
+
+/* patch 209: a savestate's Chihiro base board back on its port, as the state had it: no connection change */
+void nc_ohci_root_restore(unsigned port, NcUsbDev *d)
+{
+    Ohci *o = &g_ohci;
+    if (!port || port > ROOT_PORTS) {
+        return;
+    }
+    pthread_mutex_lock(&o->lock);
+    o->dev[port - 1] = d;
+    pthread_mutex_unlock(&o->lock);
 }
 
 static void roothub_reset(Ohci *o)
@@ -358,6 +433,7 @@ static bool service_td(Ohci *o, uint32_t ed_pa, uint32_t ed[4])
     NcUsbDev *d = find_device(o, (uint8_t)ED_FA(ed[0]));
     const int ep = (int)ED_EN(ed[0]);
     int r;
+    const uint64_t td_t0 = g_chihiro ? now_ns() : 0, td_c0 = g_chihiro ? thread_cpu_ns() : 0;
     if (!d) {
         r = -100;
     } else if (ep == 0) {
@@ -367,11 +443,32 @@ static bool service_td(Ohci *o, uint32_t ed_pa, uint32_t ed[4])
     } else {
         r = d->data ? d->data(d, pid == PID_IN, ep, buf, (int)len) : NC_USB_STALL;
     }
+    if (g_chihiro) {
+        const uint64_t td_ns = now_ns() - td_t0;
+        if (td_ns > g_slow_td_ns) {
+            static const char *const k_pid[] = {"SETUP", "OUT", "IN", "?"};
+            g_slow_td_ns = td_ns;
+            g_slow_td_cpu_ns = thread_cpu_ns() - td_c0;
+            snprintf(g_slow_td, sizeof(g_slow_td), "%s addr %u ep %d %s len %u -> %d", d ? d->name : "none",
+                     (unsigned)ED_FA(ed[0]), ep, k_pid[pid & 3], len, r);
+        }
+    }
     if (r == NC_USB_NAK) {
+        if (g_chihiro) {
+            /* which endpoint keeps a transfer waiting (XPSemu patch 196, a tool) */
+            const uint32_t key = (uint32_t)ED_FA(ed[0]) << 8 | (uint32_t)ep << 2 | (uint32_t)(pid & 3);
+            for (unsigned i = 0; i < 8; i++) {
+                if (!g_nak[i].n || g_nak[i].key == key) {
+                    g_nak[i].key = key;
+                    g_nak[i].n++;
+                    break;
+                }
+            }
+        }
         return false;
     }
     o->tds++;
-    if (g_trace) {
+    if (g_trace && (!g_chihiro || g_trace_left-- > 0)) {
         static const char *const k_pid[] = {"SETUP", "OUT", "IN", "?"};
         char hex[3 * 8 + 1] = "";
         const int show = r > 0 ? MIN(r, 8) : 0;
@@ -473,6 +570,17 @@ static void frame(Ohci *o)
                (unsigned long long)(o->tds - s_tds), o->ctl, o->ctl & CTL_PLE ? "P" : "-",
                o->ctl & CTL_CLE ? "C" : "-", o->ctl & CTL_BLE ? "B" : "-", o->hcca, o->intr_status, o->intr);
         s_tds = o->tds;
+        if (g_chihiro) {
+            static const char *const k_pid[] = {"SETUP", "OUT", "IN", "?"};
+            char line[400] = "";
+            int n = 0;
+            for (unsigned i = 0; i < 8 && g_nak[i].n; i++) {
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " addr %u ep %u %s x%u;", g_nak[i].key >> 8,
+                              (g_nak[i].key >> 2) & 15, k_pid[g_nak[i].key & 3], g_nak[i].n);
+            }
+            memset(g_nak, 0, sizeof(g_nak));
+            nc_log("hakuX-native-usb", "ohci: NAKed in 10 s:%s", n ? line : " none");
+        }
     }
     o->frame_number = (uint16_t)(o->frame_number + 1);
     uint8_t *hcca = phys(o, o->hcca, 256);
@@ -517,12 +625,29 @@ static void frame(Ohci *o)
     }
     o->intr_status |= INT_SF;
     update_irq(o);
+    if (g_chihiro) {
+        nc_chihiro_usb_frame();     /* the base boards' hot plug (their 8051s: after the lock, patch 196) */
+    }
 }
 
 static void *frame_thread(void *arg)
 {
     Ohci *o = arg;
     nc_pause_register("usb");
+#if defined(__PROSPERO__)
+    if (g_chihiro) {
+        /* XPSemu patch 204: the base boards' 8051s run on this thread, and the game's USB requests time out
+         * (100 ms) when it waits for a core: up from the default to the sound's priority (690), Chihiro only */
+        int pol = 0;
+        struct sched_param sp;
+        if (pthread_getschedparam(pthread_self(), &pol, &sp) == 0) {
+            const int was = sp.sched_priority;
+            sp.sched_priority = was > 690 ? 690 : was;   /* SCE: a lower number runs first */
+            const int rc = was > 690 ? pthread_setschedparam(pthread_self(), pol, &sp) : 0;
+            nc_log("hakuX-native-usb", "ohci: frame thread priority %d -> 690 (rc %d, policy %d) (patch 204)", was, rc, pol);
+        }
+    }
+#endif
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     pthread_mutex_lock(&o->lock);
@@ -533,8 +658,24 @@ static void *frame_thread(void *arg)
             nc_pause_idle(false);
             clock_gettime(CLOCK_MONOTONIC, &next);
         }
+        const uint64_t f0 = g_chihiro ? now_ns() : 0;
+        g_slow_td_ns = 0;
+        g_slow_td[0] = 0;
         frame(o);
+        if (g_chihiro) {
+            const uint64_t held = now_ns() - f0;
+            static unsigned logged;
+            if (held > 20000000ull && logged < 100) {
+                logged++;
+                nc_log("hakuX-native-usb", "ohci: a frame held the USB lock %.1f ms; its slowest device call %.1f ms "
+                       "(this thread on a CPU %.1f ms of it): %s (patch 203/204 tool)", held / 1e6, g_slow_td_ns / 1e6,
+                       g_slow_td_cpu_ns / 1e6, g_slow_td[0] ? g_slow_td : "none");
+            }
+        }
         pthread_mutex_unlock(&o->lock);
+        if (g_chihiro) {
+            nc_chihiro_usb_run();           /* the 8051s' millisecond, the guest free to read the registers */
+        }
         if (nc_paused()) {
             nc_pause_wait();                /* the emulation paused: no frames */
             clock_gettime(CLOCK_MONOTONIC, &next);
@@ -557,7 +698,11 @@ static uint64_t ohci_read(void *opaque, uint32_t off, unsigned size)
 {
     Ohci *o = opaque;
     uint32_t v = 0;
+    const uint64_t w0 = g_chihiro ? now_ns() : 0;
     pthread_mutex_lock(&o->lock);
+    if (g_chihiro) {
+        lock_waited(now_ns() - w0, off, "read");
+    }
     switch (off & ~3u) {
     case 0x00: v = 0x10; break;
     case 0x04: v = o->ctl; break;
@@ -599,7 +744,11 @@ static void ohci_write(void *opaque, uint32_t off, uint64_t value, unsigned size
 {
     Ohci *o = opaque;
     const uint32_t v = (uint32_t)value;
+    const uint64_t w0 = g_chihiro ? now_ns() : 0;
     pthread_mutex_lock(&o->lock);
+    if (g_chihiro) {
+        lock_waited(now_ns() - w0, off, "write");
+    }
     switch (off) {
     case 0x04: {
         const uint32_t old = o->ctl & CTL_HCFS;
@@ -608,6 +757,9 @@ static void ohci_write(void *opaque, uint32_t off, uint64_t value, unsigned size
             nc_log("hakuX-native-usb", "ohci: state %u -> %u", old >> 6, (v & CTL_HCFS) >> 6);
             if ((v & CTL_HCFS) == HCFS_OPERATIONAL) {
                 o->frame_t0_ns = now_ns();
+                if (g_chihiro) {
+                    nc_chihiro_usb_bus_start();
+                }
                 pthread_cond_signal(&o->run);
             }
         }
@@ -671,6 +823,10 @@ static void ohci_write(void *opaque, uint32_t off, uint64_t value, unsigned size
 void nc_dev_ohci_init(struct NcVm *vm)
 {
     Ohci *o = &g_ohci;
+    g_chihiro = nc_chihiro_usb_enabled();
+    if (g_chihiro) {
+        nc_chihiro_usb_init();      /* the base boards (plugged in after the guest starts the bus) */
+    }
     pthread_mutex_lock(&o->lock);
     o->vm = vm;
 
@@ -685,6 +841,7 @@ void nc_dev_ohci_init(struct NcVm *vm)
     if (g_early_mask >= 0) {
         mask = (unsigned)g_early_mask;      /* the controllers changed while the core started */
     }
+    mask = chihiro_pad_mask(mask);
     unsigned players = 0;
     for (unsigned p = 0; p < 4; p++) {
         players += (mask >> p) & 1;
@@ -694,7 +851,7 @@ void nc_dev_ohci_init(struct NcVm *vm)
      * console's front panel hub in between, which the titles' USB stack
      * doesn't enumerate past here yet. */
     const char *fh = getenv("NC_USB_FRONT_HUB");
-    const bool front_hub = fh && atoi(fh) != 0;
+    const bool front_hub = fh && atoi(fh) != 0 && !g_chihiro;   /* Chihiro: root port 1 is the QC's */
     g_front_hub = front_hub;
     NcUsbDev *front = front_hub && players ? nc_usb_hub_new(4) : NULL;
     for (unsigned p = 0; p < 4; p++) {
@@ -756,6 +913,7 @@ void nc_dev_ohci_set_pads(unsigned mask)
         pthread_mutex_unlock(&o->lock);
         return;
     }
+    mask = chihiro_pad_mask(mask);
     unsigned changed = 0;
     for (unsigned p = 0; p < 4; p++) {
         const unsigned i = k_port_map[p] - 1;
@@ -795,6 +953,9 @@ bool nc_usb_state_save(NcBuf *b)
     nc_rec_put(b, &nc_rec_Ohci, o);
     for (unsigned i = 0; i < ROOT_PORTS; i++) {
         NcUsbDev *hub = o->dev[i];
+        if (hub && !hub->find) {
+            hub = NULL;     /* not a hub: a Chihiro base board, not in states (yet) */
+        }
         nc_buf_u8(b, hub != NULL);
         if (!hub) {
             continue;
@@ -825,6 +986,9 @@ bool nc_usb_state_load(NcRd *r, unsigned v)
     unsigned changes = 0;
     for (unsigned i = 0; i < ROOT_PORTS && !r->fail; i++) {
         NcUsbDev *hub = o->dev[i];
+        if (hub && !hub->find) {
+            hub = NULL;     /* a Chihiro base board: its port as the state has it */
+        }
         if (!nc_rd_u8(r)) {
             if (hub) {
                 /* plugged in since: a connection for the guest to see */

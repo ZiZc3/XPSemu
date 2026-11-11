@@ -188,6 +188,8 @@ static void to_front(int i, uint32_t swap_id)
     hle_hitch_frame(swap_id, HLE_FR_FRONT);
 }
 
+unsigned nc_ff_mul(void);   /* XOG patch 253 (ps5/src/ff_ps5.c) */
+
 int hle_disp_begin_write(uint32_t swap_id, uint64_t value)
 {
     static unsigned s_none;
@@ -220,6 +222,22 @@ int hle_disp_begin_write(uint32_t swap_id, uint64_t value)
         int64_t waited = g_get_monotonic_time() - t0;
         if (pick >= 0 || waited >= 300000) {
             break;
+        }
+        if (nc_ff_mul() > 1) {
+            /* patch 253: fast-forward makes frames faster than the screen shows them: the oldest finished one not
+             * shown yet makes room (only the screen skips it; the game's frame was drawn), the game isn't held */
+            uint32_t oldest = UINT32_MAX;
+            for (int i = 0; i < HLE_DISP_SLOTS; i++) {
+                HleDispSlot *s = &g_disp.s[i];
+                if (s->state == SLOT_READY && !s->held && s->swap_id < oldest) {
+                    oldest = s->swap_id;
+                    pick = i;
+                }
+            }
+            if (pick >= 0) {
+                g_disp.st.dropped++;
+                break;
+            }
         }
         if (waited >= 100000) {
             /* nothing presented for 100 ms (guest paused?): drop the oldest

@@ -324,9 +324,54 @@ int nc_eff_priority(const NcKernel *k, const NcThread *t)
     return p < 15 && g_boost[t - k->threads] ? p + 1 : p;
 }
 
+/* xogfix=waitquantum (patch 315, per game: SSX 3): NT's quantum rules for a thread that waits. NT takes a
+ * wait's charge off the slice it has (KiUnwaitThread, WAIT_QUANTUM_DECREMENT) and doesn't renew a boost the
+ * thread still holds; here a waiting thread got a whole new 20 ms slice and its boost again every time. SSX 3's
+ * render thread blocks ~60 times a second, so its slice never ran out and the XAPI timer thread at the same
+ * priority (timeSetEvent: EA's 60 Hz movie clock) ran about once in 5 s: the THX intro froze. */
+static int g_waitquantum = -1;      /* -1 not read yet; on by the game's start line or by the watch below */
+
+static bool waitquantum_on(void)
+{
+    if (g_waitquantum < 0) {
+        const char *e = getenv("XOG_FIX");
+        g_waitquantum = e && strstr(e, "waitquantum") ? 1 : 0;
+    }
+    return g_waitquantum;
+}
+
+/* Patch 316: both scheduling fixes turn on by themselves, only in a game that gets stuck (user: "only when
+ * the game needs it, so no game gets hurt"); one that never does keeps today's rules. Each turn-on is logged.
+ * g_ready_since: when a ready thread became ready (0: running or waiting). */
+static uint64_t g_ready_since[NC_MAX_THREADS];
+/* the wait-quantum watch, over one-second windows: how long each thread was ready but not run, how long each
+ * ran, and how many slices ended (a same-priority turn) */
+static uint64_t g_ready_ns[NC_MAX_THREADS], g_run_ns[NC_MAX_THREADS], g_watch_from, g_watch_last;
+static unsigned g_watch_slices;
+static unsigned g_yields[NC_MAX_THREADS];      /* NtYieldExecution calls per thread in the window */
+static int g_yield_mode = -1;       /* as g_waitquantum, for xogfix=yield */
+static NcThread *g_yield_asker;     /* the thread whose NtYieldExecution this schedule is */
+
+static bool yield_on(void)
+{
+    if (g_yield_mode < 0) {
+        const char *e = getenv("XOG_FIX");
+        g_yield_mode = e && strstr(e, "yield") ? 1 : 0;
+    }
+    return g_yield_mode;
+}
+
 void nc_ps_boost(const NcKernel *k, const NcThread *t, int increment)
 {
+    if (waitquantum_on() && g_boost[t - k->threads]) {
+        return;     /* it still holds one: it decays at the end of its slice */
+    }
     g_boost[t - k->threads] = increment > 0 && t->priority < 16;
+}
+
+void nc_ps_unboost(const NcKernel *k, const NcThread *t)
+{
+    g_boost[t - k->threads] = 0;
 }
 
 void nc_ps_slice_end(NcKernel *k, uint64_t now)
@@ -344,6 +389,7 @@ void nc_ps_slice_end(NcKernel *k, uint64_t now)
             k->resched = true;
             k->slice_due_ns = 0;
             g_nc_sched.slices++;
+            g_watch_slices++;
             return;
         }
     }
@@ -379,23 +425,58 @@ void nc_ps_yield(NcKernel *k)
     }
     /* As the Xbox's NtYieldExecution: another ready thread runs if there is one, whatever its priority (NT picks
      * the highest ready from priority 1 up, not only the yielder's own); else the yielder goes on. */
-    {
-        /* only for a game whose start asks for it (xogfix=yield, patch 126): Halo's sound went with it for all */
-        static int on = -1;
-        if (on < 0) {
-            const char *e = getenv("XOG_FIX");
-            on = e && strstr(e, "yield");
-        }
-        if (on) {
-            g_yielder = k->current;
-        }
+    /* only for a game that asks for it (xogfix=yield, patch 126) or got stuck yielding (patch 316): Halo's
+     * sound went with it for all */
+    g_yield_asker = k->current;
+    if (k->current && k->current >= k->threads && k->current < k->threads + NC_MAX_THREADS) {
+        g_yields[k->current - k->threads]++;
+    }
+    if (yield_on()) {
+        g_yielder = k->current;
     }
     k->resched = true;
+}
+
+/* XPSemu patch 196 (Sega Chihiro only): a thread that waits at DISPATCH_LEVEL or above takes its IRQL with it,
+ * as NT's KiSwapThread: the others (and the idle loop's DPCs) run at theirs, it gets it back when it runs again.
+ * SEGABOOT cancels a USB request that timed out and waits for the cancel at DISPATCH_LEVEL; the IRQL stayed up
+ * for everyone, the OHCI DPC that finishes the cancel never ran: a black screen forever. */
+static uint8_t g_wait_irql[NC_MAX_THREADS];
+static bool g_wait_irql_held[NC_MAX_THREADS];
+
+static bool chihiro_irql_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("NC_CHIHIRO") != NULL;
+    }
+    return on;
+}
+
+static uint8_t *ps_irql(NcKernel *k)
+{
+    return (uint8_t *)nc_vm_host(k->vm, k->kpcr_va + 0x24);
 }
 
 void nc_ps_schedule(NcKernel *k, NcFrame *f)
 {
     g_nc_sched.schedules++;
+    if (chihiro_irql_on()) {
+        static uint64_t s_last_ns;
+        const uint64_t t = nc_ke_now_ns();
+        if (t - s_last_ns > 10000000000ull) {
+            s_last_ns = t;
+            char held[160] = "";
+            int o = 0;
+            for (unsigned i = 0; i < NC_MAX_THREADS && o < (int)sizeof(held) - 16; i++) {
+                if (g_wait_irql_held[i]) {
+                    o += snprintf(held + o, sizeof(held) - (size_t)o, " t%u:%u", k->threads[i].id, g_wait_irql[i]);
+                }
+            }
+            nc_log("hakuX-native", "ps: IRQL %u, current t%u, in ISR %d, in DPC %d; held:%s (patch 199 tool)",
+                   *ps_irql(k), k->current ? k->current->id : 0, k->in_isr, k->in_dpc, o ? held : " none");
+        }
+    }
     k->resched = false;
     NcThread *cur = k->current;
     /* The frame always goes back through the saved context: a wait that ends
@@ -431,7 +512,20 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
         cur->slice_expired = false;
         cur->state = NC_T_READY;
     } else if (cur) {
-        cur->slice_used_ns = 0;         /* it waits or ends: a new quantum when it runs again */
+        g_ready_since[cur - k->threads] = 0;
+        if (waitquantum_on() && cur->state == NC_T_WAITING && cur->priority < 14) {
+            /* NT: the slice it has, less the wait's charge; a new one (and no boost) once it is used up */
+            if (cur == k->slice_thread && cur->slice_start_ns) {
+                cur->slice_used_ns += now - cur->slice_start_ns;
+            }
+            cur->slice_used_ns += 10ull * 1000000u / 3;
+            if (cur->slice_used_ns >= quantum_ns(k)) {
+                cur->slice_used_ns = 0;
+                g_boost[cur - k->threads] = 0;
+            }
+        } else {
+            cur->slice_used_ns = 0;     /* it waits or ends: a new quantum when it runs again */
+        }
         cur->slice_expired = false;
         cur->ready_seq = 0;
         if (cur == k->slice_thread) {
@@ -440,6 +534,25 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
     }
 
     k->force_switch = false;
+
+    if (chihiro_irql_on() && cur && cur->state == NC_T_WAITING && cur != k->dpc_thread && cur != k->isr_thread &&
+        !k->in_dpc) {
+        /* Its IRQL: the PCR's, or, when an ISR came in as it began the wait, the one the ISR keeps to put back
+         * (patch 199: put back, the 2 stayed for everyone, the main thread spun at it and the media board's
+         * sender thread, readied above it, never ran). */
+        uint8_t *ir = !k->in_isr ? ps_irql(k) : (k->isr_interrupted == cur ? &k->isr_saved_irql : NULL);
+        if (ir && *ir >= 2 && *ir < 26) {
+            const unsigned i = (unsigned)(cur - k->threads);
+            static unsigned logged;
+            if (logged++ < 20) {
+                nc_log("hakuX-native", "ps: thread %u waits at IRQL %u: the others run at theirs, its IRQL back when it "
+                       "runs (patch 196)", i, *ir);
+            }
+            g_wait_irql[i] = *ir;
+            g_wait_irql_held[i] = true;
+            *ir = 0;
+        }
+    }
 
     /* Code an ISR interrupted above DISPATCH_LEVEL continues first. Then the
      * highest priority ready thread, round-robin after the current one. When
@@ -468,6 +581,9 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
                 }
                 if (!t->ready_seq) {
                     t->ready_seq = ++k->ready_clock;    /* ready since the last pass */
+                }
+                if (!g_ready_since[t - k->threads]) {
+                    g_ready_since[t - k->threads] = nc_ke_now_ns();
                 }
                 const int tp = nc_eff_priority(k, t), np = next ? nc_eff_priority(k, next) : 0;
                 if (!next || tp > np || (tp == np && t->ready_seq < next->ready_seq)) {
@@ -506,6 +622,103 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
         k->resume_first = NULL;
     }
     g_yielder = NULL;
+    {
+        const uint64_t t_now = nc_ke_now_ns();
+        const bool real = next != k->isr_thread && next != k->dpc_thread;
+        /* Wait quantum (patch 316): over a second, a thread at priority below 14 ready more than 60% of it yet
+         * hardly run, while a thread of the same priority ran most of it and no slice ended: the turns of that
+         * priority don't rotate (SSX 3: its XAPI timer thread, ready all the time behind the render thread, which
+         * got a new slice and its boost back on every wait). */
+        /* Yield (patch 316): over a second, a thread that yielded again and again and ran most of it, while a
+         * thread below its priority was ready more than 60% of it and hardly ran: NtYieldExecution never gave way
+         * (FIFA 07, Shadow, RalliSport 2: loading spun on SwitchToThread waiting for that thread, forever). Measured
+         * over the whole second: the ISR / DPC threads running in between don't reset it. */
+        if (!waitquantum_on() || !yield_on()) {
+            if (g_watch_last) {
+                const uint64_t dt = t_now - g_watch_last;
+                for (unsigned i = 0; i < k->threads_hi; i++) {
+                    const NcThread *t = &k->threads[i];
+                    if (t->state == NC_T_READY && !t->suspend && t != cur) {
+                        g_ready_ns[i] += dt;
+                    }
+                }
+                if (cur && cur >= k->threads && cur < k->threads + NC_MAX_THREADS) {
+                    g_run_ns[cur - k->threads] += dt;
+                }
+            } else {
+                g_watch_from = t_now;
+            }
+            g_watch_last = t_now;
+            if (t_now - g_watch_from >= 1000000000ull) {
+                const uint64_t win = t_now - g_watch_from;
+                for (unsigned i = 0; i < k->threads_hi; i++) {
+                    const NcThread *t = &k->threads[i];
+                    if (t->state == NC_T_FREE || t->priority >= 14 || g_ready_ns[i] * 10 < win * 6 ||
+                        g_run_ns[i] * 10 > win) {
+                        continue;   /* not starved */
+                    }
+                    for (unsigned j = 0; j < k->threads_hi; j++) {
+                        const NcThread *o = &k->threads[j];
+                        if (j == i || o->state == NC_T_FREE || g_run_ns[j] * 2 <= win) {
+                            continue;
+                        }
+                        if (!waitquantum_on() && g_watch_slices < 2 && o->priority == t->priority) {
+                            g_waitquantum = 1;
+                            nc_log("hakuX-native", "ps: thread %u (priority %d) ready %llu ms of the last %llu, run %llu, "
+                                   "behind thread %u at its priority (ran %llu ms), %u slices: the Xbox's wait quantum on "
+                                   "for this game (patch 316, automatic)", t->id, t->priority,
+                                   (unsigned long long)(g_ready_ns[i] / 1000000u), (unsigned long long)(win / 1000000u),
+                                   (unsigned long long)(g_run_ns[i] / 1000000u), o->id,
+                                   (unsigned long long)(g_run_ns[j] / 1000000u), g_watch_slices);
+                        }
+                        /* below it, or at its priority (RalliSport 2: the spinner's boost kept it a step above the
+                         * worker it waited for, same base priority 8, so its yields never gave way) */
+                        if (!yield_on() && o->priority >= t->priority && g_yields[j] >= 50) {
+                            g_yield_mode = 1;
+                            nc_log("hakuX-native", "ps: thread %u yielded %u times and ran %llu ms of the last %llu, while "
+                                   "thread %u (priority %d, at or below it) was ready %llu ms and ran %llu: yield gives way to it "
+                                   "now, for this game (patch 316, automatic)", o->id, g_yields[j],
+                                   (unsigned long long)(g_run_ns[j] / 1000000u), (unsigned long long)(win / 1000000u),
+                                   t->id, t->priority, (unsigned long long)(g_ready_ns[i] / 1000000u),
+                                   (unsigned long long)(g_run_ns[i] / 1000000u));
+                        }
+                    }
+                }
+                memset(g_ready_ns, 0, sizeof(g_ready_ns));
+                memset(g_run_ns, 0, sizeof(g_run_ns));
+                memset(g_yields, 0, sizeof(g_yields));
+                g_watch_slices = 0;
+                g_watch_from = t_now;
+            }
+        }
+        g_yield_asker = NULL;
+        g_ready_since[next - k->threads] = 0;
+        /* debug (NC_PSWATCH=1 in debug.txt): once a second, every thread's state and how long a ready one waits */
+        static int watch = -1;
+        static uint64_t watch_last;
+        if (watch < 0) {
+            watch = getenv("NC_PSWATCH") != NULL;
+        }
+        if (watch && t_now - watch_last > 1000000000ull) {
+            watch_last = t_now;
+            char line[900];
+            int o = snprintf(line, sizeof(line), "next t%u p%d/e%d:", next->id, next->priority, nc_eff_priority(k, next));
+            for (unsigned i = 0; i < k->threads_hi && o < (int)sizeof(line) - 40; i++) {
+                const NcThread *t = &k->threads[i];
+                if (t->state == NC_T_FREE) {
+                    continue;
+                }
+                o += snprintf(line + o, sizeof(line) - (size_t)o, " t%u:p%d/e%d:%c%s", t->id, t->priority,
+                              nc_eff_priority(k, t), t->state == NC_T_READY ? 'R' : t->state == NC_T_RUNNING ? 'X' :
+                              t->state == NC_T_WAITING ? 'W' : '?', t->suspend ? "s" : "");
+                if (t->state == NC_T_READY && g_ready_since[i]) {
+                    o += snprintf(line + o, sizeof(line) - (size_t)o, "%llums",
+                                  (unsigned long long)((t_now - g_ready_since[i]) / 1000000u));
+                }
+            }
+            nc_log("hakuX-native-pswatch", "%s", line);
+        }
+    }
     if (next != cur) {
         g_nc_sched.switches++;
     }
@@ -523,6 +736,13 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
         }
         nc_ps_stack_free(k, cur->stack_limit, cur->stack_base - cur->stack_limit);
         cur->state = NC_T_FREE;
+    }
+    if (chihiro_irql_on()) {
+        const unsigned i = (unsigned)(next - k->threads);
+        if (i < NC_MAX_THREADS && g_wait_irql_held[i] && next != k->dpc_thread && next != k->isr_thread) {
+            g_wait_irql_held[i] = false;
+            *ps_irql(k) = g_wait_irql[i];       /* patch 196: its own IRQL again */
+        }
     }
     nc_frame_load(f, &next->ctx);
     next->fresh = false;

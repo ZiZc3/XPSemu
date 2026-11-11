@@ -201,9 +201,49 @@ static NcSeh *push_level(NcKernel *k, NcFrame *f, NcThread *t, uint32_t esp)
     return l;
 }
 
+/* A guest address that can be read (mapped), for the crash report below. */
+static bool readable(NcKernel *k, uint32_t va)
+{
+    return va >= 0x1000 && nc_vm_phys(k->vm, va) != UINT32_MAX && nc_vm_phys(k->vm, va + 3) != UINT32_MAX;
+}
+
+/* An unhandled crash, for the log: the registers as they were at the fault (the context the
+ * dispatch saved), the frame-pointer chain of callers, and the stack words at the fault, so
+ * a report says which code called in and what was empty. Log only. */
+static void crash_report(NcKernel *k, NcSeh *l)
+{
+    const uint32_t c = l->ctx;
+    if (!readable(k, c + CX_SS)) {
+        return;
+    }
+    nc_log("hakuX-native", "crash: eip %08x | eax %08x ebx %08x ecx %08x edx %08x | esi %08x edi %08x | "
+           "ebp %08x esp %08x | eflags %08x", rd(k, c + CX_EIP), rd(k, c + CX_EAX), rd(k, c + CX_EBX),
+           rd(k, c + CX_ECX), rd(k, c + CX_EDX), rd(k, c + CX_ESI), rd(k, c + CX_EDI), rd(k, c + CX_EBP),
+           rd(k, c + CX_ESP), rd(k, c + CX_EFLAGS));
+    char line[512];
+    int o = 0;
+    uint32_t ebp = rd(k, c + CX_EBP);
+    for (int i = 0; i < 16 && readable(k, ebp) && readable(k, ebp + 4) && o < (int)sizeof(line) - 12; i++) {
+        o += snprintf(line + o, sizeof(line) - (size_t)o, " %08x", rd(k, ebp + 4));
+        const uint32_t next = rd(k, ebp);
+        if (next <= ebp) {
+            break;                      /* the chain must climb the stack */
+        }
+        ebp = next;
+    }
+    nc_log("hakuX-native", "crash: callers (frame chain):%s", o ? line : " none");
+    o = 0;
+    const uint32_t esp = rd(k, c + CX_ESP);
+    for (int i = 0; i < 24 && readable(k, esp + 4u * i) && o < (int)sizeof(line) - 12; i++) {
+        o += snprintf(line + o, sizeof(line) - (size_t)o, " %08x", rd(k, esp + 4u * i));
+    }
+    nc_log("hakuX-native", "crash: stack at esp %08x:%s", esp, o ? line : " unreadable");
+}
+
 static void unhandled(NcKernel *k, NcFrame *f, NcSeh *l, const char *why)
 {
     char type[96];
+    crash_report(k, l);
     nc_kernel_request_stop(k, f, "seh: unhandled exception %08x at %08x (%s)%s%s", rd(k, l->rec + ER_CODE),
                            rd(k, l->rec + ER_ADDRESS), why, rd(k, l->rec + ER_CODE) == CXX_EXCEPTION ? ", C++ " : "",
                            rd(k, l->rec + ER_CODE) == CXX_EXCEPTION ? cxx_type(k, l->rec, type, sizeof(type)) : "");
@@ -292,6 +332,22 @@ bool nc_seh_exception(NcKernel *k, NcFrame *f, uint32_t code, uint32_t eip, unsi
     static unsigned s_logged;
     if (s_logged++ < 32) {
         nc_log("hakuX-native", "seh: t%u exception %08x at %08x (%08x %08x): to the title's handlers", t->id, code, eip, p0, p1);
+        if (code == 0xC0000005u) {
+            /* The registers, the frames and the stack's top with it: an
+             * access a title doesn't handle ends the run, and its line alone
+             * names only the instruction. */
+            char calls[96], stack[16 * 9 + 1];
+            nc_kernel_frame_chain(k, f, calls, sizeof(calls));
+            size_t n = 0;
+            stack[0] = 0;
+            for (unsigned i = 0; i < 16 && nc_vm_phys(k->vm, esp + i * 4 + 3) != UINT32_MAX; i++) {
+                n += (size_t)snprintf(stack + n, sizeof(stack) - n, " %08x", nc_vm_rd32(k->vm, esp + i * 4));
+            }
+            nc_log("hakuX-native", "seh:   eax %08x ecx %08x edx %08x ebx %08x esp %08x ebp %08x esi %08x edi %08x | "
+                   "frames%s | stack%s", nc_frame_gpr(f, NC_EAX), nc_frame_gpr(f, NC_ECX), nc_frame_gpr(f, NC_EDX),
+                   nc_frame_gpr(f, NC_EBX), esp, nc_frame_gpr(f, NC_EBP), nc_frame_gpr(f, NC_ESI),
+                   nc_frame_gpr(f, NC_EDI), calls, stack[0] ? stack : " (not mapped)");
+        }
     }
     step(k, f, t);
     return true;

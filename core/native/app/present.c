@@ -21,6 +21,7 @@ static int g_aspect = NC_ASPECT_AUTO;
 static bool g_widescreen;
 static bool g_fxaa;
 static int g_upscale = NC_UPSCALE_BILINEAR;
+static int g_cas = 2, g_crt;    /* patch 247: CAS's sharpness (0.5), the CRT filter (off) */
 static bool g_fps_counter = false;   /* the overlay draws it now */
 
 void nc_present_fps_counter(bool on)
@@ -44,8 +45,8 @@ static struct {
 bool nc_present_init(void)
 {
     hle_disp_gamma_by_consumer(true); /* before the core starts: frames come without it */
-    nc_log("hakuX-app", "present: Vulkan; FXAA %s, upscaling %s", g_fxaa ? "on" : "off",
-           g_upscale == NC_UPSCALE_SGSR ? "SGSR" : "bilinear");
+    nc_log("hakuX-app", "present: Vulkan; FXAA %s, upscaling %s (CAS sharpness %d/4), CRT filter %d", g_fxaa ? "on" : "off",
+           g_upscale == NC_UPSCALE_SGSR ? "SGSR" : g_upscale == NC_UPSCALE_CAS ? "CAS" : "bilinear", g_cas, g_crt);
     return true;
 }
 
@@ -65,6 +66,19 @@ void nc_present_set_fxaa(bool on)
 void nc_present_set_upscale(int mode)
 {
     g_upscale = mode;
+}
+
+/* patch 247: both live, from the next refresh (they're in the key) */
+void nc_present_set_cas(int level)
+{
+    g_cas = level < 0 ? 0 : level > 4 ? 4 : level;
+    hle_present_set_cas(g_cas);
+}
+
+void nc_present_set_crt(int mode)
+{
+    g_crt = mode < 0 ? 0 : mode > 2 ? 2 : mode;
+    hle_present_set_crt(g_crt);
 }
 
 void nc_present_set_aspect(int mode)
@@ -137,7 +151,8 @@ static void debug_poll(void)
     char v[PROP_VALUE_MAX] = "";
     hle_prop_get("debug.hakux.present", v);
     g_dbg.fxaa = strstr(v, "nofxaa") ? 0 : strstr(v, "fxaa") ? 1 : -1;
-    g_dbg.upscale = strstr(v, "sgsr") ? NC_UPSCALE_SGSR : strstr(v, "bilinear") ? NC_UPSCALE_BILINEAR : -1;
+    g_dbg.upscale = strstr(v, "sgsr") ? NC_UPSCALE_SGSR : strstr(v, "bilinear") ? NC_UPSCALE_BILINEAR :
+                    strstr(v, "cas") ? NC_UPSCALE_CAS : -1;
     g_dbg.average = !strstr(v, "noaverage");
 }
 
@@ -211,6 +226,7 @@ bool nc_present_frame(struct ANativeWindow *win)
     hle_present_set_fps(g_fps_counter ? fps_now : -1);
     const uint64_t key = (uint64_t)fxaa | (uint64_t)upscale << 1 | (uint64_t)g_dbg.average << 4 |
                          (uint64_t)g_widescreen << 5 | (uint64_t)g_smaa << 7 | (uint64_t)(uint32_t)g_aspect << 8 |
+                         (uint64_t)(uint32_t)g_cas << 16 | (uint64_t)(uint32_t)g_crt << 20 |
                          (uint64_t)(uint32_t)fps_now << 32 ^ (uint64_t)(g_qm_open || g_qm_overlay ? g_qm_serial : 0) << 48;
     if (hle_present_unchanged(win, key)) {
         nc_dev_nv2a_display_pickup(now_ns()); /* it looked: the vblank keeps clear of it */

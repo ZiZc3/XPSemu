@@ -91,8 +91,13 @@ static const NcStateSection k_sections[] = {
      * (nc_mods_after_load) */
     {NC_TAG('M', 'O', 'D', 'S'), "MODS", NC_STATE_V_MODS, NC_STATE_MIN_MODS, nc_mods_state_save, nc_mods_state_load,
      true},
+    /* Sega Chihiro's base boards (patch 209): the last, written only in a Chihiro run (NSECTIONS_WRITE) */
+    {NC_TAG('C', 'H', 'I', 'H'), "CHIH", NC_STATE_V_CHIH, NC_STATE_MIN_CHIH, nc_chih_state_save, nc_chih_state_load,
+     true},
 };
 #define NSECTIONS (sizeof(k_sections) / sizeof(k_sections[0]))
+/* what a save writes: the Chihiro boards' section only in a Chihiro run, so an Xbox game's states stay as before */
+#define NSECTIONS_WRITE (getenv("NC_CHIHIRO") ? NSECTIONS : NSECTIONS - 1)
 
 static uint64_t mono_ns(void)
 {
@@ -182,7 +187,7 @@ static const char *capture(NcKernel *k, const NcFrame *f, bool idle)
     snprintf(info.core_git, sizeof(info.core_git), "%s", NC_GIT);
     const uint64_t t1 = mono_ns();
     snprintf(g_path, sizeof(g_path), "%s", g_req.path);
-    err = nc_state_write(g_req.path, &info, k_sections, NSECTIONS);
+    err = nc_state_write(g_req.path, &info, k_sections, NSECTIONS_WRITE);
     if (!err) {
         nc_cache_gc(g_req.path);            /* the copies only replaced states used */
     }
@@ -213,8 +218,11 @@ void nc_state_cpu_work(NcKernel *k, const NcFrame *f, bool idle)
     pthread_mutex_unlock(&g_req.mu);
 }
 
+void nc_ff_off(const char *why);    /* XOG patch 253 (ps5/src/ff_ps5.c) */
+
 const char *nc_state_save(const char *path)
 {
+    nc_ff_off("a save state");
     if (!g_core) {
         return "no game is running";
     }
@@ -312,6 +320,7 @@ const char *nc_state_compat(const char *path)
 
 const char *nc_state_load(const char *path)
 {
+    nc_ff_off("a save state load");
     NcKernel *k = &g_core->kernel;
     const uint64_t t0 = mono_ns();
     NcStateInfo want, info;
@@ -331,6 +340,7 @@ const char *nc_state_load(const char *path)
     if (!nc_pause_quiesce(1000000000ull, &who)) {
         nc_log("hakuX-native-state", "load: the %s device did not stop", who ? who : "?");
     }
+    nc_io_writes_drain(60000, "a state load");     /* patch 261: before the cache drives are restored */
     const char *err = nc_state_read(path, &info, k_sections, NSECTIONS);
     if (!err) {
         hle_host_mem_set_dirty(0, k->vm->ram_size);     /* every page new to the GPU */

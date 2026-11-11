@@ -120,7 +120,12 @@ bool nc_vm_init(NcVm *vm, uint32_t ram_size)
     /* The contiguous window: VA 0x80000000 + pa for all of RAM. And the
      * NV2A's BAR1 aperture at 0xF0000000, another view of RAM, where D3D's
      * tiled locks point (D3DLOCK_TILED). */
-    if (!nc_vm_map(vm, NC_CONTIG_WINDOW, 0, ram_size) || !nc_vm_map(vm, NC_GPU_WINDOW, 0, ram_size)) {
+#if defined(__PROSPERO__)
+    const uint32_t gpu_window = vm->guest_size > NC_RAM_RETAIL ? vm->guest_size : ram_size;    /* XPSemu patch 185 */
+#else
+    const uint32_t gpu_window = ram_size;
+#endif
+    if (!nc_vm_map(vm, NC_CONTIG_WINDOW, 0, ram_size) || !nc_vm_map(vm, NC_GPU_WINDOW, 0, gpu_window)) {
         return false;
     }
 #if defined(__PROSPERO__)
@@ -723,6 +728,29 @@ static uint32_t free_pages(const NcVm *vm)
 uint32_t nc_vm_free_bytes(const NcVm *vm)
 {
     return free_pages(vm) * NC_PAGE;
+}
+
+/* Free GUEST-PHYSICAL bytes: pages in the title's own RAM window [0, RX_GUEST)
+ * that are not in use. This is what a contiguous allocation can actually draw
+ * on (contiguous blocks live in the guest window; nc_vm_alloc_phys_top/compact
+ * clamp to RX_GUEST). It is NOT the title's budget: on PS5 rx_free_pages caps
+ * free at guest_size while counting used pages across all of ram_size (the
+ * guest window plus the 2x backing that holds committed virtual memory), so
+ * once enough virtual memory is committed it reads 0 even while tens of MiB of
+ * guest-physical RAM sit free. Gating a contiguous allocation on that budget
+ * number made MmAllocateContiguousMemory fail with free guest RAM to spare
+ * (Half-Life 2 at a level load: free 0 KiB reported with a 34 MiB free run),
+ * and the title then used the null it got -- a hang spinning in its allocator
+ * (patch 299). This count agrees with nc_vm_free_runs, which also walks the
+ * guest window. */
+uint32_t nc_vm_free_guest_bytes(const NcVm *vm)
+{
+    const uint32_t pages = RX_GUEST(vm) / NC_PAGE;
+    uint32_t used = 0;
+    for (uint32_t p = 0; p < pages; p++) {
+        used += vm->page_used[p] != 0;
+    }
+    return (pages - used) * NC_PAGE;
 }
 
 void nc_vm_free_runs(const NcVm *vm, char *buf, size_t len)

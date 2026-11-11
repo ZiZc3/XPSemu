@@ -155,6 +155,11 @@ bool nc_vm_claim_phys(NcVm *vm, uint32_t pa, uint32_t len);
 bool nc_vm_alloc_at(NcVm *vm, uint32_t va, uint32_t len, uint32_t *pa_out);
 /* Physical RAM not in use (bytes). */
 uint32_t nc_vm_free_bytes(const NcVm *vm);
+/* Free guest-physical RAM (bytes) in the title's window [0, RX_GUEST): what a
+ * contiguous allocation can draw on, unlike nc_vm_free_bytes which on PS5 is
+ * the title's shared budget and reads 0 once its virtual memory fills the
+ * backing even while guest RAM is free (patch 299). */
+uint32_t nc_vm_free_guest_bytes(const NcVm *vm);
 /* The free physical runs of 64 KiB or more (pa+size), their count and the
  * largest, as text (out-of-memory reports). */
 void nc_vm_free_runs(const NcVm *vm, char *buf, size_t len);

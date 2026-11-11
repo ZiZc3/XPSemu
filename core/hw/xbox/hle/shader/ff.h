@@ -121,7 +121,11 @@ typedef struct HleFfStage {
     uint32_t alphaop, alphaarg0, alphaarg1, alphaarg2;
     uint32_t resultarg;
     uint8_t texture;                  /* a texture is bound to this stage */
-    uint8_t tex_dim;                  /* 2 = 2D, 3 = cube, 4 = volume */
+    uint8_t sgn;                      /* patch 334: colour sign, the texel's channels
+                                         (bit 0 r .. 3 a) uploaded offset binary, bits
+                                         4-7 those read as stored (two's complement);
+                                         in the byte an unused tex_dim (always 0) had,
+                                         so the key's size and other draws' keys stay */
     uint8_t alpha_kill;               /* D3DTSS_ALPHAKILL: texel alpha 0 discards */
     uint8_t unset;                    /* no texture set (D3D's Textures[stage] NULL): an
                                          op reading the texture passes CURRENT through */
@@ -131,7 +135,8 @@ typedef struct HleFfPsKey {
     HleFfStage st[HLE_FF_STAGES];
     uint8_t nstages;                  /* stages up to the first COLOROP DISABLE */
     uint8_t alpha_test;               /* ALPHATESTENABLE */
-    uint8_t alpha_func;               /* D3DCMP_* - 0x200 (0..7) */
+    uint8_t alpha_func;               /* D3DCMP_* - 0x200 (0..7); bit 3 (patch 354): MSAA
+                                         alpha-to-coverage (HLE_A2C_BIT) */
     uint8_t specular;                 /* SPECULARENABLE (add specular) */
     uint8_t flat;
     uint8_t fog;                      /* 0 off; FOGTABLEMODE + 1 (NONE 1 .. LINEAR 4) */
@@ -294,6 +299,25 @@ static inline const char *hle_push_glsl(void)
     HLE_ZNORM_GLSL("wRaw", "wN") \
     "  float wDepth = clamp(wN, 0.0, 1.0);\n"
 #define HLE_WBUF_STORE_GLSL "  gl_FragDepth = wDepth;\n"
+
+/* patch 354: MSAA alpha-to-coverage for alpha-tested cut-outs (grass, leaves,
+ * fences, hair). vk/draw.c sets HLE_A2C_BIT in the keys' alpha_func only in
+ * an MSAA pass with blending off and a cut-out's test (GREATER or GEQUAL),
+ * and that pipeline turns alphaToCoverageEnable on. The hard test becomes a
+ * ramp one pixel's alpha change wide (fwidth) around the reference: alpha
+ * well under it is still discarded (no colour, depth or stencil, as the
+ * test), well over it is 1 (every sample), and in between the samples
+ * covered follow how far the edge reaches into the pixel, so the cut-out's
+ * edge is smoothed along the texture's own outline. The ramp's middle stays
+ * inside 0..1 (reference 0 with GREATER: alpha 0 still fails; 1 with GEQUAL:
+ * alpha 1 still covers whole). Without the bit the test is as before. */
+#define HLE_A2C_BIT 8u
+#define HLE_A2C_GLSL(v) \
+    "  { float a = " v ".a, r = pc.alpha_ref;\n" \
+    "    float w = clamp(fwidth(a), 1.0 / 1024.0, 0.5);\n" \
+    "    float m = clamp(r, 0.5 * w, 1.0 - 0.5 * w);\n" \
+    "    " v ".a = clamp((a - m) / w + 0.5, 0.0, 1.0);\n" \
+    "    if (" v ".a <= 0.0) discard; }\n"
 
 /* EQUAL depth passes that do not write (vk/draw.c eq_tol) test LESSEQUAL a
  * step toward the eye, which passes everything in front of the stored depth

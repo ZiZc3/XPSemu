@@ -36,6 +36,7 @@ NC_SECTION_FNS(usb)   /* native/dev/ohci.c (with the hub and the controllers) */
 NC_SECTION_FNS(nic)   /* native/dev/nvnet.c */
 void nc_nic_state_absent(void);
 NC_SECTION_FNS(misc)  /* native/dev/ports.c */
+NC_SECTION_FNS(chih)  /* native/dev/chihiro/chihiro_usb.c: Sega Chihiro base boards (patch 209) */
 NC_SECTION_FNS(mods)  /* native/core/mods.c: the mods' XBE patches in the RAM */
 
 #undef NC_SECTION_FNS

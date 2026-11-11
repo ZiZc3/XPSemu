@@ -21,6 +21,7 @@ extern "C" {
 #define NC_DISC_OVERLAY 0xF0000000u
 
 typedef struct NcDiscOverlay NcDiscOverlay;
+struct NcDirCache;
 
 typedef struct NcDisc {
     int fd;
@@ -28,6 +29,7 @@ typedef struct NcDisc {
     uint32_t root_sector;
     uint32_t root_size;
     NcDiscOverlay *ov;     /* NULL: the disc as it is */
+    struct NcDirCache *dirs; /* the folders' tables in memory (nc_disc_cache_folders), or NULL */
 } NcDisc;
 
 typedef struct NcDiscFile {
@@ -38,6 +40,22 @@ typedef struct NcDiscFile {
 
 bool nc_disc_open(NcDisc *d, int fd);
 void nc_disc_close(NcDisc *d);
+
+/* The disc's folder tables kept in memory once read, and all of them read
+ * ahead on a helper thread. A file's open looked its path up on the disc,
+ * folder by folder, on the emulated CPU's thread: from a share the read
+ * waited behind the disc reader's 1.5 MiB reads (30-65 ms an open,
+ * interrupts held off meanwhile: a game loading while its intro movie plays
+ * starved the movie's sound, and the movie, timed by it, stalled). The
+ * game's disc only (the core's). */
+void nc_disc_cache_folders(NcDisc *d);
+
+/* Visits a directory's entries in sorted order until fn returns false. dir
+ * holds the directory's size bytes. Each entry is visited once, so a
+ * malformed tree that loops still ends. fn only sees entries whose name
+ * (e[13] bytes at e + 14) fits inside dir. Returns false if out of memory. */
+typedef bool (*NcXdvdfsEntryFn)(void *ctx, const uint8_t *e, uint32_t off);
+bool nc_xdvdfs_walk(const uint8_t *dir, uint32_t size, NcXdvdfsEntryFn fn, void *ctx);
 
 /* Finds a path such as "\\default.xbe" or "media/x.bin" (either slash,
  * case-insensitive). */
@@ -58,6 +76,9 @@ bool nc_disc_read_file(const NcDisc *d, const NcDiscFile *f, uint64_t off, void 
  * patches: bytes over a file's content at off (the overlay's file if it
  * replaced it). */
 bool nc_disc_overlay_file(NcDisc *d, const char *path, const char *host);
+/* XPSemu patch 219: a file served by a hook (a Sega Chihiro image's, read in place: no unpacking) */
+bool nc_disc_overlay_virtual(NcDisc *d, const char *path, uint32_t size, unsigned id);
+extern bool (*nc_disc_vread_hook)(unsigned id, uint64_t off, void *buf, size_t len);
 void nc_disc_overlay_seal(NcDisc *d);
 bool nc_disc_overlay_patch(NcDisc *d, const char *path, uint64_t off, const uint8_t *bytes, uint32_t len);
 /* The disc's own file and bytes, past the overlay and its patches (what

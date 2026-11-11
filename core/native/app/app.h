@@ -30,8 +30,11 @@ void nc_present_set_fxaa(bool on);
 void nc_present_set_smaa(bool on);
 /* A frame smaller than its place in the window: scaled up bilinearly, or by
  * Snapdragon Game Super Resolution (a larger one is always averaged down). */
-enum { NC_UPSCALE_BILINEAR, NC_UPSCALE_SGSR };   /* swapchain.h HLE_UPSCALE_*'s */
+enum { NC_UPSCALE_BILINEAR, NC_UPSCALE_SGSR, NC_UPSCALE_CAS };   /* swapchain.h HLE_UPSCALE_*'s */
 void nc_present_set_upscale(int mode);
+/* patch 247: CAS's sharpness 0 to 4 (0.0 to 1.0); the CRT filter 0 off, 1 scanlines, 2 CRT */
+void nc_present_set_cas(int level);
+void nc_present_set_crt(int mode);
 /* Frames the title presented per second over the last half second, their
  * average interval, and the last one's (ms). */
 void nc_present_stats(float *fps, float *avg_ms, float *last_ms);

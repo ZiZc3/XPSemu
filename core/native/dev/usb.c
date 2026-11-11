@@ -43,6 +43,9 @@ static int standard(NcUsbDev *d, const uint8_t *s, int wlen)
     if ((type & 0x60) != 0) {
         return -3; /* class or vendor */
     }
+    if (!d->dev_desc && req != REQ_SET_ADDRESS) {
+        return -3; /* no tables: the device answers them itself (the Chihiro base boards' firmware) */
+    }
     switch (req) {
     case REQ_GET_DESCRIPTOR:
         if (type != 0x80) {

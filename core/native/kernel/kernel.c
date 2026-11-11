@@ -8,6 +8,7 @@
 #include "native/core/mmio.h"
 #include "native/core/mods.h"
 #include "native/core/irq.h"
+#include "native/core/trainer.h"
 #include "hw/xbox/hle/hitch.h"
 
 #include <ctype.h>
@@ -609,6 +610,12 @@ bool nc_kernel_init(NcKernel *k, NcVm *vm)
         nc_wr32(p + 4, q + 4);
         nc_wr32(p + 8, q + 4);
     }
+    /* Sega Chihiro mode (XPSemu patch 185): NC_CHIHIRO set by the PS5 layer for an arcade game's start */
+    uint8_t *hwinfo = data_ptr(k, "XboxHardwareInfo");
+    if (hwinfo && getenv("NC_CHIHIRO")) {
+        nc_wr32(hwinfo, nc_rd32(hwinfo) | 0x8u);
+        nc_log("hakuX-native", "Chihiro: the arcade flag is set (XboxHardwareInfo %08x)", nc_rd32(hwinfo));
+    }
     uint8_t *kdnp = data_ptr(k, "KdDebuggerNotPresent");
     if (kdnp) {
         kdnp[0] = 1;
@@ -1096,6 +1103,98 @@ void nc_kernel_clock_arm(NcKernel *k)
 /* Timers and wait timeouts that are due: fire them, wake their threads, and
  * reschedule if one of those outranks the running thread. Then the running
  * thread's slice. */
+/* patch 361 (debug): NC_PROBE="<hex eip>[,<hex eip>...]" (up to 8) hooks those guest instructions; each hit is
+ * counted and the first 24 logged with the registers, and NC_PROBE_OFS="<hex>[,<hex>]" (up to 4) adds the dwords at
+ * esi+each offset. Once a second: the hits per address and the last values. For tracing a game's own logic
+ * (RalliSport Challenge 2's roadside streamer: its evictions and loads, and its free / busy block counts). */
+static struct {
+    int n, nofs;
+    uint32_t eip[8], ofs[4], hits[8], last[8][4];
+    uint64_t t;
+    unsigned logged;
+} g_probe = { .n = -1 };
+
+static void probe_read_env(void)
+{
+    g_probe.n = 0;
+    const char *e = getenv("NC_PROBE");
+    for (const char *c = e; c && *c && g_probe.n < 8;) {
+        char *end;
+        const unsigned long v = strtoul(c, &end, 16);
+        if (end == c) {
+            break;
+        }
+        g_probe.eip[g_probe.n++] = (uint32_t)v;
+        c = *end == ',' ? end + 1 : end;
+    }
+    const char *o = getenv("NC_PROBE_OFS");
+    for (const char *c = o; c && *c && g_probe.nofs < 4;) {
+        char *end;
+        const unsigned long v = strtoul(c, &end, 16);
+        if (end == c) {
+            break;
+        }
+        g_probe.ofs[g_probe.nofs++] = (uint32_t)v;
+        c = *end == ',' ? end + 1 : end;
+    }
+}
+
+bool nc_probe_is(uint32_t eip)
+{
+    if (g_probe.n < 0) {
+        probe_read_env();
+    }
+    for (int i = 0; i < g_probe.n; i++) {
+        if (g_probe.eip[i] == eip) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool probe_hit(NcKernel *k, NcFrame *f, uint32_t eip)
+{
+    if (g_probe.n <= 0) {
+        return false;
+    }
+    int i = 0;
+    while (i < g_probe.n && g_probe.eip[i] != eip) {
+        i++;
+    }
+    if (i == g_probe.n) {
+        return false;
+    }
+    g_probe.hits[i]++;
+    const uint32_t esi = nc_frame_gpr(f, NC_ESI);
+    for (int j = 0; j < g_probe.nofs; j++) {
+        const uint32_t a = esi + g_probe.ofs[j];
+        g_probe.last[i][j] = nc_vm_phys(k->vm, a) != UINT32_MAX && nc_vm_phys(k->vm, a + 3) != UINT32_MAX
+                                 ? nc_vm_rd32(k->vm, a) : 0xDEADDEADu;
+    }
+    if (g_probe.logged < 24) {
+        g_probe.logged++;
+        nc_log("hakuX-probe", "%08x hit %u: eax %08x ecx %08x edx %08x ebx %08x esi %08x edi %08x | [esi+ofs] %08x %08x "
+               "%08x %08x", eip, g_probe.hits[i], nc_frame_gpr(f, NC_EAX), nc_frame_gpr(f, NC_ECX),
+               nc_frame_gpr(f, NC_EDX), nc_frame_gpr(f, NC_EBX), esi, nc_frame_gpr(f, NC_EDI), g_probe.last[i][0],
+               g_probe.last[i][1], g_probe.last[i][2], g_probe.last[i][3]);
+    }
+    const uint64_t now = nc_ke_now_ns();
+    if (now - g_probe.t >= 1000000000ull) {
+        g_probe.t = now;
+        char b[512];
+        int o = 0;
+        for (int j = 0; j < g_probe.n && o < (int)sizeof(b) - 80; j++) {
+            o += snprintf(b + o, sizeof(b) - (size_t)o, " %08x: %u hits [%x %x %x %x]", g_probe.eip[j],
+                          g_probe.hits[j], g_probe.last[j][0], g_probe.last[j][1], g_probe.last[j][2],
+                          g_probe.last[j][3]);
+            g_probe.hits[j] = 0;
+        }
+        nc_log("hakuX-probe", "per s:%s", b);
+    }
+    nc_frame_bypass_hook(f);
+    return true;
+}
+
 static void clock_tick(NcKernel *k)
 {
     if (!k->timer_due_ns && !k->wait_due_ns && !k->slice_due_ns) {
@@ -1656,6 +1755,7 @@ void nc_kernel_pause_point(NcKernel *k, NcFrame *f, bool idle)
         }
         if (nc_pause_cpu_work()) {
             nc_state_cpu_work(k, f, idle);
+            nc_trainer_cpu_work();      /* patch 252: a trainer option switched from the quick menu */
         }
     }
     const uint64_t c1 = nc_cpu_host_cycles();
@@ -1790,6 +1890,9 @@ static bool sysop(void *opaque, NcFrame *f, enum NcSysOp op, unsigned size)
         break;
     case NC_SYSOP_HOOK:
         if (nc_x86mmio_hook(k, f, eip)) {
+            break;
+        }
+        if (probe_hit(k, f, eip)) {     /* patch 361 (debug) */
             break;
         }
         if (k->hle_hook) {

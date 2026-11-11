@@ -13,6 +13,7 @@
  */
 #include "native/kernel/kernel.h"
 #include "native/kernel/xc_crypto.h"
+#include "native/core/hostio.h"
 #include "native/dev/dev.h"
 #include "native/core/irq.h"
 #include "native/core/xdvdfs.h"
@@ -27,11 +28,16 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 #ifdef __ANDROID__
 #include "hw/xbox/hle/prop.h"
 #endif
+
+static void writes_drain(void);
+bool nc_pread_sure(int fd, void *buf, size_t len, uint64_t off);
+bool nc_pwrite_sure(int fd, const void *buf, size_t len, uint64_t off);
 
 #define STATUS_NO_MORE_FILES          0x80000006u
 #define STATUS_INVALID_DEVICE_REQUEST 0xC0000010u
@@ -68,6 +74,7 @@
 #define FILE_ATTRIBUTE_READONLY  0x01u
 #define FILE_ATTRIBUTE_DIRECTORY 0x10u
 #define FILE_ATTRIBUTE_NORMAL    0x80u
+#define FILE_ATTRIBUTE_ARCHIVE   0x20u
 
 #define DISC_TIME 0x01C0739BEB8F8000ull /* 2001-01-01 */
 
@@ -124,6 +131,12 @@ typedef struct NcFile {
      * pends for a failed one; its copy stopped after the first, and the area
      * then loaded from a file of zeros (no room drawn, nor in cutscenes). */
     bool no_buffering;
+    /* patch 307: a handle on the persistent write-helper (wbwriter.elf, a
+     * process outside the sandbox that isn't write-throttled) when this is a
+     * writable cache-drive file and the helper is up; 0 = none, <0 = tried and
+     * failed (write in place). Not part of the save state (opened fresh after a
+     * state load). */
+    int wb_handle;
 } NcFile;
 
 /* DesiredAccess bits that grant writing the data. */
@@ -284,6 +297,20 @@ static bool canon(const char *in, char *out, size_t cap)
         char joined[512];
         snprintf(joined, sizeof(joined), "%s\\%s", g_links[l].target, tmp + 6);
         snprintf(tmp, sizeof(tmp), "%s", joined);
+    } else if (prefix_ci(tmp, "\\??\\")) {
+        /* a longer drive name (the Chihiro media board's mbfs:, mbcom:, mbrom0:, mbrom1:; XPSemu patch 187) */
+        const char *colon = strchr(tmp + 4, ':');
+        const char *slash = strchr(tmp + 4, '\\');
+        if (colon && (!slash || colon < slash) && colon - tmp < 40) {
+            char name[48];
+            snprintf(name, sizeof(name), "%.*s", (int)(colon - tmp + 1), tmp);
+            const int l = link_find(name);
+            if (l >= 0) {
+                char joined[512];
+                snprintf(joined, sizeof(joined), "%s\\%s", g_links[l].target, colon + 1);
+                snprintf(tmp, sizeof(tmp), "%s", joined);
+            }
+        }
     }
     /* Fold components. */
     char *parts[64];
@@ -315,9 +342,17 @@ static bool canon(const char *in, char *out, size_t cap)
 
 /* Which device a canonical path is on: -1 the disc, 0..7 a partition, -2
  * unknown. rel receives the path inside the device ("" for its root). */
+#define DEV_MB0 8   /* \Device\MediaBoard\Partition0 .. 3: 8 .. 11 (Chihiro) */
+
 static int device_of(const char *path, const char **rel)
 {
     static const char cd[] = "\\Device\\CdRom0";
+    static const char mb[] = "\\Device\\MediaBoard\\Partition";
+    if (getenv("NC_CHIHIRO") && prefix_ci(path, mb) && path[sizeof(mb) - 1] >= '0' && path[sizeof(mb) - 1] <= '3' &&
+        (!path[sizeof(mb)] || path[sizeof(mb)] == '\\')) {
+        *rel = path + sizeof(mb);
+        return DEV_MB0 + (path[sizeof(mb) - 1] - '0');
+    }
     static const char hd[] = "\\Device\\Harddisk0\\Partition";
     if (prefix_ci(path, cd) && (!path[sizeof(cd) - 1] || path[sizeof(cd) - 1] == '\\')) {
         *rel = path + sizeof(cd) - 1;
@@ -363,11 +398,11 @@ static bool mkdirs(const char *path)
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = 0;
-            mkdir(tmp, 0775);
+            mkdir(tmp, 0777);
             *p = '/';
         }
     }
-    return mkdir(tmp, 0775) == 0 || errno == EEXIST;
+    return mkdir(tmp, 0777) == 0 || errno == EEXIST;
 }
 
 /* Host path for a path inside partition part, matching existing names
@@ -377,6 +412,44 @@ static bool mkdirs(const char *path)
  * each game to have its own: another game can't wipe them, a state finds its files. */
 static char g_cache_root[256];
 
+static bool ram_enabled(void);   /* patch 288 (defined below) */
+
+/* Delete our own stale 0-byte placeholder cache files (left by a prior ramcache run that exited or
+ * crashed with files still resident in RAM, or by ramcache since being disabled). A 0-byte file
+ * where the game wrote real data makes the guest read nothing and hang (patch 293: this bit Fable -
+ * fonts.big left 0 bytes, read empty, black screen). Only when ramcache is OFF this launch: with it
+ * on, those files are served from RAM, not disk. A deleted (missing) file is safe - the game rebuilds
+ * it; a present 0-byte file is not. Markers and other non-empty files are untouched. */
+static void cache_sweep_empty(const char *dir, unsigned depth, unsigned *n)
+{
+    if (depth > 24) {
+        return;
+    }
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    while (d && (de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) {
+            continue;
+        }
+        char p[600];
+        struct stat st;
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        if (lstat(p, &st) != 0) {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            cache_sweep_empty(p, depth + 1, n);
+        } else if (S_ISREG(st.st_mode) && st.st_size == 0) {
+            if (unlink(p) == 0) {
+                (*n)++;
+            }
+        }
+    }
+    if (d) {
+        closedir(d);
+    }
+}
+
 void nc_io_set_cache_game(uint32_t title)
 {
     snprintf(g_cache_root, sizeof(g_cache_root), "%s/cache/%08x", g_hdd_root, title);
@@ -384,6 +457,14 @@ void nc_io_set_cache_game(uint32_t title)
     snprintf(dir, sizeof(dir), "%s", g_cache_root);
     mkdirs(dir);
     nc_log("hakuX-native-io", "cache drives: %s", g_cache_root);
+    if (!ram_enabled() && g_cache_root[0]) {
+        unsigned n = 0;
+        cache_sweep_empty(g_cache_root, 0, &n);
+        if (n) {
+            nc_log("hakuX-native-io", "cache: deleted %u stale 0-byte placeholder file(s) under %s so the game "
+                   "rebuilds them (patch 293: never serve a 0-byte file as real data)", n, g_cache_root);
+        }
+    }
 }
 
 const char *nc_io_part_root(int part)
@@ -393,6 +474,28 @@ const char *nc_io_part_root(int part)
 
 static int host_path(int part, const char *rel, char *out, size_t cap)
 {
+    if (part >= DEV_MB0) {
+        /* the game's folder (mbfs:), else one file each: mbcom:, mbrom0:, mbrom1: */
+        static const char *const file[4] = { NULL, "/data/xpsemu/chihiro/run/mbcom.bin",
+                                             "/data/xpsemu/chihiro/boot/segaboot_old.xbe",
+                                             "/data/xpsemu/chihiro/boot/default.xbe" };
+        struct stat st;
+        if (part > DEV_MB0) {
+            if (*rel) {
+                return -1;
+            }
+            snprintf(out, cap, "%s", file[part - DEV_MB0]);
+            return stat(out, &st) == 0 ? 1 : 0;
+        }
+        const char *root = getenv("NC_CHIHIRO_FS");
+        snprintf(out, cap, "%s%s", root ? root : "/data/xpsemu/chihiro/run/none", rel);
+        for (char *p = out; *p; p++) {
+            if (*p == '\\') {
+                *p = '/';
+            }
+        }
+        return stat(out, &st) == 0 ? 1 : 0;
+    }
     size_t len = (size_t)snprintf(out, cap, "%s/Partition%d", nc_io_part_root(part), part);
     mkdirs(out);
     char tmp[512];
@@ -494,9 +597,21 @@ static NcFile *file_of(NcKernel *k, uint32_t handle)
  * data (the page cache). A full queue closes in place. */
 typedef struct CloseJob {
     int fd;
+    int wb_handle;       /* patch 307: the write-helper handle to close too, or 0 */
+    int fsync_helper;    /* patch 308b: a flush's helper handle (fsync, not close), or 0 */
     char path[64];       /* for the log */
     char old_path[320];
 } CloseJob;
+
+/* patch 307: the persistent write-helper (ps5/src/wbwriter_client.c). It streams
+ * wbwriter.elf to elfldr once and keeps a socket to a process outside the sandbox
+ * that is NOT write-throttled; cache-drive writes go there. Every call is
+ * fail-soft - any failure and the helper goes unavailable and we write in place. */
+extern int wbwr_available(void);
+extern int wbwr_open(const char *host);
+extern long wbwr_write(int handle, uint64_t off, const void *data, uint32_t len);
+extern int wbwr_fsync(int handle);
+extern void wbwr_close(int handle);
 
 static struct {
     pthread_mutex_t mu;
@@ -508,10 +623,24 @@ static struct {
 
 static void close_now(const CloseJob *j)
 {
-    if (fsync(j->fd) != 0) {
+    /* patch 308b: a file the helper wrote is fsynced by its own descriptor.
+     * Syncing the app's descriptor too is charged to the app and was still
+     * throttled (a 49 MiB state took 16 s that way); only a file with local
+     * fallback bytes needs the app's fsync. */
+    const int fh = j->fsync_helper > 0 ? j->fsync_helper : j->wb_handle;
+    if (fh > 0) {
+        if (wbwr_fsync(fh) != 0 && j->fd >= 0 && fsync(j->fd) != 0) {
+            nc_log("hakuX-native-io", "sync %s: %s", j->path, strerror(errno));
+        }
+    } else if (j->fd >= 0 && fsync(j->fd) != 0) {
         nc_log("hakuX-native-io", "sync %s: %s", j->path, strerror(errno));
     }
-    close(j->fd);
+    if (j->fd >= 0) {
+        close(j->fd);
+    }
+    if (j->wb_handle > 0) {
+        wbwr_close(j->wb_handle);       /* patch 307: the helper's own descriptor, after its writes */
+    }
     if (j->old_path[0]) {
         unlink(j->old_path);
     }
@@ -534,11 +663,8 @@ static void *closer_thread(void *arg)
     return NULL;
 }
 
-static void close_later(const NcFile *nf)
+static void close_queue(CloseJob j)
 {
-    CloseJob j = {.fd = nf->fd};
-    snprintf(j.path, sizeof(j.path), "%s", nf->path);
-    snprintf(j.old_path, sizeof(j.old_path), "%s", nf->old_path);
     pthread_mutex_lock(&g_closer.mu);
     if (!g_closer.started) {
         pthread_t t;
@@ -558,32 +684,502 @@ static void close_later(const NcFile *nf)
     }
 }
 
+static void close_later(const NcFile *nf)
+{
+    CloseJob j = {.fd = nf->fd, .wb_handle = nf->wb_handle};    /* patch 307: close the helper handle too */
+    snprintf(j.path, sizeof(j.path), "%s", nf->path);
+    snprintf(j.old_path, sizeof(j.old_path), "%s", nf->old_path);
+    close_queue(j);
+}
+
 /* NtFlushBuffersFile: the same sync on the closer thread, of a duplicate of
  * the descriptor (the title may close the file meanwhile), in order with the
  * closes. On the guest's CPU it took up to 211 ms (Forza's saves in the
  * menus), nothing else running. */
 static void flush_later(const NcFile *nf)
 {
-    NcFile d = *nf;
-    d.fd = dup(nf->fd);
-    if (d.fd < 0) {
-        fsync(nf->fd);
+    CloseJob j = {.fd = dup(nf->fd)};
+    if (j.fd < 0) {
+        if (nf->wb_handle > 0) {
+            wbwr_fsync(nf->wb_handle);
+        } else {
+            fsync(nf->fd);
+        }
         return;
     }
-    d.old_path[0] = 0;          /* the overwritten contents go at the close */
-    close_later(&d);
+    snprintf(j.path, sizeof(j.path), "%s", nf->path);
+    j.fsync_helper = nf->wb_handle;    /* patch 308b: flush through the helper, do not close it */
+    j.old_path[0] = 0;                 /* the overwritten contents go at the close */
+    close_queue(j);
+}
+
+static bool soft_range(uint32_t va, uint32_t len);
+static bool ram_enabled(void);          /* patch 288: RAM cache (defined below) */
+static void ram_drop(const char *host);
+
+/* patch 356: a host read that the PS5 refuses for a moment (ENOMEM / EAGAIN / EINTR, or a short read) is tried again,
+ * then through a buffer of our own: RalliSport Challenge 2's music read from Z: (32 KiB into the game's buffer) failed
+ * "Cannot allocate memory" once, the game saw STATUS_DEVICE_DATA_ERROR and showed its dirty-disc screen (issue #33). */
+bool nc_pread_sure(int fd, void *buf, size_t len, uint64_t off)
+{
+    uint8_t *p = buf;
+    size_t done = 0;
+    for (unsigned tries = 0; done < len && tries < 6;) {
+        const ssize_t n = pread(fd, p + done, len - done, (off_t)(off + done));
+        if (n > 0) {
+            done += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            break;                      /* the end of the file */
+        }
+        tries++;
+        static unsigned told;
+        if (told++ < 16) {
+            nc_log("hakuX-native-io", "read of %zu bytes at +%llx refused (%s): tried again", len - done,
+                   (unsigned long long)(off + done), strerror(errno));
+        }
+        const struct timespec ts = {0, 2000000};
+        nanosleep(&ts, NULL);
+    }
+    if (done < len) {
+        uint8_t *b = malloc(len - done);
+        if (b) {
+            const ssize_t n = pread(fd, b, len - done, (off_t)(off + done));
+            if (n == (ssize_t)(len - done)) {
+                memcpy(p + done, b, len - done);
+                done = len;
+            }
+            free(b);
+        }
+    }
+    return done == len;
+}
+
+/* patch 356: the same for a host write: a refused or short pwrite tried again, then from a buffer of our own */
+bool nc_pwrite_sure(int fd, const void *buf, size_t len, uint64_t off)
+{
+    const uint8_t *p = buf;
+    size_t done = 0;
+    for (unsigned tries = 0; done < len && tries < 6;) {
+        const ssize_t n = pwrite(fd, p + done, len - done, (off_t)(off + done));
+        if (n > 0) {
+            done += (size_t)n;
+            continue;
+        }
+        tries++;
+        static unsigned told;
+        if (told++ < 16) {
+            nc_log("hakuX-native-io", "write of %zu bytes at +%llx refused (%s): tried again", len - done,
+                   (unsigned long long)(off + done), strerror(errno));
+        }
+        const struct timespec ts = {0, 2000000};
+        nanosleep(&ts, NULL);
+    }
+    if (done < len) {
+        uint8_t *b = malloc(len - done);
+        if (b) {
+            memcpy(b, p + done, len - done);
+            if (pwrite(fd, b, len - done, (off_t)(off + done)) == (ssize_t)(len - done)) {
+                done = len;
+            }
+            free(b);
+        }
+    }
+    return done == len;
+}
+
+/* ---- Write-behind for the cache drives (XOG patch 261, xogfix=cachewrite, per game) ----
+ * A write to a file on a cache partition (Partition3-5, the utility drives)
+ * is copied into a host buffer and completes in the call, as it did, same
+ * status, IoStatusBlock, event and APC; the writer thread does the pwrite,
+ * in order. Far Cry Instincts copies its sounds from the disc to Z: while
+ * its Ubisoft and Crytek intros play: each pwrite in place held the guest's
+ * one CPU 9-15 ms and the Bink decoder ran at 20-26 fps.
+ * Anything else on a file with writes queued (a read, its size or times,
+ * set-size, rename, delete, an open of the same path, a listing of its
+ * folder, a format) waits for that path's queue first; a close or flush goes
+ * into the queue behind its writes (the descriptor stays open until they are
+ * done, so its number can't be reused under them). Save states, a state load
+ * and leaving the game drain the whole queue. At most WB_CAP bytes wait:
+ * past it the game waits for room. */
+#define WB_CAP (64u << 20)
+#define WB_PATHS 64
+
+typedef struct WbJob {
+    struct WbJob *next;
+    int fd;
+    int wb_handle;          /* patch 307: the write-helper handle, or 0 to pwrite in place */
+    int slot;               /* g_wb.path[] */
+    uint64_t off;
+    uint32_t len;
+    bool is_close;          /* a close or flush (cj) behind the writes */
+    CloseJob cj;
+    uint8_t data[];
+} WbJob;
+
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;      /* a job queued */
+    pthread_cond_t done;    /* a job done */
+    WbJob *head, *tail;
+    uint64_t backlog;       /* bytes queued, not yet written */
+    struct {
+        char host[512];
+        unsigned pending;   /* 0: free */
+    } path[WB_PATHS];
+    unsigned npaths;        /* paths with jobs (read without the lock as a hint) */
+    bool started;
+    /* this second's figures, for the log */
+    uint64_t s_writes, s_in, s_done, s_out, s_write_ns, s_longest_ns, s_waits, s_wait_ns, s_wait_longest_ns;
+    uint64_t total_in, total_out, s_t0;
+} g_wb = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
+static int g_wb_on = -1;
+
+static uint64_t wb_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int g_wb_helper = -1;    /* patch 307: 1 while the write-helper is routing (set once) */
+
+static bool wb_enabled(void)
+{
+    if (g_wb_on < 0) {
+        const char *e = getenv("XOG_FIX");
+        const int cachewrite = e && strstr(e, "cachewrite") ? 1 : 0;
+        /* patch 307: general when the un-throttled helper loads (it only changes
+         * HOW cache writes reach the disk, via a process outside the sandbox);
+         * without it, keep today's behaviour (synchronous in place unless the
+         * game opted into xogfix=cachewrite). */
+        g_wb_helper = wbwr_available() ? 1 : 0;
+        g_wb_on = (cachewrite || g_wb_helper) ? 1 : 0;
+        if (g_wb_on) {
+            nc_log("hakuX-native-io",
+                   "cachewrite: cache-drive (Partition3-5) writes go to a writer thread%s (at most %u MiB waiting)",
+                   g_wb_helper ? ", then to an un-throttled helper process (patch 307, all titles)"
+                               : " (xogfix=cachewrite)",
+                   WB_CAP >> 20);
+        }
+    }
+    return g_wb_on == 1;
+}
+
+/* With g_wb.mu held: the slot of host's queue, or -1. */
+static int wb_slot(const char *host)
+{
+    for (int i = 0; i < WB_PATHS; i++) {
+        if (g_wb.path[i].pending && !strcasecmp(g_wb.path[i].host, host)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* With g_wb.mu held: a queue for host or anything under it (a folder's). */
+static bool wb_busy_under(const char *host)
+{
+    const size_t n = strlen(host);
+    for (int i = 0; i < WB_PATHS; i++) {
+        const char *p = g_wb.path[i].host;
+        if (g_wb.path[i].pending && !strncasecmp(p, host, n) && (p[n] == 0 || p[n] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* With g_wb.mu held: the game waited from t0 (the log's figures). */
+static void wb_waited(uint64_t t0)
+{
+    const uint64_t d = wb_ns() - t0;
+    g_wb.s_waits++;
+    g_wb.s_wait_ns += d;
+    if (d > g_wb.s_wait_longest_ns) {
+        g_wb.s_wait_longest_ns = d;
+    }
+}
+
+/* Waits for the queued writes to host and to anything under it. */
+static void wb_wait_under(const char *host)
+{
+    if (!__atomic_load_n(&g_wb.npaths, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    pthread_mutex_lock(&g_wb.mu);
+    if (wb_busy_under(host)) {
+        const uint64_t t0 = wb_ns();
+        while (wb_busy_under(host)) {
+            pthread_cond_wait(&g_wb.done, &g_wb.mu);
+        }
+        wb_waited(t0);
+    }
+    pthread_mutex_unlock(&g_wb.mu);
+}
+
+/* With g_wb.mu held: the second's figures to the log. */
+static void wb_log(const char *when)
+{
+    nc_log("hakuX-native-io", "cachewrite%s: %llu writes %llu KiB queued, %llu done %llu KiB in %.1f ms (longest "
+           "%.1f ms), backlog %llu KiB; the game waited %llu times %.1f ms (longest %.1f ms); in all %.1f of %.1f MiB "
+           "written", when, (unsigned long long)g_wb.s_writes, (unsigned long long)(g_wb.s_in >> 10),
+           (unsigned long long)g_wb.s_done, (unsigned long long)(g_wb.s_out >> 10), g_wb.s_write_ns / 1e6,
+           g_wb.s_longest_ns / 1e6, (unsigned long long)(g_wb.backlog >> 10), (unsigned long long)g_wb.s_waits,
+           g_wb.s_wait_ns / 1e6, g_wb.s_wait_longest_ns / 1e6, g_wb.total_out / 1048576.0,
+           g_wb.total_in / 1048576.0);
+    g_wb.s_writes = g_wb.s_in = g_wb.s_done = g_wb.s_out = g_wb.s_write_ns = g_wb.s_longest_ns = 0;
+    g_wb.s_waits = g_wb.s_wait_ns = g_wb.s_wait_longest_ns = 0;
+    g_wb.s_t0 = wb_ns();
+}
+
+static void *wb_thread(void *arg)
+{
+    pthread_mutex_lock(&g_wb.mu);
+    for (;;) {
+        while (!g_wb.head) {
+            if (g_wb.s_writes || g_wb.s_done || g_wb.s_waits) {
+                wb_log(" (queue empty)");
+            }
+            pthread_cond_wait(&g_wb.cv, &g_wb.mu);
+        }
+        WbJob *j = g_wb.head;
+        g_wb.head = j->next;
+        if (!g_wb.head) {
+            g_wb.tail = NULL;
+        }
+        pthread_mutex_unlock(&g_wb.mu);
+        const uint64_t t0 = wb_ns();
+        uint64_t put = 0;
+        if (j->is_close) {
+            close_now(&j->cj);
+        } else {
+            /* patch 307: hand the write to the un-throttled helper process. It
+             * only returns once the helper has done the pwrite, so the job isn't
+             * marked done (and wb_wait_under can't release a reader) until the
+             * bytes are in the shared page cache - the same ordering the local
+             * pwrite gives. On any helper trouble, write it in place (fail-soft). */
+            if (j->wb_handle > 0 && wbwr_write(j->wb_handle, j->off, j->data, j->len) == (long)j->len) {
+                put = j->len;
+            }
+            if (put < j->len && nc_pwrite_sure(j->fd, j->data + put, j->len - put, j->off + put)) {
+                put = j->len;           /* patch 356: a refused write tried again */
+            }
+            while (put < j->len) {
+                const ssize_t w = pwrite(j->fd, j->data + put, j->len - put, (off_t)(j->off + put));
+                if (w <= 0) {
+                    static unsigned told;
+                    if (told++ < 16) {
+                        nc_log("hakuX-native-io", "cachewrite: writing fd %d +%llx (%u bytes) failed: %s (first 16 "
+                               "logged)", j->fd, (unsigned long long)j->off, j->len,
+                               w < 0 ? strerror(errno) : "nothing written");
+                    }
+                    break;
+                }
+                put += (uint64_t)w;
+            }
+            /* when a game last wrote: leaving waits for it (main_ps5.c) */
+            extern volatile uint64_t g_xog_hdd_write_ms;
+            extern uint64_t rx_now_ms(void);
+            g_xog_hdd_write_ms = rx_now_ms();
+        }
+        const uint64_t took = wb_ns() - t0;
+        pthread_mutex_lock(&g_wb.mu);
+        if (!--g_wb.path[j->slot].pending) {
+            g_wb.path[j->slot].host[0] = 0;
+            __atomic_store_n(&g_wb.npaths, g_wb.npaths - 1, __ATOMIC_RELEASE);
+        }
+        g_wb.backlog -= j->len;
+        if (!j->is_close) {
+            g_wb.s_done++;
+            g_wb.s_out += put;
+            g_wb.total_out += put;
+        }
+        g_wb.s_write_ns += took;
+        if (took > g_wb.s_longest_ns) {
+            g_wb.s_longest_ns = took;
+        }
+        pthread_cond_broadcast(&g_wb.done);
+        if (wb_ns() - g_wb.s_t0 >= 1000000000ull) {
+            wb_log("");
+        }
+        pthread_mutex_unlock(&g_wb.mu);
+        free(j);
+        pthread_mutex_lock(&g_wb.mu);
+    }
+    return NULL;
+}
+
+/* With g_wb.mu held: j (its slot set here) to the queue; false without the writer thread. */
+static bool wb_push(WbJob *j, const char *host)
+{
+    if (!g_wb.started) {
+        pthread_t t;
+        g_wb.started = pthread_create(&t, NULL, wb_thread, NULL) == 0;
+        if (!g_wb.started) {
+            return false;
+        }
+        pthread_detach(t);
+        g_wb.s_t0 = wb_ns();
+    }
+    int s = wb_slot(host);
+    if (s < 0) {
+        uint64_t t0 = 0;
+        while ((s = wb_slot(host)) < 0) {
+            for (int i = 0; i < WB_PATHS && s < 0; i++) {
+                if (!g_wb.path[i].pending) {
+                    s = i;
+                }
+            }
+            if (s >= 0) {
+                snprintf(g_wb.path[s].host, sizeof(g_wb.path[s].host), "%s", host);
+                __atomic_store_n(&g_wb.npaths, g_wb.npaths + 1, __ATOMIC_RELEASE);
+                break;
+            }
+            t0 = t0 ? t0 : wb_ns();
+            pthread_cond_wait(&g_wb.done, &g_wb.mu);  /* every slot busy: one frees */
+        }
+        if (t0) {
+            wb_waited(t0);
+        }
+    }
+    g_wb.path[s].pending++;
+    j->slot = s;
+    j->next = NULL;
+    if (g_wb.tail) {
+        g_wb.tail->next = j;
+    } else {
+        g_wb.head = j;
+    }
+    g_wb.tail = j;
+    g_wb.backlog += j->len;
+    pthread_cond_signal(&g_wb.cv);
+    return true;
+}
+
+/* A write of len bytes at off to nf, from the guest's va0: queued (true), or
+ * false to write it in place (too big for the queue, no memory). */
+static bool wb_write(NcKernel *k, NcFile *nf, uint64_t off, uint32_t va0, uint32_t len)
+{
+    if (!len || len > WB_CAP / 4) {
+        return false;
+    }
+    /* patch 307: open this cache file on the helper the first time it is written
+     * (once per handle, off the writer thread). 0 = not tried, <0 = tried and
+     * failed (write in place from now on). */
+    if (g_wb_helper == 1 && nf->wb_handle == 0) {
+        const int h = wbwr_open(nf->host);
+        nf->wb_handle = h > 0 ? h : -1;
+    }
+    WbJob *j = malloc(sizeof(*j) + len);
+    if (!j) {
+        return false;
+    }
+    memset(j, 0, sizeof(*j));
+    j->fd = nf->fd;
+    j->wb_handle = nf->wb_handle > 0 ? nf->wb_handle : 0;
+    j->off = off;
+    j->len = len;
+    for (uint32_t put = 0; put < len;) {
+        const uint32_t va = va0 + put, left = len - put, room = NC_PAGE - (va & (NC_PAGE - 1));
+        const uint32_t chunk = soft_range(va, left) && left > room ? room : left;
+        memcpy(j->data + put, nc_vm_host(k->vm, va), chunk);
+        put += chunk;
+    }
+    pthread_mutex_lock(&g_wb.mu);
+    if (g_wb.backlog + len > WB_CAP) {
+        const uint64_t t0 = wb_ns();
+        while (g_wb.backlog + len > WB_CAP) {
+            pthread_cond_wait(&g_wb.done, &g_wb.mu);    /* full: the game waits for room */
+        }
+        wb_waited(t0);
+    }
+    const bool ok = wb_push(j, nf->host);
+    if (ok) {
+        g_wb.s_writes++;
+        g_wb.s_in += len;
+        g_wb.total_in += len;
+    }
+    pthread_mutex_unlock(&g_wb.mu);
+    if (!ok) {
+        free(j);
+    }
+    return ok;
+}
+
+/* A close (or a flush's duplicate) of host's descriptor behind its queued
+ * writes: true if queued, false (nothing queued for host) to do it as before. */
+static bool wb_close(const CloseJob *cj, const char *host)
+{
+    if (!__atomic_load_n(&g_wb.npaths, __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+    WbJob *j = calloc(1, sizeof(*j));
+    if (!j) {
+        wb_wait_under(host);
+        return false;
+    }
+    j->is_close = true;
+    j->cj = *cj;
+    j->fd = cj->fd;
+    pthread_mutex_lock(&g_wb.mu);
+    const bool ok = wb_slot(host) >= 0 && wb_push(j, host);
+    pthread_mutex_unlock(&g_wb.mu);
+    if (!ok) {
+        free(j);
+    }
+    return ok;
+}
+
+/* Every queued write on the disk (a save state, a state load, leaving the
+ * game): false if it took over timeout_ms. why: for the log. */
+bool nc_io_writes_drain(uint64_t timeout_ms, const char *why)
+{
+    writes_drain();                 /* the reader thread's host writes first */
+    if (!__atomic_load_n(&g_wb.npaths, __ATOMIC_ACQUIRE)) {
+        return true;
+    }
+    const uint64_t t0 = wb_ns();
+    pthread_mutex_lock(&g_wb.mu);
+    const uint64_t had = g_wb.backlog;
+    bool ok = true;
+    while (g_wb.npaths) {
+        pthread_mutex_unlock(&g_wb.mu);
+        if (wb_ns() - t0 > timeout_ms * 1000000ull) {
+            ok = false;
+            pthread_mutex_lock(&g_wb.mu);
+            break;
+        }
+        usleep(2000);
+        pthread_mutex_lock(&g_wb.mu);
+    }
+    const uint64_t left = g_wb.backlog;
+    pthread_mutex_unlock(&g_wb.mu);
+    nc_log("hakuX-native-io", "cachewrite: %s: %llu KiB waiting written in %.0f ms%s", why,
+           (unsigned long long)((had - left) >> 10), (wb_ns() - t0) / 1e6, ok ? "" : " (not all: timed out)");
+    return ok;
 }
 
 void nc_io_close(NcKernel *k, uint32_t object)
 {
+    writes_drain();                 /* a close is behind the writes already queued */
     uint32_t i = nc_vm_rd32(k->vm, object + FO_INDEX);
     if (i < MAX_FILES && g_files[i].used) {
         NcFile *nf = &g_files[i];
         if (nf->fd >= 0 && nf->wrote) {
-            close_later(nf);
+            CloseJob j = {.fd = nf->fd, .wb_handle = nf->wb_handle};   /* patch 307: close the helper handle too */
+            snprintf(j.path, sizeof(j.path), "%s", nf->path);
+            snprintf(j.old_path, sizeof(j.old_path), "%s", nf->old_path);
+            if (!wb_close(&j, nf->host)) {     /* patch 261: behind its queued writes */
+                close_later(nf);
+            }
         } else {
             if (nf->fd >= 0) {
                 close(nf->fd);
+            }
+            if (nf->wb_handle > 0) {
+                wbwr_close(nf->wb_handle);     /* patch 307: an unwritten cache file's helper handle */
             }
             if (nf->old_path[0]) {
                 unlink(nf->old_path);
@@ -594,6 +1190,9 @@ void nc_io_close(NcKernel *k, uint32_t object)
             if (o) {
                 o->del = true;                      /* the last handle deletes it */
             } else {
+                if (ram_enabled()) {
+                    ram_drop(nf->host);
+                }
                 unlink(nf->host);
             }
         }
@@ -636,6 +1235,294 @@ static void complete(NcKernel *k, const uint32_t *a)
         const NcApc apc = {.normal = a[2], .ctx = a[3], .a1 = a[4], .a2 = 0};
         nc_apc_queue(k, k->current, &apc);
     }
+}
+
+/* ---- RAM cache for the utility/cache drives (XOG patch 288, xogfix=ramcache, per game) ----
+ * Cache-partition files (Partition3-5) are throwaway: games rebuild them. We keep their DATA in
+ * host RAM so writes during play never reach PS5 storage, and so they never count toward the
+ * per-launch write cap that makes big games crawl after ~1 GiB written in a launch. A real 0-byte
+ * placeholder file still lives on disk for each cache file, so every path/dir/stat/delete/rename
+ * path below is unchanged; only the bytes and the reported size come from RAM. Strictly the cache
+ * partitions, never the save partitions (Partition1 TDATA/UDATA, which must persist). Capped; past
+ * the cap a file falls back to a normal on-disk write. RAM is per launch (freed on exit): the game
+ * rebuilds its cache each launch, to RAM, which is fast and uncapped. */
+#define RAM_FILES 256
+#define RAM_CEILING (512ull << 20)  /* never hold more than this, whatever is free */
+#define RAM_MARGIN  (384ull << 20)  /* host memory kept free for everything else */
+typedef struct RamFile {
+    bool used;
+    char host[512];
+    uint8_t *data;
+    uint64_t size, cap;             /* cap = bytes allocated */
+    uint64_t atime;                 /* last-access tick, for LRU eviction */
+    bool spilled;                   /* flushed to disk: a tombstone, so it is not re-cached into RAM */
+} RamFile;
+static RamFile g_ram[RAM_FILES];
+static uint64_t g_ram_total;        /* bytes allocated across all RAM files */
+static uint64_t g_ram_limit;        /* adaptive cap, set in ram_enabled() */
+static uint64_t g_ram_tick;
+static int g_ram_on = -1;
+
+static bool ram_enabled(void)
+{
+    if (g_ram_on < 0) {
+        const char *e = getenv("XOG_FIX");
+        g_ram_on = e && strstr(e, "ramcache") ? 1 : 0;
+        if (g_ram_on) {
+            /* Patch 292: adaptive cap so we can never run the app out of memory (Fable's ~675 MiB cache
+             * OOM'd a fixed 1280 MiB cap). Keep RAM_MARGIN free for everything else, never hold more than
+             * RAM_CEILING; a file past the cap spills to disk (LRU) instead of crashing. */
+            extern int sceKernelAvailableFlexibleMemorySize(size_t * out);
+            size_t avail = 0;
+            if (sceKernelAvailableFlexibleMemorySize(&avail) != 0) {
+                avail = 0;
+            }
+            g_ram_limit = (uint64_t)avail > RAM_MARGIN ? (uint64_t)avail - RAM_MARGIN : (uint64_t)avail / 4;
+            if (g_ram_limit > RAM_CEILING) {
+                g_ram_limit = RAM_CEILING;
+            }
+            if (g_ram_limit < (64ull << 20)) {
+                g_ram_limit = 64ull << 20;   /* a floor; realloc returning NULL still guards OOM */
+            }
+            nc_log("hakuX-native-io", "ramcache: cache-drive files kept in RAM (xogfix=ramcache); %llu MiB flexible "
+                   "free -> cap %llu MiB, overflow spills to disk", (unsigned long long)((uint64_t)avail >> 20),
+                   (unsigned long long)(g_ram_limit >> 20));
+        }
+    }
+    return g_ram_on == 1;
+}
+
+/* A host path on a cache/utility partition (under the per-game cache root). */
+static bool ram_is_cache(const char *host)
+{
+    if (!g_cache_root[0]) {
+        return false;
+    }
+    const size_t n = strlen(g_cache_root);
+    return strncmp(host, g_cache_root, n) == 0 && host[n] == '/';
+}
+
+static int ram_find(const char *host)
+{
+    for (int i = 0; i < RAM_FILES; i++) {
+        if (g_ram[i].used && !g_ram[i].spilled && strcmp(g_ram[i].host, host) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void ram_free(int i)
+{
+    if (i < 0 || !g_ram[i].used) {
+        return;
+    }
+    free(g_ram[i].data);
+    g_ram_total -= g_ram[i].cap;
+    memset(&g_ram[i], 0, sizeof(g_ram[i]));
+}
+
+/* Ensure RAM file i can hold need bytes; false if that would pass the cap. */
+static bool ram_reserve(int i, uint64_t need)
+{
+    if (need <= g_ram[i].cap) {
+        return true;
+    }
+    uint64_t want = g_ram[i].cap ? g_ram[i].cap : (1ull << 20);
+    while (want < need) {
+        want += want / 2 + (1ull << 20);
+    }
+    if (g_ram_total - g_ram[i].cap + want > g_ram_limit) {
+        return false;
+    }
+    uint8_t *d = realloc(g_ram[i].data, want);
+    if (!d) {
+        return false;
+    }
+    g_ram_total += want - g_ram[i].cap;
+    g_ram[i].data = d;
+    g_ram[i].cap = want;
+    return true;
+}
+
+/* Track a cache file. reset: start it empty (a create or overwrite). Returns its index, or -1 if
+ * RAM is full (the caller then uses the on-disk file). */
+static int ram_track(const char *host, bool reset)
+{
+    for (int j = 0; j < RAM_FILES; j++) {
+        if (g_ram[j].used && strcmp(g_ram[j].host, host) == 0) {
+            if (g_ram[j].spilled) {
+                if (!reset) {
+                    return -1;              /* already on disk: stay disk-backed */
+                }
+                g_ram[j].spilled = false;   /* recreated (create/overwrite): cache it again, empty */
+                g_ram[j].size = 0;
+                return j;
+            }
+            if (reset) {
+                g_ram[j].size = 0;
+            }
+            return j;
+        }
+    }
+    for (int j = 0; j < RAM_FILES; j++) {
+        if (!g_ram[j].used) {
+            memset(&g_ram[j], 0, sizeof(g_ram[j]));
+            g_ram[j].used = true;
+            snprintf(g_ram[j].host, sizeof(g_ram[j].host), "%s", host);
+            return j;
+        }
+    }
+    return -1;
+}
+
+static ssize_t ram_pwrite(int i, const uint8_t *src, uint64_t off, uint32_t len)
+{
+    if (!ram_reserve(i, off + len)) {
+        return -1;
+    }
+    if (off > g_ram[i].size) {
+        memset(g_ram[i].data + g_ram[i].size, 0, off - g_ram[i].size);
+    }
+    memcpy(g_ram[i].data + off, src, len);
+    if (off + len > g_ram[i].size) {
+        g_ram[i].size = off + len;
+    }
+    g_ram[i].atime = ++g_ram_tick;
+    return (ssize_t)len;
+}
+
+static uint32_t ram_pread(int i, uint8_t *dst, uint64_t off, uint32_t len)
+{
+    if (off >= g_ram[i].size) {
+        return 0;
+    }
+    const uint64_t avail = g_ram[i].size - off;
+    const uint32_t n = len < avail ? len : (uint32_t)avail;
+    memcpy(dst, g_ram[i].data + off, n);
+    g_ram[i].atime = ++g_ram_tick;
+    return n;
+}
+
+static void ram_truncate(int i, uint64_t v)
+{
+    if (v < g_ram[i].size) {
+        g_ram[i].size = v;
+    } else if (v > g_ram[i].size && ram_reserve(i, v)) {
+        memset(g_ram[i].data + g_ram[i].size, 0, v - g_ram[i].size);
+        g_ram[i].size = v;
+    }
+}
+
+static void ram_drop(const char *host)
+{
+    for (int i = 0; i < RAM_FILES; i++) {
+        if (g_ram[i].used && strcmp(g_ram[i].host, host) == 0) {
+            ram_free(i);   /* clears the slot, tombstone included */
+            return;
+        }
+    }
+}
+
+static void ram_rename(const char *from, const char *to)
+{
+    int src = -1, dst = -1;
+    for (int i = 0; i < RAM_FILES; i++) {
+        if (!g_ram[i].used) {
+            continue;
+        }
+        if (strcmp(g_ram[i].host, to) == 0) {
+            dst = i;
+        } else if (strcmp(g_ram[i].host, from) == 0) {
+            src = i;
+        }
+    }
+    if (dst >= 0) {
+        ram_free(dst);
+    }
+    if (src >= 0) {
+        snprintf(g_ram[src].host, sizeof(g_ram[src].host), "%s", to);
+    }
+}
+
+/* Would RAM file i still be within the cap if it had to hold need bytes? */
+static bool ram_fits(int i, uint64_t need)
+{
+    if (need <= g_ram[i].cap) {
+        return true;
+    }
+    uint64_t want = g_ram[i].cap ? g_ram[i].cap : (1ull << 20);
+    while (want < need) {
+        want += want / 2 + (1ull << 20);
+    }
+    return g_ram_total - g_ram[i].cap + want <= g_ram_limit;
+}
+
+/* Write RAM file i out to fd (its on-disk placeholder) and free its RAM, so it becomes disk-backed
+ * (ram_find then returns -1 and later reads/writes/size use the real file). */
+static void ram_flush(int i, int fd)
+{
+    if (g_ram[i].data) {
+        /* XOG patch 308: a spill is the app writing the whole file (8-10 MiB
+         * in the logs). Past the per-launch cap that pwrite ran at a few
+         * hundred KB/s and held the game. Through the helper when it is up;
+         * nc_host_write falls back to its own descriptor (or fd) on failure. */
+        NcHostOut out;
+        if (nc_host_out_open(&out, g_ram[i].host, 0666, false) == 0) {
+            const long w = nc_host_write(&out, g_ram[i].data, g_ram[i].size);
+            if (w != (long)g_ram[i].size && fd >= 0) {
+                uint64_t off = w > 0 ? (uint64_t)w : 0;
+                while (off < g_ram[i].size) {
+                    const ssize_t n = pwrite(fd, g_ram[i].data + off, (size_t)(g_ram[i].size - off), (off_t)off);
+                    if (n <= 0) {
+                        break;
+                    }
+                    off += (uint64_t)n;
+                }
+            }
+            (void)nc_host_out_close(&out);   /* cache data: no fsync, as the old pwrite path */
+        } else if (fd >= 0) {
+            uint64_t off = 0;
+            while (off < g_ram[i].size) {
+                const ssize_t w = pwrite(fd, g_ram[i].data + off, (size_t)(g_ram[i].size - off), (off_t)off);
+                if (w <= 0) {
+                    break;
+                }
+                off += (uint64_t)w;
+            }
+        }
+    }
+    free(g_ram[i].data);
+    g_ram_total -= g_ram[i].cap;
+    g_ram[i].data = NULL;
+    g_ram[i].cap = 0;
+    g_ram[i].size = 0;
+    g_ram[i].spilled = true;            /* keep the slot as a tombstone (ram_track won't re-cache it) */
+}
+
+/* Spill the least-recently-used RAM file other than keep to disk, to make room. False if none. */
+static bool ram_evict_one(int keep)
+{
+    int lru = -1;
+    uint64_t best = UINT64_MAX;
+    for (int j = 0; j < RAM_FILES; j++) {
+        if (g_ram[j].used && !g_ram[j].spilled && j != keep && g_ram[j].atime < best) {
+            best = g_ram[j].atime;
+            lru = j;
+        }
+    }
+    if (lru < 0) {
+        return false;
+    }
+    const int fd = open(g_ram[lru].host, O_WRONLY | O_CLOEXEC);
+    nc_log("hakuX-native-io", "ramcache: spill %s (%llu KiB) to disk (LRU; cap %llu MiB reached)",
+           g_ram[lru].host, (unsigned long long)(g_ram[lru].size >> 10),
+           (unsigned long long)(g_ram_limit >> 20));
+    ram_flush(lru, fd);
+    if (fd >= 0) {
+        close(fd);
+    }
+    return true;
 }
 
 /* ------------------------------------------------------- the disc reader */
@@ -684,6 +1571,11 @@ static struct DevRate {
 
 void nc_io_set_device_time(bool on)
 {
+    if (on && getenv("NC_CHIHIRO")) {
+        /* Sega Chihiro (XPSemu patch 208): the game runs from the media board's DIMM (RAM), not a DVD drive */
+        on = false;
+        nc_log("hakuX-native-io", "console timing: off for Sega Chihiro (the game is in the media board's RAM)");
+    }
     g_devtime = on;
     const char *e = getenv("NC_DEVTIME");
 #ifdef __ANDROID__
@@ -711,8 +1603,37 @@ void nc_io_read_kinds(uint32_t *paced, uint32_t *free_reads)
     g_reads_paced = g_reads_free = 0;
 }
 
+/* xogfix=drivetime (patch 329, per game: Breakdown). The drive's own time even while no frame shows: Breakdown
+ * starts a 1 MB read of a level's event file on its file-server thread (above the main thread) and only then stores
+ * the buffer pointer its completion uses; with the read done from the page cache in microseconds, the server thread
+ * ran the completion first, wrote through a NULL+0x10 and the game crashed as its first level loaded. At the
+ * drive's speed (as a console's ~13 ms for 1 MB) the main thread always stores it first. */
+/* patch 332: a per-game xogfix word (the start line's xogfix=, read once a name) */
+static bool xogfix_has(const char *w, int *cache)
+{
+    if (*cache < 0) {
+        const char *e = getenv("XOG_FIX");
+        *cache = e && strstr(e, w) ? 1 : 0;
+    }
+    return *cache == 1;
+}
+
+static bool drivetime_fix(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XOG_FIX");
+        on = e && strstr(e, "drivetime") ? 1 : 0;
+    }
+    return on;
+}
+
 static bool devtime_now(void)
 {
+    if (drivetime_fix()) {
+        g_reads_paced++;
+        return true;
+    }
     if (!g_devtime) {
         return false;
     }
@@ -811,6 +1732,8 @@ typedef struct DiscJob {
     bool sync;               /* a synchronous handle's: the thread waits for it (nc_ke_block) */
     bool ok;
     int err;
+    bool write;              /* a write to a host file (the guest's buffer to the file) */
+    int wb;                  /* patch 330: the file's handle on the write helper (>0), so the write isn't throttled */
     char path[64]; /* for the log */
 } DiscJob;
 
@@ -824,13 +1747,39 @@ static struct {
     unsigned busy;           /* queued, reading or done: at most DISC_JOBS */
     bool started;
     bool hurry;              /* a savestate's drain: no drive time left to wait (atomic) */
-} g_reader = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+    unsigned writes;         /* writes queued or being written */
+    pthread_cond_t written;  /* signalled when writes reaches 0 */
+} g_reader = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, .written = PTHREAD_COND_INITIALIZER};
+
+/* Host writes go to the reader thread too (as the reference does: The Punisher
+ * copies archives to the cache drive while the guest CPU runs on). Any file
+ * query, close, delete or rename waits for them first, so it sees the bytes. */
+static void writes_drain(void)
+{
+    pthread_mutex_lock(&g_reader.mu);
+    while (g_reader.writes) {
+        pthread_cond_wait(&g_reader.written, &g_reader.mu);
+    }
+    pthread_mutex_unlock(&g_reader.mu);
+}
+
+/* patch 330: a queued write's bytes, through the un-throttled helper when the file has a handle there (patch 307/308),
+ * else (or should that fail) by the app's own descriptor. */
+static bool job_write(const DiscJob *j, const void *p, size_t len, uint64_t o)
+{
+    if (j->wb > 0 && len <= 0xFFFFFFFFu && wbwr_write(j->wb, o, p, (uint32_t)len) == (long)len) {
+        return true;
+    }
+    return nc_pwrite_sure(j->fd, p, len, o);
+}
+
+/* XOG patch 253: the drive's time on the guest's clock (ps5/src/ff_ps5.c): twice as fast with fast-forward on */
+uint64_t nc_ff_now_ns(void);
+unsigned nc_ff_mul(void);
 
 static uint64_t mono_ns(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+    return nc_ff_now_ns();
 }
 
 /* A request's drive time, until due (mono_ns), in slices a savestate's drain
@@ -840,7 +1789,7 @@ static void drive_wait(uint64_t due)
 {
     for (uint64_t now; !__atomic_load_n(&g_reader.hurry, __ATOMIC_ACQUIRE) && (now = mono_ns()) < due;) {
         const uint64_t left = due - now;
-        const struct timespec ts = {0, (long)(left < 1000000 ? left : 1000000)};
+        const struct timespec ts = {0, (long)((left < 1000000 ? left : 1000000) / nc_ff_mul())};
         nanosleep(&ts, NULL);
     }
 }
@@ -863,10 +1812,38 @@ static void *reader_thread(void *arg)
         errno = 0;
         j.ok = true;
         uint64_t o = j.off;
-        for (unsigned i = 0; j.ok && i < j.nseg; i++) {
+        size_t total = 0;
+        for (unsigned i = 0; i < j.nseg; i++) {
+            total += j.seg[i].len;
+        }
+        uint8_t *bounce = j.nseg > 1 && total <= (16u << 20) ? malloc(total) : NULL;
+        const bool gathered = bounce != NULL;
+        if (gathered) {
+            if (j.write) {
+                size_t at = 0;
+                for (unsigned i = 0; i < j.nseg; i++) {
+                    memcpy(bounce + at, j.seg[i].host, j.seg[i].len);
+                    at += j.seg[i].len;
+                }
+                j.ok = job_write(&j, bounce, total, o);
+            } else {
+                j.ok = j.fd >= 0 ? nc_pread_sure(j.fd, bounce, total, o)
+                                 : nc_disc_read_file(j.disc, &j.file, o, bounce, total);
+                size_t at = 0;
+                for (unsigned i = 0; j.ok && i < j.nseg; i++) {
+                    memcpy(j.seg[i].host, bounce + at, j.seg[i].len);
+                    at += j.seg[i].len;
+                }
+            }
+            free(bounce);
+        }
+        for (unsigned i = 0; !gathered && j.ok && i < j.nseg; i++) {
             const struct DmaSeg *g = &j.seg[i];
-            nc_io_note_read(g->pa, g->len, j.va, j.off);
-            j.ok = j.fd >= 0 ? pread(j.fd, g->host, g->len, (off_t)o) == (ssize_t)g->len
+            if (!j.write) {
+                nc_io_note_read(g->pa, g->len, j.va, j.off);
+            }
+            j.ok = j.write ? job_write(&j, g->host, g->len, o)
+                   : j.fd >= 0 ? nc_pread_sure(j.fd, g->host, g->len, o)
                              : nc_disc_read_file(j.disc, &j.file, o, g->host, g->len);
             o += g->len;
         }
@@ -875,6 +1852,9 @@ static void *reader_thread(void *arg)
             drive_wait(due);
         }
         pthread_mutex_lock(&g_reader.mu);
+        if (j.write && g_reader.writes && !--g_reader.writes) {
+            pthread_cond_broadcast(&g_reader.written);
+        }
         g_reader.done[g_reader.ndone++] = j;
         pthread_mutex_unlock(&g_reader.mu);
         nc_irq_post_work();
@@ -901,19 +1881,25 @@ static void pin_buffer(NcKernel *k, const DiscJob *j, int lock)
  * writable); false when it must happen in place. sync: the calling thread
  * waits for it, every other one runs on. dev_us: the drive's time for it. */
 static bool disc_read_later(NcKernel *k, const NcFile *nf, const uint32_t *a, const IoRun *run, unsigned nrun,
-                            uint64_t off, uint32_t n, bool sync, uint32_t dev_us)
+                            uint64_t off, uint32_t n, bool sync, uint32_t dev_us, bool write)
 {
     static int in_place = -1; /* NC_DISC_SYNC: every disc read in place, as before */
     if (in_place < 0) {
         in_place = getenv("NC_DISC_SYNC") != NULL;
     }
     if (in_place) {
+        if (g_trace_io) {
+            nc_log("hakuX-native-io", "%s not queued: NC_DISC_SYNC", nf->path);
+        }
         return false;
     }
     uint32_t event = 0;
     if (a[1]) {
         event = nc_ob_lookup(k, a[1], NULL);
         if (!event) {
+            if (g_trace_io) {
+                nc_log("hakuX-native-io", "%s not queued: event handle %08x unknown", nf->path, a[1]);
+            }
             return false;
         }
     } else {
@@ -925,7 +1911,8 @@ static bool disc_read_later(NcKernel *k, const NcFile *nf, const uint32_t *a, co
     }
     DiscJob j = {.disc = k->disc, .file = nf->disc, .fd = -1, .off = off, .va = run[0].va, .n = n,
                  .dev_us = dev_us, .iosb = a[4], .event = event, .apc = a[2], .apc_ctx = a[3],
-                 .thread = k->current, .thread_id = k->current ? k->current->id : 0, .sync = sync};
+                 .thread = k->current, .thread_id = k->current ? k->current->id : 0, .sync = sync,
+                 .write = write, .wb = write && nf->wb_handle > 0 ? nf->wb_handle : 0};
     snprintf(j.path, sizeof(j.path), "%s", nf->path);
     size_t segs = 0;
     for (unsigned r = 0; r < nrun; r++) {
@@ -933,6 +1920,7 @@ static bool disc_read_later(NcKernel *k, const NcFile *nf, const uint32_t *a, co
     }
     j.seg = malloc(sizeof(*j.seg) * segs);
     if (!j.seg) {
+        nc_log("hakuX-native-io", "%s not queued: no memory for %zu runs", nf->path, segs);
         return false;
     }
     for (unsigned r = 0; r < nrun; r++) {
@@ -940,6 +1928,10 @@ static bool disc_read_later(NcKernel *k, const NcFile *nf, const uint32_t *a, co
             const uint32_t room = NC_PAGE - (va & (NC_PAGE - 1)), chunk = left < room ? left : room;
             const uint32_t pa = nc_vm_phys(k->vm, va);
             if (pa == UINT32_MAX || (uint64_t)pa + chunk > k->vm->ram_size || g_va_soft[va >> 14] == 2) {
+                if (g_trace_io) {
+                    nc_log("hakuX-native-io", "%s not queued: va %08x pa %08x soft %u", nf->path, va, pa,
+                           g_va_soft[va >> 14]);
+                }
                 free(j.seg);
                 return false;               /* not all RAM, or a shadow's: in place */
             }
@@ -953,9 +1945,33 @@ static bool disc_read_later(NcKernel *k, const NcFile *nf, const uint32_t *a, co
             left -= chunk;
         }
     }
-    if (nf->kind == F_HOST && (j.fd = dup(nf->fd)) < 0) {
+    /* patch 331: the job's own descriptor. The PS5 refuses dup() to this app (EPERM), so every hard-disk read was
+     * done in the call and completed at once, where a console's (and the disc's here) pends: Breakdown's file
+     * thread ran a read's completion before the main thread had stored what it uses, and crashed loading its
+     * first level. Where dup() fails the file is opened again by its path. */
+    /* patch 332: per game (xogfix=hddqueue, Breakdown); every other game keeps hard-disk reads in the call */
+    static int hddq = -1;
+    if (nf->kind == F_HOST && !xogfix_has("hddqueue", &hddq) && (j.fd = dup(nf->fd)) < 0) {
         free(j.seg);
         return false;
+    }
+    if (nf->kind == F_HOST && hddq == 1) {
+        static int no_dup;
+        if (!no_dup && (j.fd = dup(nf->fd)) < 0) {
+            no_dup = 1;
+            nc_log("hakuX-native-io", "dup: %s: queued reads and writes open the file again", strerror(errno));
+        }
+        if (j.fd < 0) {
+            j.fd = open(nf->host, (write ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
+        }
+        if (j.fd < 0) {
+            static unsigned told;
+            if (told++ < 8 || g_trace_io) {
+                nc_log("hakuX-native-io", "%s not queued: open %s: %s", nf->path, nf->host, strerror(errno));
+            }
+            free(j.seg);
+            return false;
+        }
     }
     for (unsigned i = 0; nc_vm_dma.fence && i < j.nseg; i++) {
         const uint64_t v = nc_vm_dma.fence(j.seg[i].pa, j.seg[i].len);
@@ -972,12 +1988,17 @@ static bool disc_read_later(NcKernel *k, const NcFile *nf, const uint32_t *a, co
     const bool queued = g_reader.started && g_reader.busy < DISC_JOBS;
     if (queued) {
         pin_buffer(k, &j, 1);
+        g_reader.writes += write;
         g_reader.q[(g_reader.head + g_reader.n++) % DISC_JOBS] = j;
         g_reader.busy++;
         pthread_cond_signal(&g_reader.cv);
     }
     pthread_mutex_unlock(&g_reader.mu);
     if (!queued) {
+        if (g_trace_io) {
+            nc_log("hakuX-native-io", "%s not queued: reader busy %u started %d", nf->path, g_reader.busy,
+                   g_reader.started);
+        }
         if (j.fd >= 0) {
             close(j.fd);
         }
@@ -994,7 +2015,7 @@ static void disc_read_done(NcKernel *k, const DiscJob *j)
     pin_buffer(k, j, -1);
     const bool ok = j->ok;
     const int err = j->err;
-    for (unsigned i = 0; i < j->nseg; i++) {
+    for (unsigned i = 0; !j->write && i < j->nseg; i++) {
         if (nc_vm_dma.wrote) {
             nc_vm_dma.wrote(j->seg[i].pa, j->seg[i].len);    /* what a guest store would mark */
         }
@@ -1005,9 +2026,9 @@ static void disc_read_done(NcKernel *k, const DiscJob *j)
     }
     uint32_t st = NC_STATUS_SUCCESS, n = j->n;
     if (!ok) {
-        nc_log("hakuX-native-io", "read %s +%llx (%u) into %08x failed: %s", j->path, (unsigned long long)j->off,
-               j->n, j->va, strerror(err));
-        st = 0xC000009Cu; /* STATUS_DEVICE_DATA_ERROR */
+        nc_log("hakuX-native-io", "%s %s +%llx (%u) %s %08x failed: %s", j->write ? "write" : "read", j->path,
+               (unsigned long long)j->off, j->n, j->write ? "from" : "into", j->va, strerror(err));
+        st = j->write ? 0xC000007Fu /* STATUS_DISK_FULL */ : 0xC000009Cu; /* STATUS_DEVICE_DATA_ERROR */
         n = 0;
     }
     io_status(k, j->iosb, st, n);
@@ -1061,7 +2082,7 @@ static bool set_aside(const char *host, char *old_path, size_t len)
         remove_tree(dir, false);
         g_swept = true;
     }
-    mkdir(dir, 0775);
+    mkdir(dir, 0777);
     snprintf(old_path, len, "%s/%u-%u", dir, (unsigned)getpid(), ++serial);
     if (rename(host, old_path) != 0) {
         nc_log("hakuX-native-io", "overwrite %s: keeping its old bytes failed: %s", host, strerror(errno));
@@ -1100,11 +2121,29 @@ static void regrow(NcFile *nf, uint64_t from, uint64_t to)
     if (old < 0) {
         return;
     }
+    /* XOG patch 308: the bytes a FATX overwrite brings back are written
+     * through the helper too (an overwritten file kept all its writes in the
+     * app before this). */
+    int h = 0;
+    if (wb_enabled() && g_wb_helper == 1) {
+        if (nf->wb_handle == 0) {
+            const int x = wbwr_open(nf->host);
+            nf->wb_handle = x > 0 ? x : -1;
+        }
+        h = nf->wb_handle > 0 ? nf->wb_handle : 0;
+    }
     static uint8_t buf[1u << 16];
     for (uint64_t o = from; o < to;) {
         const size_t want = to - o < sizeof(buf) ? (size_t)(to - o) : sizeof(buf);
         const ssize_t r = pread(old, buf, want, (off_t)o);
-        if (r <= 0 || pwrite(nf->fd, buf, (size_t)r, (off_t)o) != r) {
+        bool ok = r > 0;
+        if (ok) {
+            ok = h && wbwr_write(h, o, buf, (uint32_t)r) == r;
+            if (!ok) {
+                ok = pwrite(nf->fd, buf, (size_t)r, (off_t)o) == r;
+            }
+        }
+        if (!ok) {
             break;
         }
         o += (uint64_t)r;
@@ -1150,6 +2189,7 @@ static uint32_t dir_mismatch(const char *path, uint32_t options, uint32_t st)
 static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t disposition, uint32_t options,
                         uint32_t *handle, uint32_t *info)
 {
+    writes_drain();                 /* an open sees writes already queued */
     char name[512], path[512];
     ansi(k, nc_vm_rd32(k->vm, attrs + 4), name, sizeof(name));
     const uint32_t root = nc_vm_rd32(k->vm, attrs);
@@ -1228,6 +2268,9 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t d
     } else {
         char host[512];
         int exists = host_path(dev, rel, host, sizeof(host));
+        if (exists >= 0) {
+            wb_wait_under(host);        /* patch 261: its queued writes first */
+        }
         if (exists < 0) {
             if (g_trace_io) {
                 nc_log("hakuX-native-io", "open %s: path not found", path);
@@ -1236,8 +2279,8 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t d
         }
         struct stat st;
         bool is_dir = exists && stat(host, &st) == 0 && S_ISDIR(st.st_mode);
-        if (!*rel) {
-            is_dir = true; /* the partition root */
+        if (!*rel && dev <= DEV_MB0) {
+            is_dir = true; /* the partition root (mbcom: and mbrom0/1: are files) */
         }
         if (exists && !is_dir && file_other(NULL, host, true)) {
             nc_log("hakuX-native-io", "open %s: delete pending", path);
@@ -1262,7 +2305,7 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t d
         char old_path[320] = "";
         uint64_t old_size = 0;
         if (!exists && (options & FILE_DIRECTORY_FILE)) {
-            if (mkdir(host, 0775) != 0) {
+            if (mkdir(host, 0777) != 0) {
                 return STATUS_ACCESS_DENIED;
             }
             is_dir = true;
@@ -1284,13 +2327,31 @@ static uint32_t do_open(NcKernel *k, uint32_t access, uint32_t attrs, uint32_t d
             } else {
                 *info = 1;
             }
-            fd = open(host, flags, 0664);
+            fd = open(host, flags, 0666);
+            if (fd < 0 && errno == EACCES && exists) {
+                /* XOG patch 286d: a file created earlier under a different
+                 * credential (before the app ran as the system user) that this
+                 * credential may not open (uid 0 does not bypass the check on
+                 * this console). Open its permissions and retry once; the one-
+                 * time tree chmod at startup does the same for the whole tree. */
+                if (chmod(host, 0666) == 0) {
+                    fd = open(host, flags, 0666);
+                    if (fd >= 0) {
+                        nc_log("hakuX-native-io", "open %s: was EACCES, chmod 0666 and reopened", path);
+                    }
+                }
+            }
             if (fd < 0) {
                 nc_log("hakuX-native-io", "open %s (%s): %s", path, host, strerror(errno));
                 if (old_path[0]) {
                     rename(old_path, host); /* the file as it was */
                 }
                 return STATUS_ACCESS_DENIED;
+            }
+            if (ram_enabled() && ram_is_cache(host)) {
+                /* back this cache file with RAM; empty it on a create/overwrite */
+                const bool fresh = (*info == 2) || (flags & O_TRUNC);
+                (void)ram_track(host, fresh);
             }
         } else {
             *info = 1;
@@ -1356,6 +2417,13 @@ static uint64_t file_size(const NcFile *nf)
     if (nf->kind == F_DISC) {
         return nf->disc.size;
     }
+    writes_drain();                 /* its size with the writes already queued in */
+    if (nf->kind == F_HOST && ram_enabled() && ram_is_cache(nf->host)) {
+        const int ri = ram_find(nf->host);
+        if (ri >= 0) {
+            return g_ram[ri].size;
+        }
+    }
     struct stat st;
     return nf->fd >= 0 && fstat(nf->fd, &st) == 0 ? (uint64_t)st.st_size : 0;
 }
@@ -1378,7 +2446,7 @@ static void raw_io(int part, uint64_t off, uint8_t *buf, uint32_t len, bool writ
     }
     char p[320];
     snprintf(p, sizeof(p), "%s/raw-partition%d.bin", nc_io_part_root(part), part);
-    const int fd = open(p, write ? O_RDWR | O_CREAT | O_CLOEXEC : O_RDONLY | O_CLOEXEC, 0664);
+    const int fd = open(p, write ? O_RDWR | O_CREAT | O_CLOEXEC : O_RDONLY | O_CLOEXEC, 0666);
     if (fd < 0) {
         return;
     }
@@ -1556,6 +2624,7 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
     if (!nf) {
         return NC_STATUS_INVALID_HANDLE;
     }
+    writes_drain();                 /* a read sees writes already queued */
     const uint32_t va0 = nrun ? run[0].va : 0;
     const int raw = nf->kind == F_VOLUME && nf->partition == 0 ? 0
                   : nf->kind == F_HOST && nf->is_dir ? partition_root(nf) : -1;
@@ -1581,6 +2650,9 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
         io_status(k, a[4], STATUS_INVALID_DEVICE_REQUEST, 0);
         return STATUS_INVALID_DEVICE_REQUEST;
     }
+    if (nf->kind == F_HOST) {
+        wb_wait_under(nf->host);        /* patch 261: its queued writes first */
+    }
     uint64_t off = nf->pos;
     if (a[7]) {
         const uint64_t o = (uint64_t)nc_vm_rd32(k->vm, a[7]) | ((uint64_t)nc_vm_rd32(k->vm, a[7] + 4) << 32);
@@ -1589,7 +2661,9 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
         }
     }
     const uint64_t size = file_size(nf);
-    const bool async = nf->async && !disc_cached(nf, off, len);
+    /* patch 329b (xogfix=drivetime): cached data too takes the drive's time - Breakdown's level file was cached (it
+     * had just copied it to Z:), so its overlapped read still completed at once and the race stayed */
+    const bool async = nf->async && (drivetime_fix() || !disc_cached(nf, off, len));
     uint32_t st = NC_STATUS_SUCCESS, n = 0;
     if (!len) {
         /* Zero bytes succeed, past the end too, as the file systems check
@@ -1604,11 +2678,17 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
             return 0;
         }
         /* console timing: a synchronous read the cache doesn't hold waits for the drive */
-        const bool drive = !async && can_block(k) && !fs_cache_holds(nf, off, n) && devtime_now();
+        const bool drive = !async && can_block(k) && (drivetime_fix() || !fs_cache_holds(nf, off, n)) && devtime_now();
         const bool later = async || drive || (n >= SYNC_LATER_MIN && can_block(k));
-        const uint32_t dev_us = async ? device_us(nf, n) : drive ? device_us(nf, fs_cache_fill(nf, off, n)) : 0;
-        if ((nf->kind == F_DISC || (nf->kind == F_HOST && nf->fd >= 0)) && later &&
-            disc_read_later(k, nf, a, run, nrun, off, n, !async, dev_us)) {
+        const bool ram_rd = nf->kind == F_HOST && ram_enabled() && ram_is_cache(nf->host) && ram_find(nf->host) >= 0;
+        const uint32_t dev_us = async ? device_us(nf, n) :
+                                drive ? device_us(nf, drivetime_fix() ? n : fs_cache_fill(nf, off, n)) : 0;
+        if (g_trace_io && nf->kind == F_HOST) {
+            nc_log("hakuX-native-io", "read %s: later %d drive %d ram %d fd %d dev %u us", nf->path, later, drive, ram_rd,
+                   nf->fd, dev_us);
+        }
+        if ((nf->kind == F_DISC || (nf->kind == F_HOST && nf->fd >= 0)) && later && !ram_rd &&
+            disc_read_later(k, nf, a, run, nrun, off, n, !async, dev_us, false)) {
             io_moved(k, nf, a[7], off + n);
             if (g_trace_io) {
                 nc_log("hakuX-native-io", "read %s +%llx %u into %08x%s %s%s%s", nf->path, (unsigned long long)off,
@@ -1632,8 +2712,13 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
                 if (nc_vm_phys(k->vm, va) != UINT32_MAX) {
                     nc_io_note_read(nc_vm_phys(k->vm, va), chunk, va, o);
                 }
-                ok = nf->kind == F_DISC ? nc_disc_read_file(k->disc, &nf->disc, o, h, chunk)
-                                        : pread(nf->fd, h, chunk, (off_t)o) == (ssize_t)chunk;
+                if (nf->kind == F_DISC) {
+                    ok = nc_disc_read_file(k->disc, &nf->disc, o, h, chunk);
+                } else {
+                    const int ri = ram_enabled() && ram_is_cache(nf->host) ? ram_find(nf->host) : -1;
+                    ok = ri >= 0 ? ram_pread(ri, h, o, chunk) == chunk
+                                 : nc_pread_sure(nf->fd, h, chunk, (uint64_t)o);
+                }
                 o += chunk;
                 got += chunk;
             }
@@ -1651,15 +2736,424 @@ static uint64_t read_runs(NcKernel *k, const uint32_t *a, IoRun *run, unsigned n
         if (n >= 8 && run[0].len >= 8) {
             memcpy(b, nc_vm_host(k->vm, va0), 8);
         }
-        nc_log("hakuX-native-io", "read %s +%llx %u into %08x -> %08x n=%u%s%s [%02x%02x%02x%02x %02x%02x%02x%02x]",
+        nc_log("hakuX-native-io", "read %s +%llx %u into %08x -> %08x n=%u%s%s async %d/%d block %d fd %d t%u "
+               "[%02x%02x%02x%02x %02x%02x%02x%02x]",
                nf->path, (unsigned long long)off, len, va0, st, n, a[1] ? " event" : "", a[2] ? " apc" : "",
+               nf->async, async, can_block(k), nf->fd, k->current ? k->current->id : 0,
                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
     }
     return io_finish(k, nf, a, st, n, async);
 }
 
+/* ---- Sega Chihiro media board, the command channel mbcom: (XPSemu patch 193). Ported from Cxbx-Reloaded
+ * src/devices/chihiro/MediaBoard.cpp (GPL-2.0-or-later; Luke Usher and the Cxbx-Reloaded team): a command
+ * written at 0x900200 (seq u16, command u16, arguments) is answered at 0x900000 (seq, command | 0x8000, data)
+ * and raises IRQ 10; 0x800000/0x800200 the network channel; 0x5FFCE9 the DMA flag. ---- */
+#include "native/core/irq.h"
+
+static uint8_t g_mb_900000[512], g_mb_800000[512];
+static void mb_answer(NcKernel *k, const uint8_t *in, uint8_t *out);
+
+static void mb_com_read(uint32_t off, uint8_t *buf, uint32_t len)
+{
+    memset(buf, 0, len);
+    if (off == 0x005FFCE9u) {
+        if (len >= 4) {
+            nc_wr32(buf, 0x10000);
+        }
+    } else if (off == 0x800000u || off == 0x800200u) {
+        memcpy(buf, g_mb_800000, len < sizeof(g_mb_800000) ? len : sizeof(g_mb_800000));
+    } else if (off == 0x900000u || off == 0x900200u) {
+        memcpy(buf, g_mb_900000, len < sizeof(g_mb_900000) ? len : sizeof(g_mb_900000));
+    } else if (off != 0x00D00000u) {
+        nc_log("hakuX-native-mb", "mbcom read +%08x %u: not known", off, len);
+    }
+}
+
+static void mb_com_write(NcKernel *k, uint32_t off, const uint8_t *buf, uint32_t len)
+{
+    static unsigned s_logged;
+    {
+        static unsigned w_logged;
+        if (w_logged++ < 200) {
+            char hex[3 * 12 + 4] = "";
+            int o = 0;
+            for (uint32_t i = 0; i < len && i < 12; i++) {
+                o += snprintf(hex + o, sizeof(hex) - (size_t)o, " %02x", buf[i]);
+            }
+            nc_log("hakuX-native-mb", "mbcom write +%08x %u:%s (patch 197 tool)", off, len, hex);
+        }
+    }
+    if (off == 0x005FFCE9u) {
+        nc_irq_set(10, true);
+        return;
+    }
+    if (off == 0x800000u) {
+        memcpy(g_mb_800000, buf, len < sizeof(g_mb_800000) ? len : sizeof(g_mb_800000));
+        nc_irq_set(10, true);
+        return;
+    }
+    if (off == 0x800200u) {
+        nc_wr32(g_mb_800000, 0x0A000001u);      /* an IP asked for: 10.0.0.1 */
+        nc_irq_set(10, true);
+        return;
+    }
+    if (off == 0x900000u) {
+        memcpy(g_mb_900000, buf, len < sizeof(g_mb_900000) ? len : sizeof(g_mb_900000));
+        nc_irq_set(10, true);
+        return;
+    }
+    if (off != 0x900200u || len < 4) {
+        nc_log("hakuX-native-mb", "mbcom write +%08x %u: not known", off, len);
+        return;
+    }
+    uint8_t in[512];
+    memcpy(in, buf, len < sizeof(in) ? len : sizeof(in));
+    if (!(in[2] | in[3] << 8)) {
+        return;
+    }
+    mb_answer(k, in, g_mb_900000);
+    nc_irq_set(10, true);
+}
+
+/* The media board's answer to a command block (seq u16, command u16, arguments) into out (seq, command | 0x8000,
+ * data at +4): Type-1 through mbcom: (patch 193), Type-3 through the ASIC window (patch 256). k NULL: no guest
+ * memory (0x0301 leaves its "TEST OK" out). */
+static void mb_answer(NcKernel *k, const uint8_t *in, uint8_t *out)
+{
+    static unsigned s_logged;
+    const uint16_t seq = (uint16_t)(in[0] | in[1] << 8), cmd = (uint16_t)(in[2] | in[3] << 8);
+    switch (cmd) {
+    case 0x0001: nc_wr32(out + 4, 1024u << 20); break;            /* DIMM size */
+    case 0x0100: nc_wr32(out + 4, 5); nc_wr32(out + 8, 100); break; /* status READY, 100% */
+    case 0x0101: nc_wr32(out + 4, 0x00001399u); break;   /* patch 227: 13.99: games read major/minor apart (the fork: Gundam needs minor >= 09 and refuses the dumped 13.05); a later-looking version passes any ">=" check */ //            /* firmware version 13.05 as the fork answers this channel (a 16-bit word, zeros after: chihiro_mbcom_process); 0x0317 and 00011305 (its network board path) gave Maximum Tune Error 14 (patches 223, 225) */
+    case 0x0102: nc_wr32(out + 4, 0x8000u | 0x0001u); break;       /* system type: developer | GD-ROM */
+    case 0x0103: memcpy(out + 4, "A89E-25A47354512", 16); break;  /* serial */
+    case 0x0104: case 0x0204: case 0x0601: case 0x0605: case 0x0606:
+        nc_wr32(out + 4, 0);
+        break;
+    case 0x0301: {                                                /* hardware test: "TEST OK" */
+        const uint32_t type = nc_rd32(in + 4), result = nc_rd32(in + 8);
+        nc_wr32(out + 4, type);
+        if (k && result && nc_vm_phys(k->vm, result) != UINT32_MAX) {
+            memcpy(nc_vm_host(k->vm, result), "TEST OK", 8);
+        }
+        break;
+    }
+    case 0x0415: case 0x0608: nc_wr32(out + 4, 0x0A000001u); break;  /* 10.0.0.1 */
+    case 0x0602: nc_wr32(out + 4, 0xFFFF); break;
+    case 0x0607: nc_wr32(out + 4, 0); nc_wr32(out + 8, 0); break;
+    default:
+        nc_log("hakuX-native-mb", "mbcom: command %04x not known", cmd);
+        break;
+    }
+    out[0] = (uint8_t)seq;
+    out[1] = (uint8_t)(seq >> 8);
+    out[2] = (uint8_t)cmd;
+    out[3] = (uint8_t)((cmd | 0x8000u) >> 8);
+    if (s_logged++ < 64) {
+        nc_log("hakuX-native-mb", "mbcom: command %04x seq %04x -> %08x %08x", cmd, seq, nc_rd32(out + 4), nc_rd32(out + 8));
+    }
+}
+
+/* ---- XPSemu patch 256: a Type-3 (ASIC) media board, for the games whose acLib needs one ----
+ * Maximum Tune (SBHQ, \A\V307.xbe, acLib 0.71) reads the board type at port 40F0 (0x000b88f0): high byte 0, the
+ * Type-1 FPGA, gives device '!' (the mbcom: file, what every other game here uses); 1, the Type-3 ASIC, gives
+ * device ')'. Only with ')' does it add the network board, device 0xa9 (0x000b8690), and ask that board's firmware
+ * version (command 0101 with 0x80000000, 0x000b5da0) into its info block +0x14/+0x15 (0x000b70a2). The game waits
+ * up to 1200 x 16 ms for both bytes (0x0006e17d, 0x0006e1cb), else sets 0x24740e, and its error check (0x000631f0)
+ * returns 20 = "Error14: Network firmware version does not fulfill the game spec" (Data/2D_Usa/Menu/error_002.png).
+ * So the board is a Type-3 for this game, as on the cabinet and in the fork's cabinet table (tattoohanz's QEMU
+ * Chihiro fork, hw/xbox/chihiro/chihiro.c, LGPL-2.1-or-later: register map and the network board's answers
+ * adapted from there; the game's side read from V307.xbe).
+ * Registers: port 4004 = an address, 4000 = its data (4008 bit 7: the address steps by 4 per access). Through
+ * A0000020 (address) / A0000000 (data, steps by 4) / A0000040 (bit 31 burst) the ASIC's window: 80000140 bit 0 its
+ * CPU runs (no firmware.asic upload then), 80000160 bit 0 clear = network board present, 84000000 the answer,
+ * 84000020 the command, 84000040 bit 0 = run it (answered at once: 40E0 bit 0 + IRQ 10). The network board:
+ * 91000000 its answer, 91000200 its command, a read of 90000000 rings it (40E0 bit 2 + IRQ 10). 40E0 written:
+ * those bits cleared. NC_CHIHIRO_TYPE3=1 / 0 forces it on / off. */
+#include <stdbool.h>
+
+static int g_t3_on = -1;
+
+static void t3_game_id(char id[5])
+{
+    id[0] = '\0';
+    const char *fs = getenv("NC_CHIHIRO_FS");
+    if (!fs) {
+        return;
+    }
+    char bp[600];
+    snprintf(bp, sizeof(bp), "%s/boot.id", fs);
+    const int fd = open(bp, O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    uint8_t b[0x34];
+    if (read(fd, b, sizeof(b)) == (ssize_t)sizeof(b)) {
+        memcpy(id, b + 0x30, 4);
+        id[4] = '\0';
+        for (int i = 0; i < 4; i++) {
+            if (id[i] < 0x20 || id[i] > 0x7E) {
+                id[0] = '\0';
+                break;
+            }
+        }
+    }
+    close(fd);
+}
+
+static bool nc_mb_type3(void)
+{
+    if (g_t3_on < 0) {
+        g_t3_on = 0;
+        if (getenv("NC_CHIHIRO")) {
+            char id[5];
+            t3_game_id(id);
+            const char *env = getenv("NC_CHIHIRO_TYPE3");
+            /* Maximum Tune 1 and 2 (patch 258: SBKD \A\V322.xbe, gdx-0015/0015a/0016/0016a, the same gate: 40F0
+             * at 0x00120xxx, network device only for ')' at 0x00120xxx, the same 1200 x 16 ms version wait at
+             * 0x000541xx); the other games here run on the Type-1 path (OutRun 2, Crazy Taxi, Ollie King, Ghost
+             * Squad, Virtua Cop 3, HOTD3) */
+            g_t3_on = env ? atoi(env) != 0 : (!strcmp(id, "SBHQ") || !strcmp(id, "SBKD"));
+            nc_log("hakuX-native-mb", "media board: %s for game %s%s (patch 256)",
+                   g_t3_on ? "Type-3 (ASIC) with its network board" : "Type-1 (FPGA, mbcom:)", id[0] ? id : "?",
+                   env ? " (NC_CHIHIRO_TYPE3)" : "");
+        }
+    }
+    return g_t3_on;
+}
+
+static struct {
+    uint32_t reg;               /* 4004 */
+    uint8_t mode;               /* 4008 */
+    uint32_t saddr, sctl;       /* A0000020, A0000040 */
+    uint32_t asic_ctrl;         /* 80000140 */
+    uint32_t dma;               /* A0001E60 */
+    uint32_t e0;                /* 40E0: bit 0 the ASIC's answer, bit 2 the network board's */
+    uint32_t mresp[8], mcmd[8]; /* 84000000, 84000020 */
+    uint32_t nresp[8], ncmd[8]; /* 91000000, 91000200 */
+} g_t3 = { .asic_ctrl = 1, .dma = 2 };
+
+static void t3_irq(void)
+{
+    if (g_t3.e0) {
+        nc_irq_set(10, true);
+    } else {
+        nc_irq_set(10, false);
+    }
+}
+
+/* 84000040 bit 0: the ASIC runs the command at 84000020 (the same block as Type-1's) */
+static void t3_asic_run(void)
+{
+    uint8_t in[32], out[32];
+    memcpy(in, g_t3.mcmd, sizeof(in));
+    if (!(in[2] | in[3] << 8)) {
+        return;
+    }
+    memset(out, 0, sizeof(out));
+    mb_answer(NULL, in, out);
+    memcpy(g_t3.mresp, out, sizeof(out));
+    memset(g_t3.mcmd, 0, sizeof(g_t3.mcmd));    /* taken: the game polls for a zero command word */
+    g_t3.e0 |= 1;
+    t3_irq();
+}
+
+/* The network board (the fork's chihiro_netdimm_answer, no cable): rung by a read of 90000000 */
+static void t3_net_ring(void)
+{
+    static unsigned logged;
+    const uint32_t c0 = g_t3.ncmd[0], arg = g_t3.ncmd[1];
+    const uint16_t op = (uint16_t)(c0 >> 16);
+    if (!op) {
+        return;
+    }
+    uint32_t r[8] = { c0 | 0x80000000u };
+    switch (op) {
+    case 0x0001: r[1] = 1024u << 20; break;                      /* connect: the DIMM size */
+    case 0x0100: r[1] = 5; r[2] = 100; break;                   /* READY, 100% */
+    case 0x0101: r[1] = 0x00011305u; break;                     /* firmware 13.05: the fork's measured board */
+    case 0x0103: memcpy(&r[1], "A89E-25A47354512", 16); break; /* serial: the media board's */
+    default:
+        if ((op & 0xFF00) == 0x0400) {
+            /* sockets with no cable (the fork, measured): socket, setsockopt, bind, listen, gethostbyname
+             * answer 0, whatever needs a peer fails */
+            r[1] = (op == 0x040B || op == 0x040E || op == 0x0402 || op == 0x0408 || op == 0x0405) ? 0 : 0xFFFFFFFFu;
+        }
+        break;
+    }
+    memcpy(g_t3.nresp, r, sizeof(r));
+    memset(g_t3.ncmd, 0, sizeof(g_t3.ncmd));
+    if (op == 0x0101) {
+        nc_log("hakuX-native-mb", "network board: firmware version asked (command 0101 seq %04x) -> 13.05 (%08x): "
+               "Maximum Tune's Error 14 check answered (patch 256)", c0 & 0xFFFF, r[1]);
+    } else if (logged++ < 64) {
+        nc_log("hakuX-native-mb", "network board: command %04x seq %04x arg %08x -> %08x %08x (patch 256)", op,
+               c0 & 0xFFFF, arg, r[0], r[1]);
+    }
+    g_t3.e0 |= 4;
+    t3_irq();
+}
+
+static void t3_unknown(const char *what, uint32_t addr, uint32_t v)
+{
+    static unsigned logged;
+    if (logged++ < 40) {
+        nc_log("hakuX-native-mb", "type-3 window: %s %08x %08x not known (patch 256)", what, addr, v);
+    }
+}
+
+static uint32_t t3_mem_read(uint32_t a)
+{
+    if (a >= 0x84000000u && a <= 0x8400001Cu) {
+        return g_t3.mresp[(a - 0x84000000u) / 4];
+    }
+    if (a >= 0x84000020u && a <= 0x8400003Cu) {
+        return g_t3.mcmd[(a - 0x84000020u) / 4];
+    }
+    if (a >= 0x91000000u && a <= 0x9100001Cu) {
+        return g_t3.nresp[(a - 0x91000000u) / 4];
+    }
+    if (a >= 0x91000200u && a <= 0x9100021Cu) {
+        return g_t3.ncmd[(a - 0x91000200u) / 4];
+    }
+    switch (a) {
+    case 0x80000140u: return g_t3.asic_ctrl;
+    case 0x80000160u: return 0;             /* bit 0 clear: the network board is there */
+    case 0x80000164u: return 1;
+    case 0xA0001E60u: return g_t3.dma;
+    case 0x90000000u:                       /* shared memory ready; the read rings the network board */
+        t3_net_ring();
+        return 1;
+    default:
+        t3_unknown("read", a, 0);
+        return 0;
+    }
+}
+
+static void t3_mem_write(uint32_t a, uint32_t v)
+{
+    if (a >= 0x84000000u && a <= 0x8400001Cu) {
+        g_t3.mresp[(a - 0x84000000u) / 4] = v;
+    } else if (a >= 0x84000020u && a <= 0x8400003Cu) {
+        g_t3.mcmd[(a - 0x84000020u) / 4] = v;
+    } else if (a >= 0x91000000u && a <= 0x9100001Cu) {
+        g_t3.nresp[(a - 0x91000000u) / 4] = v;
+    } else if (a >= 0x91000200u && a <= 0x9100021Cu) {
+        g_t3.ncmd[(a - 0x91000200u) / 4] = v;
+    } else if (a == 0x84000040u) {
+        if (v & 1) {
+            t3_asic_run();
+        }
+    } else if (a == 0x80000140u) {
+        g_t3.asic_ctrl = v | 1;             /* its CPU keeps running (no firmware.asic to start) */
+    } else if (a == 0xA0001E60u) {
+        g_t3.dma = v;
+    } else if (a >= 0x84800000u && a < 0x84818000u) {
+        /* a firmware.asic upload: not modelled, the CPU already runs */
+    } else {
+        t3_unknown("write", a, v);
+    }
+}
+
+/* port 4000: the register at 4004, or through it the ASIC window */
+static uint32_t t3_data(bool write, uint32_t v)
+{
+    uint32_t r = 0;
+    switch (g_t3.reg) {
+    case 0xA0000020u:
+        if (write) {
+            g_t3.saddr = v;
+        }
+        r = g_t3.saddr;
+        break;
+    case 0xA0000040u:
+        if (write) {
+            g_t3.sctl = v;
+        }
+        r = g_t3.sctl;
+        break;
+    case 0xA0000000u:
+        if (write) {
+            t3_mem_write(g_t3.saddr, v);
+            if (g_t3.sctl & 0x80000000u) {
+                g_t3.saddr += 4;            /* a burst steps on */
+            }
+        } else {
+            r = t3_mem_read(g_t3.saddr);
+            g_t3.saddr += 4;
+        }
+        break;
+    default:
+        if (write) {
+            t3_mem_write(g_t3.reg, v);
+        } else {
+            r = t3_mem_read(g_t3.reg);
+        }
+        if (g_t3.mode & 0x80) {
+            g_t3.reg += 4;                  /* 4008 bit 7: the address steps on */
+        }
+        break;
+    }
+    return r;
+}
+
+bool nc_mb_t3_port_in(uint16_t port, unsigned bytes, uint32_t *v)
+{
+    if (!nc_mb_type3()) {
+        return false;
+    }
+    switch (port) {
+    case 0x4000: *v = t3_data(false, 0); return true;
+    case 0x4004: *v = g_t3.reg; return true;
+    case 0x4008: *v = g_t3.mode; return true;
+    case 0x40E0: *v = g_t3.e0; return true;
+    case 0x40F0: *v = 0x0100; return true;          /* chip ID: the ASIC (Type-3) */
+    case 0x40F4: *v = 0x0003 | 0x40; return true;   /* 1 GB, and the Type-3's switch bit (the fork) */
+    default: return false;
+    }
+}
+
+bool nc_mb_t3_port_out(uint16_t port, unsigned bytes, uint32_t v)
+{
+    if (!nc_mb_type3()) {
+        return false;
+    }
+    switch (port) {
+    case 0x4000:
+        t3_data(true, bytes == 4 ? v : v & ((1u << (8 * bytes)) - 1));
+        return true;
+    case 0x4004: g_t3.reg = v; return true;
+    case 0x4008: g_t3.mode = (uint8_t)v; return true;
+    case 0x40E0:                                    /* acknowledged: those bits cleared */
+        g_t3.e0 &= ~v;
+        t3_irq();
+        return true;
+    case 0x40E1: case 0x40E2:                       /* the receiver's arm / IRQ off: down only with nothing left */
+        if (!g_t3.e0) {
+            nc_irq_set(10, false);
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint64_t NtReadFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
+    {
+        NcFile *mb = file_of(k, a[0]);
+        if (mb && mb->kind == F_HOST && mb->partition == DEV_MB0 + 1) {     /* mbcom: (patch 193) */
+            if (!nc_kernel_resident(k, a[5], a[6], true)) {
+                return 0;
+            }
+            const uint64_t o = io_offset(k, mb, a[7]);
+            mb_com_read((uint32_t)o, nc_vm_host(k->vm, a[5]), a[6]);
+            io_moved(k, mb, a[7], o + a[6]);
+            return io_finish(k, mb, a, NC_STATUS_SUCCESS, a[6], false);
+        }
+    }
     IoRun run = {a[5], a[6]};
     return read_runs(k, a, &run, 1, a[6]);
 }
@@ -1720,6 +3214,9 @@ static void remove_tree(const char *path, bool self)
         if (lstat(p, &st) == 0 && S_ISDIR(st.st_mode)) {
             remove_tree(p, true);
         } else {
+            if (ram_enabled()) {
+                ram_drop(p);
+            }
             unlink(p);
         }
     }
@@ -1767,6 +3264,12 @@ static uint64_t NtWriteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
     if (!nc_kernel_resident(k, a[5], a[6], false)) {
         return 0;
     }
+    if (nf->kind == F_HOST && nf->partition == DEV_MB0 + 1) {      /* mbcom: (patch 193) */
+        const uint64_t o = io_offset(k, nf, a[7]);
+        mb_com_write(k, (uint32_t)o, nc_vm_host(k->vm, a[5]), a[6]);
+        io_moved(k, nf, a[7], o + a[6]);
+        return io_finish(k, nf, a, NC_STATUS_SUCCESS, a[6], false);
+    }
     if (nf->kind == F_VOLUME) {
         if (nf->partition == 0) {
             const uint64_t off = io_offset(k, nf, a[7]);
@@ -1793,6 +3296,7 @@ static uint64_t NtWriteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
             g_cluster_sectors[part] = nc_rd32(sb + 8);
             nc_log("hakuX-native-io", "%s formatted (%u-sector clusters): emptied %s", nf->path,
                    g_cluster_sectors[part], nf->host);
+            wb_wait_under(nf->host);    /* patch 261: the queued writes there land first */
             remove_tree(nf->host, false);
         }
         return io_finish(k, nf, a, NC_STATUS_SUCCESS, a[6], true);
@@ -1800,6 +3304,13 @@ static uint64_t NtWriteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
     if (nf->kind != F_HOST || nf->is_dir || !handle_can_write(nf, "write to")) {
         io_status(k, a[4], STATUS_ACCESS_DENIED, 0);
         return STATUS_ACCESS_DENIED;
+    }
+    /* patch 261 (xogfix=cachewrite): a cache drive's file written behind;
+     * else, or to its end, or an overwritten one's (regrow), queued writes first */
+    const bool wb = nf->partition >= 3 && nf->partition <= 5 && !nf->old_path[0] && nf->fd >= 0 && wb_enabled();
+    const bool to_end = a[7] && nc_vm_rd32(k->vm, a[7]) == 0xFFFFFFFFu && nc_vm_rd32(k->vm, a[7] + 4) == 0xFFFFFFFFu;
+    if (!wb || to_end) {
+        wb_wait_under(nf->host);
     }
     uint64_t off = nf->pos;
     if (a[7]) {
@@ -1810,23 +3321,91 @@ static uint64_t NtWriteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
             off = o;
         }
     }
-    if (nf->old_path[0]) {
+    if (nf->old_path[0] && !(ram_enabled() && ram_is_cache(nf->host))) {
         const uint64_t size = file_size(nf);
         if (off > size) {
             regrow(nf, size, off); /* the gap a write past the end leaves */
         }
     }
+    if (ram_enabled() && ram_is_cache(nf->host)) {
+        int ri = ram_find(nf->host);
+        if (ri < 0) {
+            ri = ram_track(nf->host, false);
+        }
+        if (ri >= 0) {
+            /* free room by spilling cold files to disk (patch 292: bounded, never OOM) */
+            while (!ram_fits(ri, off + a[6]) && ram_evict_one(ri)) {
+            }
+            if (ram_fits(ri, off + a[6])) {
+                nc_vm_will_read(a[5], a[6]);
+                const ssize_t rn = ram_pwrite(ri, nc_vm_host(k->vm, a[5]), off, a[6]);
+                if (rn >= 0) {
+                    nf->wrote = true;
+                    io_moved(k, nf, a[7], off + (uint64_t)rn);
+                    return io_finish(k, nf, a, NC_STATUS_SUCCESS, (uint32_t)rn, nf->no_buffering);
+                }
+            }
+            /* this file alone is over the cap (or realloc failed): spill it, write it on disk */
+            ram_flush(ri, nf->fd);
+        }
+    }
     nc_vm_will_read(a[5], a[6]);   /* pwrite from a page without access fails rather than faults */
     ssize_t n = 0;
-    for (uint32_t put = 0; put < a[6];) {
+    /* patch 330: an overlapped handle's write goes to the reader thread and completes later (IoStatusBlock, event,
+     * APC), as a console hard disk's does and as its reads here already do. Done in the call, its completion ran
+     * before the caller had finished setting up what the completion uses. Its bytes go through the write helper
+     * (patch 307/308) when that is on, so it isn't throttled. A synchronous handle's write stays as it was: the
+     * write-behind queue and the helper already keep those fast. NC_WRITE_IN_PLACE=1: as before. */
+    /* patch 332: per game only (xogfix=asyncwrite): on for every game, Breakdown's own save crashed (its save
+     * write completed later and the game called through a NULL) */
+    static int aw = -1;
+    if (a[6] && nf->async && nf->fd >= 0 && xogfix_has("asyncwrite", &aw)) {
+        wb_wait_under(nf->host);        /* the path's queued writes land first: this goes behind them */
+        if (nf->partition >= 0 && nf->partition <= 5 && wb_enabled() && g_wb_helper == 1 && nf->wb_handle == 0) {
+            const int h = wbwr_open(nf->host);
+            nf->wb_handle = h > 0 ? h : -1;
+        }
+        const IoRun run = {a[5], a[6]};
+        if (disc_read_later(k, nf, a, &run, 1, off, a[6], false, 0, true)) {
+            nf->wrote = true;
+            io_moved(k, nf, a[7], off + a[6]);
+            if (g_trace_io) {
+                nc_log("hakuX-native-io", "write %s +%llx %u from %08x pending", nf->path, (unsigned long long)off,
+                       a[6], a[5]);
+            }
+            return STATUS_PENDING;
+        }
+    }
+    writes_drain();                 /* in place: after the writes already queued */
+    /* XOG patch 308: every write patch 307's write-behind does not take goes
+     * through the helper in the calling thread, so the Xbox's "write completed"
+     * semantics are kept: the save partitions (0-2), a cache file opened with
+     * an overwrite disposition (old_path set: patch 261 keeps those in place),
+     * and a write to end. These are what kept the app's per-launch budget
+     * reachable after the cache drives were routed. */
+    if ((!wb || to_end) && nf->partition >= 0 && nf->partition <= 5 && nf->fd >= 0 && wb_enabled() &&
+        g_wb_helper == 1) {
+        if (nf->wb_handle == 0) {
+            const int h = wbwr_open(nf->host);
+            nf->wb_handle = h > 0 ? h : -1;
+        }
+        if (nf->wb_handle > 0 && wbwr_write(nf->wb_handle, off, nc_vm_host(k->vm, a[5]), a[6]) == (long)a[6]) {
+            n = (ssize_t)a[6];
+        }
+    }
+    if (!n && wb && wb_write(k, nf, off, a[5], a[6])) {
+        n = (ssize_t)a[6];              /* patch 261: the writer thread puts it on the disk */
+    } else if (!n && wb) {
+        wb_wait_under(nf->host);        /* in place: behind what is queued */
+    }
+    for (uint32_t put = (uint32_t)n; put < a[6];) {
         const uint32_t va = a[5] + put, left = a[6] - put, room = NC_PAGE - (va & (NC_PAGE - 1));
         const uint32_t chunk = soft_range(va, left) && left > room ? room : left;
-        const ssize_t w = pwrite(nf->fd, nc_vm_host(k->vm, va), chunk, (off_t)(off + put));
-        if (w <= 0) {
-            break;
+        if (!nc_pwrite_sure(nf->fd, nc_vm_host(k->vm, va), chunk, off + put)) {
+            break;                      /* patch 356: refused after its retries */
         }
-        n += w;
-        put += (uint32_t)w;
+        n += chunk;
+        put += chunk;
     }
     uint32_t st = n == (ssize_t)a[6] ? NC_STATUS_SUCCESS : 0xC000007Fu; /* STATUS_DISK_FULL */
     nf->wrote |= n > 0;
@@ -1849,17 +3428,50 @@ static uint64_t host_time(time_t t)
     return (uint64_t)(t + 11644473600ll) * 10000000ull;
 }
 
+/* patch 281 (xogfix=archive, Morrowind's launchers): FILE_ATTRIBUTE_ARCHIVE kept on a hard disk file as its
+ * owner-execute bit. Morrowind's default.xbe copies Morrowind.bsa/.esm/.esm.map to Z:, marks each finished copy
+ * with SetFileAttributes(ARCHIVE) and at the next start recopies (~480 MB) every file without that mark. */
+static bool archive_kept(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        /* patch 282 (user): every game, as the Xbox's own disk keeps a file's attributes */
+        on = 1;
+        nc_log("hakuX-native-io", "archive: a hard disk file's ARCHIVE attribute is kept (patch 282, every game)");
+    }
+    return on == 1;
+}
+
+/* patch 285: a hard disk file's CreationTime is its birth time, as FATX keeps it (set below with
+ * FileBasicInformation). st_ctime, used before, is the last change time: it moves with every write and
+ * never matched what a game stamped. Riddick (56550026) copies its FileCache to Z:, stamps each copy
+ * with the disc file's times, and at every start (1ec2a0 -> 1f23c0) recopies a copy whose size differs
+ * or whose CreationTime is over 4 s off the disc file's. Without a birth time: the older of ctime/mtime. */
+static time_t host_birth(const struct stat *st)
+{
+#ifdef st_birthtime
+    if (st->st_birthtime > 0) {
+        return st->st_birthtime;
+    }
+#endif
+    return st->st_mtime < st->st_ctime ? st->st_mtime : st->st_ctime;
+}
+
 /* Times, size and attributes common to the information classes. */
 static void file_facts(const NcFile *nf, uint64_t times[4], uint64_t *size, uint32_t *attrs)
 {
     if (nf->kind == F_HOST) {
         struct stat st;
         if (stat(nf->host, &st) == 0) {
-            times[0] = host_time(st.st_ctime);
+            times[0] = host_time(host_birth(&st));
             times[1] = host_time(st.st_atime);
             times[2] = times[3] = host_time(st.st_mtime);
-            *size = S_ISDIR(st.st_mode) ? 0 : (uint64_t)st.st_size;
+            const int rfi = !S_ISDIR(st.st_mode) && ram_enabled() && ram_is_cache(nf->host) ? ram_find(nf->host) : -1;
+            *size = S_ISDIR(st.st_mode) ? 0 : rfi >= 0 ? g_ram[rfi].size : (uint64_t)st.st_size;
             *attrs = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+            if (!S_ISDIR(st.st_mode) && (st.st_mode & S_IXUSR) && archive_kept()) {
+                *attrs = FILE_ATTRIBUTE_ARCHIVE;
+            }
             return;
         }
     }
@@ -1901,6 +3513,10 @@ static uint64_t NtQueryInformationFile(NcKernel *k, NcFrame *f, const uint32_t *
     uint8_t o[0x38];                    /* the largest class's; the caller's buffer once it fits */
     uint64_t t[4], size;
     uint32_t attrs, len;
+    writes_drain();
+    if (nf->kind == F_HOST && a[4] != 14) {
+        wb_wait_under(nf->host);        /* patch 261: its queued writes first */
+    }
     file_facts(nf, t, &size, &attrs);
     switch (a[4]) {
     case 4: /* FileBasicInformation: times, FileAttributes */
@@ -1959,6 +3575,26 @@ static uint64_t NtQueryInformationFile(NcKernel *k, NcFrame *f, const uint32_t *
     return NC_STATUS_SUCCESS;
 }
 
+/* The PS5's libkernel has no futimens/utimensat (ENOSYS): set a file's access
+ * and modification times with futimes/utimes, to the microsecond, instead.
+ * Without this, FileBasicInformation silently failed and a title that checks
+ * a cache copy's time against its source recopied it at every start. */
+static bool set_times_us(const NcFile *nf, const struct timespec ts[2])
+{
+    struct stat st;
+    if ((nf->fd >= 0 ? fstat(nf->fd, &st) : stat(nf->host, &st)) != 0) {
+        return false;
+    }
+    struct timeval tv[2];
+    for (int i = 0; i < 2; i++) {
+        const struct timespec now = i ? st.st_mtim : st.st_atim;
+        const struct timespec *t = ts[i].tv_nsec == UTIME_OMIT ? &now : &ts[i];
+        tv[i].tv_sec = t->tv_sec;
+        tv[i].tv_usec = (suseconds_t)(t->tv_nsec / 1000);
+    }
+    return (nf->fd >= 0 ? futimes(nf->fd, tv) : utimes(nf->host, tv)) == 0;
+}
+
 /* NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass) */
 static uint64_t NtSetInformationFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
@@ -1969,6 +3605,10 @@ static uint64_t NtSetInformationFile(NcKernel *k, NcFrame *f, const uint32_t *a)
     const uint8_t *in = nc_vm_host(k->vm, a[2]);
     uint64_t v;
     uint32_t st = NC_STATUS_SUCCESS;
+    writes_drain();
+    if (nf->kind == F_HOST && a[4] != 14) {
+        wb_wait_under(nf->host);        /* patch 261: its queued writes first (size, times, delete, rename) */
+    }
     switch (a[4]) {
     case 14: /* FilePositionInformation */
         memcpy(&v, in, 8);
@@ -1999,14 +3639,84 @@ static uint64_t NtSetInformationFile(NcKernel *k, NcFrame *f, const uint32_t *a)
                     ts[i].tv_nsec = UTIME_OMIT;
                 }
             }
+            /* patch 285: CreationTime too. The host has no call that sets a birth time, but its utimes
+             * moves the birth time back to a modification time set before it: set that first, then
+             * the times asked for (or the old modification time again). */
+            memcpy(&v, in, 8);
+            struct stat bst;
+            if (v && v != ~0ull && stat(nf->host, &bst) == 0) {
+                const int64_t unix100 = (int64_t)v - 116444736000000000ll;
+                struct timespec cr[2];
+                cr[0].tv_sec = 0;
+                cr[0].tv_nsec = UTIME_OMIT;
+                cr[1].tv_sec = (time_t)(unix100 / 10000000);
+                cr[1].tv_nsec = 0;
+                if (unix100 < 0 && unix100 % 10000000) {
+                    cr[1].tv_sec--;
+                }
+                if (cr[1].tv_sec != host_birth(&bst)) {
+                    if (ts[1].tv_nsec == UTIME_OMIT) {
+                        ts[1] = bst.st_mtim;    /* the modification time stays as it was */
+                    }
+                    if ((nf->fd >= 0 ? futimens(nf->fd, cr) : utimensat(AT_FDCWD, nf->host, cr, 0)) != 0) {
+                        if (errno != ENOSYS || !set_times_us(nf, cr)) {
+                            nc_log("hakuX-native-io", "set creation time on %s: %s", nf->path, strerror(errno));
+                        }
+                    }
+                }
+            }
             if ((nf->fd >= 0 ? futimens(nf->fd, ts) : utimensat(AT_FDCWD, nf->host, ts, 0)) != 0) {
-                nc_log("hakuX-native-io", "set times on %s: %s", nf->path, strerror(errno));
+                if (errno != ENOSYS || !set_times_us(nf, ts)) {
+                    nc_log("hakuX-native-io", "set times on %s: %s", nf->path, strerror(errno));
+                }
+            }
+            if (v && v != ~0ull && stat(nf->host, &bst) == 0) {
+                const int64_t want = ((int64_t)v - 116444736000000000ll) / 10000000;
+                const int64_t got = (int64_t)host_birth(&bst);
+                static unsigned told;
+                if ((got > want + 2 || got < want - 2) && told++ < 8) {
+                    nc_log("hakuX-native-io", "creation time on %s: asked %lld, the host keeps %lld (birth time %s)",
+                           nf->path, (long long)want, (long long)got,
+#ifdef st_birthtime
+                           bst.st_birthtime > 0 ? "kept" : "not kept"
+#else
+                           "unknown"
+#endif
+                    );
+                }
+            }
+            uint32_t fa;
+            memcpy(&fa, in + 0x20, 4);              /* FileAttributes: 0 leaves them as they are */
+            struct stat ast;
+            if (fa && archive_kept() && stat(nf->host, &ast) == 0) {
+                const mode_t m = (fa & FILE_ATTRIBUTE_ARCHIVE) ? (ast.st_mode | S_IXUSR) : (ast.st_mode & ~(mode_t)S_IXUSR);
+                if (m != ast.st_mode &&
+                    (nf->fd >= 0 ? fchmod(nf->fd, m & 07777) : chmod(nf->host, m & 07777)) != 0) {
+                    nc_log("hakuX-native-io", "archive: set attributes %x on %s: %s", fa, nf->path, strerror(errno));
+                } else {
+                    static unsigned told;
+                    if (told++ < 16) {
+                        nc_log("hakuX-native-io", "archive: attributes %x on %s", fa, nf->path);
+                    }
+                }
             }
         }
         break;
     case 20: { /* FileEndOfFileInformation */
         memcpy(&v, in, 8);
         const uint64_t was = file_size(nf);
+        if (nf->kind == F_HOST && ram_enabled() && ram_is_cache(nf->host)) {
+            const int ri = ram_find(nf->host);
+            if (ri >= 0) {
+                if (handle_can_write(nf, "end of file of")) {
+                    ram_truncate(ri, v);
+                    nf->wrote = true;
+                } else {
+                    st = STATUS_ACCESS_DENIED;
+                }
+                break;
+            }
+        }
         if (nf->kind == F_HOST && nf->fd >= 0 && was == 0 && v > 0 && nf->old_path[0] &&
             handle_can_write(nf, "end of file of") && regrow_by_rename(nf)) {
             if (ftruncate(nf->fd, (off_t)v) != 0) {
@@ -2058,9 +3768,12 @@ static uint64_t NtSetInformationFile(NcKernel *k, NcFrame *f, const uint32_t *a)
             st = exists < 0 && nf->kind == F_HOST ? STATUS_OBJECT_PATH_NOT_FOUND : STATUS_ACCESS_DENIED;
         } else if (exists && !in[0]) {
             st = STATUS_OBJECT_NAME_COLLISION;
-        } else if (rename(nf->host, host) != 0) {
+        } else if ((wb_wait_under(host), rename(nf->host, host) != 0)) {
             st = STATUS_ACCESS_DENIED;
         } else {
+            if (ram_enabled()) {
+                ram_rename(nf->host, host);
+            }
             snprintf(nf->host, sizeof(nf->host), "%s", host);
             snprintf(nf->path, sizeof(nf->path), "%s", path);
         }
@@ -2326,6 +4039,7 @@ static unsigned list_dir(NcKernel *k, const NcFile *nf, DirEntry *out, unsigned 
         }
         return n;
     }
+    wb_wait_under(nf->host);            /* patch 261: sizes with the queued writes in */
     DIR *d = opendir(nf->host);
     struct dirent *de;
     while (d && n < cap && (de = readdir(d))) {
@@ -2338,7 +4052,8 @@ static unsigned list_dir(NcKernel *k, const NcFile *nf, DirEntry *out, unsigned 
         DirEntry *e = &out[n++];
         snprintf(e->name, sizeof(e->name), "%s", de->d_name);
         e->dir = stat(p, &st) == 0 && S_ISDIR(st.st_mode);
-        e->size = e->dir ? 0 : (uint64_t)st.st_size;
+        const int rdi = !e->dir && ram_enabled() && ram_is_cache(p) ? ram_find(p) : -1;
+        e->size = e->dir ? 0 : rdi >= 0 ? g_ram[rdi].size : (uint64_t)st.st_size;
     }
     if (d) {
         closedir(d);
@@ -2352,6 +4067,7 @@ static unsigned list_dir(NcKernel *k, const NcFile *nf, DirEntry *out, unsigned 
  * FileAttributes 0x38, FileNameLength 0x3C, FileName (ANSI) 0x40. */
 static uint64_t NtQueryDirectoryFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
+    writes_drain();
     NcFile *nf = file_of(k, a[0]);
     if (!nf || !nf->is_dir) {
         return nf ? STATUS_INVALID_DEVICE_REQUEST : NC_STATUS_INVALID_HANDLE;
@@ -2436,6 +4152,7 @@ static uint64_t NtQueryDirectoryFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* NtQueryFullAttributesFile(ObjectAttributes, FileInformation (FILE_NETWORK_OPEN_INFORMATION)) */
 static uint64_t NtQueryFullAttributesFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
+    writes_drain();
     uint32_t h = 0, info = 0;
     uint32_t st = do_open(k, 0, a[0], FILE_OPEN, 0, &h, &info);
     if (st != NC_STATUS_SUCCESS) {
@@ -2458,6 +4175,7 @@ static uint64_t NtQueryFullAttributesFile(NcKernel *k, NcFrame *f, const uint32_
 /* NtDeleteFile(ObjectAttributes) */
 static uint64_t NtDeleteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
+    writes_drain();
     char name[512], path[512], host[512];
     ansi(k, nc_vm_rd32(k->vm, a[0] + 4), name, sizeof(name));
     if (!resolve_name(k, nc_vm_rd32(k->vm, a[0]), name, sizeof(name))) {
@@ -2472,6 +4190,7 @@ static uint64_t NtDeleteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
     if (host_path(dev, rel, host, sizeof(host)) != 1) {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
+    wb_wait_under(host);                /* patch 261: its queued writes first */
     struct stat st;
     bool dir = stat(host, &st) == 0 && S_ISDIR(st.st_mode);
     NcFile *open_on = dir ? NULL : file_other(NULL, host, false);
@@ -2480,6 +4199,9 @@ static uint64_t NtDeleteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
         nc_log("hakuX-native-io", "delete %s: at its last close (from %08x)", path,
                nc_vm_rd32(k->vm, nc_frame_gpr(f, NC_ESP)));
         return NC_STATUS_SUCCESS;
+    }
+    if (ram_enabled() && !dir) {
+        ram_drop(host);
     }
     const uint32_t r = (dir ? rmdir(host) : unlink(host)) == 0 ? NC_STATUS_SUCCESS : STATUS_ACCESS_DENIED;
     nc_log("hakuX-native-io", "delete %s: %s (from %08x)", path, r == NC_STATUS_SUCCESS ? "done" : strerror(errno),
@@ -2490,9 +4212,18 @@ static uint64_t NtDeleteFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* NtFlushBuffersFile(FileHandle, IoStatusBlock) */
 static uint64_t NtFlushBuffersFile(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
+    writes_drain();
     NcFile *nf = file_of(k, a[0]);
     if (nf && nf->fd >= 0) {
-        flush_later(nf);
+        /* patch 261: with writes queued, the sync goes behind them (a duplicate, as flush_later's) */
+        CloseJob j = {.fd = __atomic_load_n(&g_wb.npaths, __ATOMIC_ACQUIRE) ? dup(nf->fd) : -1};
+        snprintf(j.path, sizeof(j.path), "%s", nf->path);
+        if (j.fd < 0 || !wb_close(&j, nf->host)) {
+            if (j.fd >= 0) {
+                close(j.fd);
+            }
+            flush_later(nf);
+        }
     }
     io_status(k, a[1], NC_STATUS_SUCCESS, 0);
     return NC_STATUS_SUCCESS;
@@ -2862,6 +4593,18 @@ void nc_io_register(NcKernel *k)
     g_trace_io = getenv("NC_TRACE_IO") != NULL || access("/data/xpsemu/traceio", F_OK) == 0;
     link_set("\\??\\D:", "\\Device\\CdRom0");
     link_set("\\??\\CdRom0:", "\\Device\\CdRom0");     /* the kernel's own, as on the Xbox (the dashboard's) */
+    if (getenv("NC_CHIHIRO")) {
+        /* Sega Chihiro: the media board's drives (XPSemu patch 187) */
+        link_set("\\??\\mbfs:", "\\Device\\MediaBoard\\Partition0");
+        link_set("\\??\\mbcom:", "\\Device\\MediaBoard\\Partition1");
+        link_set("\\??\\mbrom0:", "\\Device\\MediaBoard\\Partition2");
+        link_set("\\??\\mbrom1:", "\\Device\\MediaBoard\\Partition3");
+        mkdirs("/data/xpsemu/chihiro/run");
+        const int fd = open("/data/xpsemu/chihiro/run/mbcom.bin", O_RDWR | O_CREAT, 0666);
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
     nc_kernel_impl(k, "ExReadWriteRefurbInfo", ExReadWriteRefurbInfo);
     nc_kernel_impl(k, "IoDismountVolumeByName", IoDismountVolumeByName);
 
@@ -2923,6 +4666,10 @@ typedef struct NcFileState {
 
 const char *nc_io_state_drain(NcKernel *k, uint64_t timeout_ns)
 {
+    /* patch 261: the cache drives' queued writes on the disk before the state copies them */
+    if (!nc_io_writes_drain(timeout_ns / 1000000u * 8u, "a save state")) {
+        return "the game is writing its cache drive; try again in a moment";
+    }
     /* the game's own save on E: half written: not a state to come back to */
     for (unsigned i = 0; i < MAX_FILES; i++) {
         const NcFile *nf = &g_files[i];
@@ -2979,6 +4726,9 @@ static void file_drop(NcFile *nf)
         if (nf->fd >= 0) {
             close(nf->fd);
         }
+        if (nf->wb_handle > 0) {
+            wbwr_close(nf->wb_handle);   /* patch 307: release the helper's descriptor (a state load drops files) */
+        }
         free(nf->listing);
         memset(nf, 0, sizeof(*nf));     /* only those used: the rest stay untouched */
     }
@@ -2988,6 +4738,7 @@ bool nc_file_state_load(NcRd *r, unsigned v)
 {
     NcFileState st = {0};
     nc_rec_get(r, &nc_rec_NcFileState, &st, v);
+    nc_io_writes_drain(60000, "a state load");     /* patch 261: nothing queued on the descriptors dropped here */
     for (unsigned i = 0; i < MAX_FILES; i++) {
         file_drop(&g_files[i]);
     }
@@ -3023,7 +4774,7 @@ bool nc_file_state_load(NcRd *r, unsigned v)
                  * for the last close (NcFile.del). Its bytes weren't kept:
                  * empty, deleted at its last close as it would be now, so the
                  * next state keeps it (Sudeki's boot.baf). */
-                nf->fd = open(nf->host, O_RDWR | O_CREAT | O_CLOEXEC, 0664);
+                nf->fd = open(nf->host, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
                 if (nf->fd >= 0) {
                     nf->del = true;
                     nc_log("hakuX-native-state", "%s: deleted while open when the state was saved; empty",

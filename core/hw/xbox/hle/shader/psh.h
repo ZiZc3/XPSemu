@@ -47,11 +47,21 @@ typedef struct HlePshKey {
     uint32_t final_abcd, final_efg;
     uint32_t count;                     /* PSCombinerCount */
     uint32_t tex_modes;                 /* PSTextureModes */
-    uint32_t dot_map;                   /* PSDotMapping */
+    /* patch 334: PSDotMapping (12 bits) and PSCompareMode (16 bits) were 32-bit
+     * words whose top halves stayed 0 (hle_psh_key masks them): those halves
+     * hold the colour sign, so the key's size and every unsigned draw's key
+     * bytes are as before (the pipeline record). Per stage 4 bits (bit 0 r ..
+     * 3 a): sgn_ob the channels uploaded offset binary (tex/xdk_res.h), mapped
+     * back exactly; sgn_raw those read as stored (targets, formats not
+     * flipped), two's complement after filtering. */
+    uint16_t dot_map;                   /* PSDotMapping */
+    uint16_t sgn_ob;
     uint32_t input_tex;                 /* PSInputTexture */
-    uint32_t compare;                   /* PSCompareMode */
+    uint16_t compare;                   /* PSCompareMode */
+    uint16_t sgn_raw;
     uint8_t alpha_test;                 /* ALPHATESTENABLE */
-    uint8_t alpha_func;                 /* D3DCMP_* - 0x200 (0..7) */
+    uint8_t alpha_func;                 /* D3DCMP_* - 0x200 (0..7); bit 3 (patch 354): MSAA
+                                           alpha-to-coverage (HLE_A2C_BIT) */
     uint8_t flat;
     uint8_t fog;                        /* 0 off; FOGTABLEMODE + 1 (NONE 1 .. LINEAR 4) */
     uint8_t fog_abs;                    /* the factor of |distance|: an NV2A _ABS fog mode
@@ -69,7 +79,8 @@ typedef struct HlePshKey {
                                            unit 3's coordinates are the point's */
     /* Shadow buffers: stages whose texture is a depth surface (bits 0-3),
      * D3DRS_SHADOWFUNC - 0x200 (bits 4-6); per stage (2 bits) the depth
-     * range the r coordinate is in: 1 D24 (2^24 - 1), 2 D16, 3 float. */
+     * range the r coordinate is in: 1 D24 (2^24 - 1), 2 D16, 3 float; 0
+     * (patch 335) an uploaded F24 texture, its float as it is. */
     uint8_t shadow;
     uint8_t shadow_fmt;
     uint8_t out_bgra;                   /* 8-bit (B8) target: it stores blue */
@@ -92,6 +103,26 @@ typedef struct HlePshKey {
                                            HleFfPsKey.sblend) */
 } HlePshKey;
 #define HLE_PSH_RECT 0x10u              /* HlePshKey.vol: a linear texture kept to its size */
+
+/* Bits PSInputTexture and PSTextureModes never have (hle_psh_key masks them:
+ * 0 in every key that uses none of these, its size and bytes as before),
+ * set by vk/draw.c for program draws only; their values in the push block's
+ * fixed-function matrix (a program's vertex shader never reads it; column 0
+ * is xogfix=rect's):
+ * - patch 340, texture colour key: input_tex bits 2s..2s+1 stage s's
+ *   COLORKEYOP (1 alpha 0, 2 colour and alpha 0, 3 discard), bit 8 + s its
+ *   alpha ignored (an X format); the key colours (ARGB) as 16-bit halves,
+ *   pc.mvp[1][s] the low, pc.mvp[2][s] the high (exact as floats);
+ * - patch 342, convolution: input_tex bit 12 + s, stage s's PROJECT2D texel
+ *   the 3x3 gaussian of its neighbours (xemu's, quincunx too);
+ * - patch 338, depth clip range: tex_modes bit 20 the fragment depth kept to
+ *   [pc.mvp[3].x, pc.mvp[3].y] (normalised), bit 21 by discarding (ZCLAMP_EN
+ *   CULL), else by clamping. */
+#define HLE_PSH_CKEY_OP(s)   (3u << (2 * (s)))
+#define HLE_PSH_CKEY_X(s)    (0x100u << (s))
+#define HLE_PSH_CONV(s)      (0x1000u << (s))
+#define HLE_PSH_ZCLIP        (1u << 20)
+#define HLE_PSH_ZCLIP_CULL   (1u << 21)
 
 /* Key from the render-state array (rs[0..56] = the pixel-shader block). */
 void hle_psh_key(const uint32_t *rs, HlePshKey *k);
