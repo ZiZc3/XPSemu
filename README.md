@@ -72,7 +72,7 @@ The Sega Chihiro is an arcade board built on the original Xbox, so its games run
 
 | Game | Best format |
 |---|---|
-| **OutRun 2** | GD-ROM |
+| **OutRun 2/Special Tours** | GD-ROM |
 | **Crazy Taxi: High Roller** | CHD |
 | **Ollie King** | CHD |
 | **Virtua Cop 3** | Netboot `.bin` |
