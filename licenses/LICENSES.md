@@ -30,6 +30,7 @@ keeps its own license; all are compatible with GPL-3.0.
 | `FidelityFX-CAS.txt` | AMD FidelityFX CAS sharpening (MIT) — new in 3.2 |
 | `SMAA.txt` | SMAA anti-aliasing (MIT) |
 | `snapdragon-gsr.txt` | Snapdragon Game Super Resolution (Sharp upscaling) |
+| `Real-ESRGAN.txt` | Real-ESRGAN realesr-general-x4v3 model (Basic Texture Upscaler: ESRGAN) (BSD-3-Clause) |
 
 ## Disc formats (CHD / CSO)
 
