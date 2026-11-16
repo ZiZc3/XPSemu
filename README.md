@@ -31,8 +31,8 @@ Around that sits the rest of an Xbox, from the [hakuX](https://github.com/rfanda
 <summary><strong>&nbsp; Picture</strong></summary>
 <br>
 
-- Resolution x1 to x6 (up to 3840x2880, shown at 4K)
-- Anti-aliasing: FXAA, SMAA, SSAA
+- Resolution x1 to x10 (up to 3840x2880, shown at 4K)
+- Anti-aliasing: FXAA, SMAA, SSAA, MSAA
 - Sharp (SGSR) or Smooth upscaling
 
 </details>
